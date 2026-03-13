@@ -1,0 +1,113 @@
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  .air.toml — Air hot-reload for auth-boilerplate                             ║
+# ║  Docs: https://github.com/air-verse/air                                      ║
+# ║  Usage: air -c .air.toml   (or: make dev)                                    ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+
+# ── Root working directory ────────────────────────────────────────────────────
+root    = "."
+tmp_dir = ".air_tmp"
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+[build]
+  # CGO_ENABLED=1 is required by the -race detector.
+  cmd = """
+    CGO_ENABLED=1 go build \
+      -race \
+      -gcflags='all=-e' \
+      -ldflags='-X github.com/waqasmani/auth-boilerplate/internal/version.Version=dev' \
+      -o .air_tmp/auth-boilerplate \
+      ./cmd/api
+  """
+
+  entrypoint = ["./.air_tmp/auth-boilerplate"]
+
+  # ── File watching ─────────────────────────────────────────────────────────
+  include_ext = ["go", "sql", "yaml", "yml", "toml", "env"]
+
+  include_dir = [
+    "cmd",
+    "internal",
+  ]
+
+  exclude_dir = [
+    ".air_tmp",
+    "bin",
+    "vendor",
+    "coverage",
+    "docs",
+    ".git",
+    "testdata",
+    "migrations",
+    "scripts",
+    "secrets",
+    "internal/infrastructure/sqlc/sqlcgen",
+  ]
+
+  exclude_file  = []
+  exclude_regex = [
+    "_test\\.go$",
+    "_mock\\.go$",
+    "\\.pb\\.go$",
+  ]
+
+  exclude_unchanged = false
+  follow_symlink    = false
+
+  # ── Debounce ──────────────────────────────────────────────────────────────
+  # 500 ms avoids spurious rebuilds when the editor writes multiple files at once.
+  delay = 500
+
+  # ── Graceful shutdown ─────────────────────────────────────────────────────
+  # send_interrupt = true  → Air sends SIGINT on reload/exit, which the signal
+  # handler in main.go catches and routes through the full graceful shutdown
+  # path (drain HTTP, run DI stop hooks).
+  #
+  # kill_delay must exceed SERVER_SHUTDOWN_TIMEOUT (15 s) so the process can
+  # finish draining before Air force-kills it with SIGKILL. 16 s gives 1 s of
+  # headroom. Increase this if your shutdown timeout is raised in .env.
+  send_interrupt = true
+  kill_delay     = "16s"
+
+  # ── Error handling ────────────────────────────────────────────────────────
+  # stop_on_error = false keeps Air alive to show the compile error in the
+  # terminal without killing the previously running binary.
+  stop_on_error = false
+
+  rerun       = false
+  rerun_delay = 500
+
+  log = ".air_tmp/build-errors.log"
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+[run]
+  pre_cmd  = []
+  post_cmd = []
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+[log]
+  main_only = false
+  time      = false
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+[color]
+  main    = "cyan"
+  watcher = "blue"
+  build   = "yellow"
+  runner  = "green"
+  app     = "white"
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+[misc]
+  clean_on_exit = false
+
+# ── Screen ────────────────────────────────────────────────────────────────────
+[screen]
+  clear_on_rebuild = false
+  keep_scroll      = true
+
+# ── Proxy (disabled) ──────────────────────────────────────────────────────────
+[proxy]
+  enabled    = false
+  proxy_port = 8090
+  app_port   = 8080

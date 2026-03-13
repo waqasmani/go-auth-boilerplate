@@ -1,0 +1,101 @@
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# Define Go version as environment variable for consistency
+env:
+  GO_VERSION: "1.25.8"
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    services:
+      mariadb:
+        image: mariadb:11.3
+        env:
+          MARIADB_ROOT_PASSWORD: rootpassword
+          MARIADB_DATABASE: auth_db_test
+          MARIADB_USER: testuser
+          MARIADB_PASSWORD: testpassword
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}  # Consistent version
+          cache: true
+
+      - name: Install dependencies
+        run: go mod download
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Security scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Apply migrations
+        run: |
+          for f in sql/migrations/*.sql; do
+            mysql -h 127.0.0.1 -u root -prootpassword auth_db_test < "$f"
+          done
+
+      - name: Run unit tests
+        run: go test -v -race -count=1 ./internal/...
+
+      - name: Run integration tests
+        env:
+          APP_ENV: test
+          DB_DSN: testuser:testpassword@tcp(127.0.0.1:3306)/auth_db_test?parseTime=true&charset=utf8mb4&loc=UTC
+          JWT_SECRET: ci-test-secret-key-32-characters-long
+          JWT_ISSUER: go-auth-boilerplate
+          JWT_AUDIENCE: go-auth-boilerplate-users
+          JWT_ACCESS_TTL: 15m
+          JWT_REFRESH_TTL: 720h
+        run: go test -v -race -count=1 -tags=integration ./tests/integration/...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}  # Same version as test job
+          cache: true
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.59
+
+  # Add build verification job
+  build:
+    name: Build Verification
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Build with race detector
+        run: CGO_ENABLED=1 go build -race -o /dev/null ./cmd/api
