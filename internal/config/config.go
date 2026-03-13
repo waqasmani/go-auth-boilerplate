@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,10 +14,18 @@ import (
 
 // Config holds all application configuration.
 type Config struct {
-	AppEnv      string
-	AppPort     string
-	DBDSN       string
-	JWTSecret   string
+	AppEnv  string
+	AppPort string
+	DBDSN   string
+
+	// JWTKeys is the full signing key set.  Exactly one entry must have
+	// Active: true (used to sign new tokens).  All entries are used during
+	// validation so tokens issued before a key rotation continue to work
+	// until they expire naturally.
+	//
+	// Set via JWT_KEYS (JSON array, see JWTKeyConfig).
+	// Legacy fallback: JWT_SECRET + optional JWT_KEY_ID.
+	JWTKeys     []JWTKeyConfig
 	JWTIssuer   string
 	JWTAudience string
 	AccessTTL   time.Duration
@@ -28,30 +37,37 @@ type Config struct {
 	RateLimitTTL     time.Duration
 	RateLimitMaxKeys int
 
-	// ─── CORS ────────────────────────────────────────────────────────────────
+	// ─── CORS ─────────────────────────────────────────────────────────────────
 	CORSAllowedOrigins   []string
 	CORSAllowedHeaders   []string
 	CORSAllowCredentials bool
 	CORSMaxAge           int
 
 	// ─── Secure Headers ───────────────────────────────────────────────────────
-	// SecHSTSEnabled controls whether the Strict-Transport-Security header is
-	// written on every response.  Must only be true when the service is
-	// reachable exclusively over HTTPS — HSTS sent over plain HTTP can lock
-	// users out of the site for the entire SecHSTSMaxAge window.
-	// Default: false (dev).  Set to true in production.
 	SecHSTSEnabled bool
+	SecHSTSMaxAge  int
+}
 
-	// SecHSTSMaxAge is the HSTS max-age directive in seconds.  Two years
-	// (63 072 000 s) is the threshold required for HSTS preloading and is a
-	// practical production default.  Only used when SecHSTSEnabled is true.
-	SecHSTSMaxAge int
+// JWTKeyConfig is a single signing key entry as stored in config / env vars.
+// It maps directly to platformauth.JWTKey; kept in the config package to
+// avoid an import cycle (platform/auth → config would create a cycle).
+//
+// JSON encoding matches the JWT_KEYS environment variable format:
+//
+//	JWT_KEYS=[{"id":"v1","secret":"…","active":true},{"id":"v2","secret":"…","active":false}]
+//
+// Rules enforced by Load:
+//   - every entry must have a non-empty id and non-empty secret
+//   - no two entries may share the same id
+//   - exactly one entry must have "active": true
+type JWTKeyConfig struct {
+	ID     string `json:"id"`
+	Secret string `json:"secret"`
+	Active bool   `json:"active"`
 }
 
 // MissingEnvError is returned by Load when one or more required environment
-// variables are absent. It lists every missing key in a single error so the
-// operator can fix all gaps in one deployment cycle rather than discovering
-// them one at a time.
+// variables are absent.
 type MissingEnvError struct {
 	Keys []string
 }
@@ -64,8 +80,7 @@ func (e *MissingEnvError) Error() string {
 }
 
 // IsMissingEnvError reports whether err (or any error in its chain) is a
-// *MissingEnvError. Mirrors the errors.As pattern so callers can inspect the
-// missing key list without a type assertion at every call site.
+// *MissingEnvError.
 func IsMissingEnvError(err error) bool {
 	var target *MissingEnvError
 	return errors.As(err, &target)
@@ -73,28 +88,30 @@ func IsMissingEnvError(err error) bool {
 
 // Load reads configuration from the environment (and optional .env file).
 // It returns a *MissingEnvError when any required variable is absent, and a
-// plain error when a value is present but cannot be parsed. Load never panics.
+// plain error when a value is present but cannot be parsed.
 func Load() (*Config, error) {
-	// Load .env if present — silently ignored when missing (production injects
-	// real environment variables directly).
 	_ = godotenv.Load()
 
-	// ── Required variables ───────────────────────────────────────────────────
-	// Collect every missing key before returning so the operator sees the
-	// complete list of gaps in one error, not just the first one encountered.
+	// ── JWT key set ───────────────────────────────────────────────────────────
+	// JWT_KEYS (JSON array) takes precedence; JWT_SECRET is the legacy fallback.
+	jwtKeys, err := loadJWTKeys()
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+
+	// ── Required variables ────────────────────────────────────────────────────
 	r := &requiredReader{}
 	dbDSN := r.get("DB_DSN")
-	jwtSecret := r.get("JWT_SECRET")
 	if err := r.err(); err != nil {
 		return nil, err
 	}
 
-	// ── Optional variables with defaults ─────────────────────────────────────
+	// ── Optional variables with defaults ──────────────────────────────────────
 	cfg := &Config{
 		AppEnv:      getEnv("APP_ENV", "development"),
 		AppPort:     getEnv("APP_PORT", "8080"),
 		DBDSN:       dbDSN,
-		JWTSecret:   jwtSecret,
+		JWTKeys:     jwtKeys,
 		JWTIssuer:   getEnv("JWT_ISSUER", "go-auth-boilerplate"),
 		JWTAudience: getEnv("JWT_AUDIENCE", "go-auth-boilerplate-users"),
 
@@ -105,26 +122,21 @@ func Load() (*Config, error) {
 		CORSAllowedOrigins:   parseStringSlice("CORS_ALLOWED_ORIGINS", []string{"http://localhost:3000"}),
 		CORSAllowedHeaders:   parseStringSlice("CORS_ALLOWED_HEADERS", []string{"Authorization", "Content-Type", "X-Request-ID"}),
 		CORSAllowCredentials: parseBool("CORS_ALLOW_CREDENTIALS", true),
-		CORSMaxAge:           parseInt("CORS_MAX_AGE", 43200), // 12 hours
+		CORSMaxAge:           parseInt("CORS_MAX_AGE", 43200),
 
-		// HSTS is opt-in: default false so development over plain HTTP is safe.
-		// Operators must explicitly set SEC_HSTS_ENABLED=true in production.
 		SecHSTSEnabled: parseBool("SEC_HSTS_ENABLED", false),
-		SecHSTSMaxAge:  parseInt("SEC_HSTS_MAX_AGE", 63_072_000), // 2 years
+		SecHSTSMaxAge:  parseInt("SEC_HSTS_MAX_AGE", 63_072_000),
 	}
 
 	// ── Duration fields ───────────────────────────────────────────────────────
-	var err error
 	cfg.AccessTTL, err = parseDuration("JWT_ACCESS_TTL", "15m")
 	if err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
-
 	cfg.RefreshTTL, err = parseDuration("JWT_REFRESH_TTL", "720h")
 	if err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
-
 	cfg.RateLimitTTL, err = parseDuration("RATE_LIMIT_TTL", "10m")
 	if err != nil {
 		return nil, fmt.Errorf("config: %w", err)
@@ -133,16 +145,88 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
+// ─── JWT key loading ──────────────────────────────────────────────────────────
+
+// loadJWTKeys resolves the signing key set from the environment.
+//
+// Resolution order:
+//  1. JWT_KEYS — JSON array of JWTKeyConfig objects.  Preferred for new
+//     deployments and required once key rotation is needed.
+//  2. JWT_SECRET — legacy single-secret fallback.  Wrapped into a
+//     JWTKeyConfig with id = JWT_KEY_ID (default "default").
+//
+// Returns an error when neither variable is set or when the resulting key
+// set fails validation.
+func loadJWTKeys() ([]JWTKeyConfig, error) {
+	if raw := os.Getenv("JWT_KEYS"); raw != "" {
+		var keys []JWTKeyConfig
+		if err := json.Unmarshal([]byte(raw), &keys); err != nil {
+			return nil, fmt.Errorf("JWT_KEYS: invalid JSON: %w", err)
+		}
+		if err := validateJWTKeys(keys); err != nil {
+			return nil, fmt.Errorf("JWT_KEYS: %w", err)
+		}
+		return keys, nil
+	}
+
+	// Legacy path: a single JWT_SECRET.
+	secret := os.Getenv("JWT_SECRET")
+	if secret == "" {
+		return nil, &MissingEnvError{Keys: []string{"JWT_KEYS (or legacy JWT_SECRET)"}}
+	}
+
+	// JWT_KEY_ID lets operators pre-assign a stable kid to the legacy secret so
+	// that when they later migrate to JWT_KEYS they can keep the same id and
+	// avoid invalidating live tokens during the migration window.
+	id := getEnv("JWT_KEY_ID", "default")
+
+	return []JWTKeyConfig{{ID: id, Secret: secret, Active: true}}, nil
+}
+
+// validateJWTKeys enforces the invariants required by platformauth.NewJWT.
+// Duplicating the checks here (rather than relying solely on the panic in
+// NewJWT) produces actionable config errors at startup before any JWT helper
+// is constructed.
+func validateJWTKeys(keys []JWTKeyConfig) error {
+	if len(keys) == 0 {
+		return fmt.Errorf("array is empty — provide at least one key")
+	}
+
+	seen := make(map[string]struct{}, len(keys))
+	activeCount := 0
+
+	for i, k := range keys {
+		if k.ID == "" {
+			return fmt.Errorf("key[%d] has an empty id", i)
+		}
+		if k.Secret == "" {
+			return fmt.Errorf("key %q has an empty secret", k.ID)
+		}
+		if _, dup := seen[k.ID]; dup {
+			return fmt.Errorf("duplicate key id %q", k.ID)
+		}
+		seen[k.ID] = struct{}{}
+		if k.Active {
+			activeCount++
+		}
+	}
+
+	switch activeCount {
+	case 0:
+		return fmt.Errorf("no key has \"active\": true — exactly one key must be active")
+	case 1:
+		return nil
+	default:
+		return fmt.Errorf("%d keys have \"active\": true — exactly one key must be active", activeCount)
+	}
+}
+
 // ─── requiredReader ───────────────────────────────────────────────────────────
 
-// requiredReader accumulates missing required variable names so Load can report
-// all of them in a single error instead of failing on the first missing key.
 type requiredReader struct {
 	missing []string
 }
 
-// get returns the value of key, or "" if absent. The key is recorded in the
-// missing list when the variable is not set.
 func (r *requiredReader) get(key string) string {
 	v := os.Getenv(key)
 	if v == "" {
@@ -151,8 +235,6 @@ func (r *requiredReader) get(key string) string {
 	return v
 }
 
-// err returns a *MissingEnvError listing every absent key, or nil when all
-// required variables were present.
 func (r *requiredReader) err() error {
 	if len(r.missing) == 0 {
 		return nil
@@ -214,8 +296,6 @@ func parseBool(key string, fallback bool) bool {
 	return v
 }
 
-// parseStringSlice splits a comma-separated env var into a trimmed string
-// slice, returning fallback when the variable is absent or empty.
 func parseStringSlice(key string, fallback []string) []string {
 	raw := os.Getenv(key)
 	if raw == "" {

@@ -49,9 +49,6 @@ func TestLoad_AllRequiredPresent(t *testing.T) {
 	if cfg.DBDSN == "" {
 		t.Error("Config.DBDSN must not be empty")
 	}
-	if cfg.JWTSecret == "" {
-		t.Error("Config.JWTSecret must not be empty")
-	}
 }
 
 func TestLoad_BothRequiredMissing(t *testing.T) {

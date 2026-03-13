@@ -27,26 +27,12 @@ import (
 type App struct {
 	cfg     *config.Config
 	db      *sql.DB
-	queries *dbpkg.Queries // prepared statements — closed before db in Shutdown
+	queries *dbpkg.Queries
 	log     *zap.Logger
 	server  *http.Server
 }
 
 // New builds and wires the application.
-//
-// migrationsFS must be the embed.FS exported by the sql/migrations package.
-// Passing it as a parameter (rather than embedding it here) is necessary
-// because Go's embed package forbids ".." in paths, so the only file that can
-// embed sql/migrations/*.sql is one that lives inside that directory.
-//
-// Startup sequence:
-//  1. Load config
-//  2. Init logger
-//  3. Connect to database (Ping)
-//  4. Run migrations  ← schema is current before any query executes
-//  5. Prepare statements  ← one round-trip; all eight statements cached
-//  6. Wire modules (auth, users) with the prepared *db.Queries
-//  7. Build HTTP server
 func New(migrationsFS fs.FS) (*App, error) {
 	// ─── Config ────────────────────────────────────────────────────────────────
 	cfg, err := config.Load()
@@ -69,22 +55,11 @@ func New(migrationsFS fs.FS) (*App, error) {
 	log.Info("connected to database")
 
 	// ─── Migrations ────────────────────────────────────────────────────────────
-	// Run before Prepare so statements are compiled against the current schema.
-	// golang-migrate is idempotent: if the schema is already at the latest
-	// version it logs "no change" and returns nil.
 	if err = database.RunMigrations(sqlDB, migrationsFS, log); err != nil {
 		return nil, fmt.Errorf("app: run migrations: %w", err)
 	}
 
 	// ─── Prepared Statements ───────────────────────────────────────────────────
-	// db.Prepare sends all eight SQL statements to the server in one batch and
-	// caches the resulting prepared-statement handles.  Every subsequent query
-	// reuses the handle, skipping the parse/plan phase on the server and saving
-	// one network round-trip per query.
-	//
-	// A 10-second timeout prevents startup from hanging if the DB is
-	// temporarily overloaded; the context is not stored — it is only used
-	// during the Prepare call itself.
 	prepCtx, prepCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer prepCancel()
 
@@ -95,19 +70,26 @@ func New(migrationsFS fs.FS) (*App, error) {
 	log.Info("prepared statements ready")
 
 	// ─── JWT ───────────────────────────────────────────────────────────────────
+	// config.JWTKeyConfig and platformauth.JWTKey are structurally identical but
+	// live in separate packages to prevent an import cycle (platform/auth must
+	// not import config).  The conversion is a one-liner per key.
+	//
+	// NewJWT panics on an invalid key set (no active key, duplicate IDs, etc.).
+	// config.Load already validates the same invariants and returns a clean
+	// error, so a panic here means a programming error in Load, not an operator
+	// mistake.
 	jwtHelper := platformauth.NewJWT(platformauth.JWTConfig{
-		Secret:     cfg.JWTSecret,
+		Keys:       jwtKeysFromConfig(cfg.JWTKeys),
 		Issuer:     cfg.JWTIssuer,
 		Audience:   cfg.JWTAudience,
 		AccessTTL:  cfg.AccessTTL,
 		RefreshTTL: cfg.RefreshTTL,
 	})
 
+	logJWTKeySet(log, cfg.JWTKeys)
+
 	// ─── Modules ───────────────────────────────────────────────────────────────
-	// Both modules receive the shared *db.Queries so all queries in a request
-	// flow through the same prepared handles.  Ownership of queries stays here;
-	// Shutdown closes it after the HTTP server drains.
-	authMod := authmodule.NewModule(queries, jwtHelper, log)
+	authMod := authmodule.NewModule(sqlDB, queries, jwtHelper, log)
 	usersMod := usersmodule.NewModule(queries, log)
 
 	// ─── Router ────────────────────────────────────────────────────────────────
@@ -173,25 +155,16 @@ func (a *App) Run() error {
 
 // Shutdown gracefully stops the server, closes prepared statements, then
 // closes the connection pool.
-//
-// Order matters: the HTTP server must drain first so in-flight handlers can
-// finish their queries.  Prepared statements are closed before the pool
-// because each statement holds an implicit reference to a connection.
 func (a *App) Shutdown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// 1. Stop accepting new requests; wait for in-flight handlers to finish.
 	if err := a.server.Shutdown(ctx); err != nil {
 		a.log.Error("server shutdown error", zap.Error(err))
 	}
-
-	// 2. Release prepared-statement handles on the server side.
 	if err := a.queries.Close(); err != nil {
 		a.log.Error("prepared statements close error", zap.Error(err))
 	}
-
-	// 3. Close the connection pool last.
 	if err := a.db.Close(); err != nil {
 		a.log.Error("database close error", zap.Error(err))
 	}
@@ -199,4 +172,36 @@ func (a *App) Shutdown() error {
 	a.log.Info("server stopped")
 	_ = a.log.Sync()
 	return nil
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+// jwtKeysFromConfig converts the config-package key slice to the platform/auth
+// key slice.  The two types are structurally identical; the conversion exists
+// only to break the config → platform/auth import that would create a cycle.
+func jwtKeysFromConfig(keys []config.JWTKeyConfig) []platformauth.JWTKey {
+	out := make([]platformauth.JWTKey, len(keys))
+	for i, k := range keys {
+		out[i] = platformauth.JWTKey{
+			ID:     k.ID,
+			Secret: k.Secret,
+			Active: k.Active,
+		}
+	}
+	return out
+}
+
+// logJWTKeySet logs the key IDs and their active/inactive status at startup
+// without ever logging secrets.  Useful for confirming which keys are loaded
+// after a rotation.
+func logJWTKeySet(log *zap.Logger, keys []config.JWTKeyConfig) {
+	ids := make([]string, len(keys))
+	for i, k := range keys {
+		status := "inactive"
+		if k.Active {
+			status = "active"
+		}
+		ids[i] = k.ID + "(" + status + ")"
+	}
+	log.Info("JWT key set loaded", zap.Strings("keys", ids))
 }

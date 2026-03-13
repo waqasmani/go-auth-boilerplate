@@ -32,6 +32,21 @@ func newStubRepo() *stubRepo {
 	}
 }
 
+// WithTx satisfies auth.Repository.  The stub has no real transaction
+// semantics — it calls fn with itself so the callback operates on the same
+// in-memory state.  This is correct for unit tests: we want to verify service
+// logic (correct sequencing, error propagation, reuse detection) without
+// standing up a real database.  True atomicity is covered by integration tests
+// against a live MySQL instance.
+//
+// If fn returns an error the stub does nothing (mirrors rollback).
+// If fn returns nil the stub does nothing (mirrors commit).
+// Either way the in-memory state reflects every write fn performed, which is
+// what the test assertions need to inspect.
+func (r *stubRepo) WithTx(_ context.Context, fn func(tx auth.Repository) error) error {
+	return fn(r)
+}
+
 func (r *stubRepo) GetUserByEmail(_ context.Context, email string) (*db.User, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -127,7 +142,9 @@ func (r *stubRepo) RevokeRefreshToken(_ context.Context, _ string) error {
 
 func newTestService(repo auth.Repository) auth.Service {
 	jwt := platformauth.NewJWT(platformauth.JWTConfig{
-		Secret:     "test-secret-at-least-32-characters-long",
+		Keys: []platformauth.JWTKey{
+			{ID: "test-v1", Secret: "test-secret-at-least-32-characters-long", Active: true},
+		},
 		Issuer:     "test",
 		Audience:   "test-audience",
 		AccessTTL:  15 * time.Minute,
