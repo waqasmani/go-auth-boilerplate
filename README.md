@@ -23,8 +23,6 @@ Production-ready Go authentication boilerplate with JWT access + refresh tokens,
 
 ## App Architecture
 ![alt text](app_architecture.png)
-
-## Token Design
 ![alt text](token_design.png)
 ---
 
