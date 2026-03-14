@@ -26,11 +26,6 @@ func NewHandler(svc Service) *Handler {
 // @Router       /users/me [get]
 func (h *Handler) Me(c *gin.Context) {
 	claims := middleware.MustGetClaims(c)
-	if claims == nil {
-		response.Error(c, nil)
-		return
-	}
-
 	userResp, err := h.svc.GetMe(c.Request.Context(), claims.UserID)
 	if err != nil {
 		response.Error(c, err)

@@ -24,6 +24,9 @@ func New(db DBTX) *Queries {
 func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	q := Queries{db: db}
 	var err error
+	if q.assignUserRoleByNameStmt, err = db.PrepareContext(ctx, assignUserRoleByName); err != nil {
+		return nil, fmt.Errorf("error preparing query AssignUserRoleByName: %w", err)
+	}
 	if q.consumeRefreshTokenStmt, err = db.PrepareContext(ctx, consumeRefreshToken); err != nil {
 		return nil, fmt.Errorf("error preparing query ConsumeRefreshToken: %w", err)
 	}
@@ -39,8 +42,14 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getUserByEmailStmt, err = db.PrepareContext(ctx, getUserByEmail); err != nil {
 		return nil, fmt.Errorf("error preparing query GetUserByEmail: %w", err)
 	}
+	if q.getUserByEmailWithRolesStmt, err = db.PrepareContext(ctx, getUserByEmailWithRoles); err != nil {
+		return nil, fmt.Errorf("error preparing query GetUserByEmailWithRoles: %w", err)
+	}
 	if q.getUserByIDStmt, err = db.PrepareContext(ctx, getUserByID); err != nil {
 		return nil, fmt.Errorf("error preparing query GetUserByID: %w", err)
+	}
+	if q.getUserByIDWithRolesStmt, err = db.PrepareContext(ctx, getUserByIDWithRoles); err != nil {
+		return nil, fmt.Errorf("error preparing query GetUserByIDWithRoles: %w", err)
 	}
 	if q.revokeRefreshTokenStmt, err = db.PrepareContext(ctx, revokeRefreshToken); err != nil {
 		return nil, fmt.Errorf("error preparing query RevokeRefreshToken: %w", err)
@@ -53,6 +62,11 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 
 func (q *Queries) Close() error {
 	var err error
+	if q.assignUserRoleByNameStmt != nil {
+		if cerr := q.assignUserRoleByNameStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing assignUserRoleByNameStmt: %w", cerr)
+		}
+	}
 	if q.consumeRefreshTokenStmt != nil {
 		if cerr := q.consumeRefreshTokenStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing consumeRefreshTokenStmt: %w", cerr)
@@ -78,9 +92,19 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getUserByEmailStmt: %w", cerr)
 		}
 	}
+	if q.getUserByEmailWithRolesStmt != nil {
+		if cerr := q.getUserByEmailWithRolesStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getUserByEmailWithRolesStmt: %w", cerr)
+		}
+	}
 	if q.getUserByIDStmt != nil {
 		if cerr := q.getUserByIDStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getUserByIDStmt: %w", cerr)
+		}
+	}
+	if q.getUserByIDWithRolesStmt != nil {
+		if cerr := q.getUserByIDWithRolesStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getUserByIDWithRolesStmt: %w", cerr)
 		}
 	}
 	if q.revokeRefreshTokenStmt != nil {
@@ -132,12 +156,15 @@ func (q *Queries) queryRow(ctx context.Context, stmt *sql.Stmt, query string, ar
 type Queries struct {
 	db                           DBTX
 	tx                           *sql.Tx
+	assignUserRoleByNameStmt     *sql.Stmt
 	consumeRefreshTokenStmt      *sql.Stmt
 	createRefreshTokenStmt       *sql.Stmt
 	createUserStmt               *sql.Stmt
 	getRefreshTokenByHashStmt    *sql.Stmt
 	getUserByEmailStmt           *sql.Stmt
+	getUserByEmailWithRolesStmt  *sql.Stmt
 	getUserByIDStmt              *sql.Stmt
+	getUserByIDWithRolesStmt     *sql.Stmt
 	revokeRefreshTokenStmt       *sql.Stmt
 	revokeRefreshTokenFamilyStmt *sql.Stmt
 }
@@ -146,12 +173,15 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 	return &Queries{
 		db:                           tx,
 		tx:                           tx,
+		assignUserRoleByNameStmt:     q.assignUserRoleByNameStmt,
 		consumeRefreshTokenStmt:      q.consumeRefreshTokenStmt,
 		createRefreshTokenStmt:       q.createRefreshTokenStmt,
 		createUserStmt:               q.createUserStmt,
 		getRefreshTokenByHashStmt:    q.getRefreshTokenByHashStmt,
 		getUserByEmailStmt:           q.getUserByEmailStmt,
+		getUserByEmailWithRolesStmt:  q.getUserByEmailWithRolesStmt,
 		getUserByIDStmt:              q.getUserByIDStmt,
+		getUserByIDWithRolesStmt:     q.getUserByIDWithRolesStmt,
 		revokeRefreshTokenStmt:       q.revokeRefreshTokenStmt,
 		revokeRefreshTokenFamilyStmt: q.revokeRefreshTokenFamilyStmt,
 	}

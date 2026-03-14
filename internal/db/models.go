@@ -20,6 +20,14 @@ type RefreshToken struct {
 	CreatedAt   time.Time    `json:"created_at"`
 }
 
+type Role struct {
+	ID          int32          `json:"id"`
+	Name        string         `json:"name"`
+	Description sql.NullString `json:"description"`
+	CreatedAt   sql.NullTime   `json:"created_at"`
+	UpdatedAt   sql.NullTime   `json:"updated_at"`
+}
+
 type User struct {
 	ID           string    `json:"id"`
 	Email        string    `json:"email"`
@@ -27,4 +35,10 @@ type User struct {
 	Name         string    `json:"name"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type UserRole struct {
+	UserID     string       `json:"user_id"`
+	RoleID     int32        `json:"role_id"`
+	AssignedAt sql.NullTime `json:"assigned_at"`
 }

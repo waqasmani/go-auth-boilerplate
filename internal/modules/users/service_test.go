@@ -28,6 +28,23 @@ func (r *stubUsersRepo) GetUserByID(_ context.Context, id string) (*db.User, err
 	}
 	return nil, apperrors.ErrNotFound
 }
+func (r *stubUsersRepo) AssignUserRole(_ context.Context, _, _ string) error {
+	return nil
+}
+func (r *stubUsersRepo) GetUserByIDWithRoles(_ context.Context, id string) (*users.UserResponse, error) {
+	u, ok := r.users[id]
+	if !ok {
+		return nil, apperrors.ErrNotFound
+	}
+	return &users.UserResponse{
+		ID:        u.ID,
+		Name:      u.Name,
+		Email:     u.Email,
+		Roles:     []string{},
+		CreatedAt: u.CreatedAt,
+		UpdatedAt: u.UpdatedAt,
+	}, nil
+}
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 

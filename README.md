@@ -1,5 +1,6 @@
 # Go Auth Boilerplate
 
+![alt text](image.png)
 Production-ready Go authentication boilerplate with JWT access + refresh tokens, token rotation, reuse detection, and a clean modules-first architecture.
 
 ## Stack

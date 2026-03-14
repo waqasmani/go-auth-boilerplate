@@ -6,7 +6,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-const defaultCost = bcrypt.DefaultCost
+const defaultCost = 12
 
 // HashPassword hashes a plain-text password using bcrypt.
 func HashPassword(plain string) (string, error) {

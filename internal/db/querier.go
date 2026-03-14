@@ -10,6 +10,10 @@ import (
 )
 
 type Querier interface {
+	// Assigns a role to a user by role name rather than by hard-coded role_id.
+	// The LIMIT 1 is defensive — role names are UNIQUE but this makes the intent
+	// explicit and prevents a runaway insert if that constraint were ever dropped.
+	AssignUserRoleByName(ctx context.Context, arg AssignUserRoleByNameParams) (sql.Result, error)
 	// Atomically marks a refresh token as used in a single UPDATE.
 	// The WHERE used_at IS NULL guard means exactly one concurrent caller
 	// will get RowsAffected = 1; every other caller racing on the same token
@@ -19,7 +23,9 @@ type Querier interface {
 	CreateUser(ctx context.Context, arg CreateUserParams) error
 	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (RefreshToken, error)
 	GetUserByEmail(ctx context.Context, email string) (User, error)
+	GetUserByEmailWithRoles(ctx context.Context, email string) ([]GetUserByEmailWithRolesRow, error)
 	GetUserByID(ctx context.Context, id string) (User, error)
+	GetUserByIDWithRoles(ctx context.Context, id string) ([]GetUserByIDWithRolesRow, error)
 	RevokeRefreshToken(ctx context.Context, id string) error
 	RevokeRefreshTokenFamily(ctx context.Context, tokenFamily string) error
 }

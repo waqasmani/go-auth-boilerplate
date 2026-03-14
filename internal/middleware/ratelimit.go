@@ -8,12 +8,13 @@ package middleware
 
 import (
 	"fmt"
-	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/hashicorp/golang-lru/v2/expirable"
+	apperrors "github.com/waqasmani/go-auth-boilerplate/internal/errors"
+	"github.com/waqasmani/go-auth-boilerplate/internal/response"
 	"golang.org/x/time/rate"
 )
 
@@ -273,7 +274,8 @@ func RateLimit(cfg RateLimitConfig) gin.HandlerFunc {
 			}
 
 			c.Header("Retry-After", strconv.Itoa(retrySeconds))
-			c.AbortWithStatusJSON(http.StatusTooManyRequests, rateLimitErrorBody())
+			response.Error(c, apperrors.ErrRateLimitExceeded)
+			c.Abort()
 			return
 		}
 
@@ -287,18 +289,4 @@ func RateLimit(cfg RateLimitConfig) gin.HandlerFunc {
 //	authGroup.Use(middleware.RateLimitWithDefaults())
 func RateLimitWithDefaults() gin.HandlerFunc {
 	return RateLimit(DefaultRateLimitConfig())
-}
-
-// ─── Response Body ────────────────────────────────────────────────────────────
-
-// rateLimitErrorBody returns the JSON body for a 429 response.
-// Shape mirrors the project-wide response.Response envelope.
-func rateLimitErrorBody() map[string]interface{} {
-	return map[string]interface{}{
-		"success": false,
-		"error": map[string]string{
-			"code":    "RATE_LIMIT_EXCEEDED",
-			"message": "too many requests — slow down and try again",
-		},
-	}
 }

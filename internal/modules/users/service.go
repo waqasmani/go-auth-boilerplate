@@ -26,23 +26,17 @@ func NewService(repo Repository, log *zap.Logger) Service {
 	return &service{repo: repo, log: log}
 }
 
+// AFTER
 func (s *service) GetMe(ctx context.Context, userID string) (*UserResponse, error) {
 	if userID == "" {
 		return nil, apperrors.ErrUnauthorized
 	}
 
-	user, err := s.repo.GetUserByID(ctx, userID)
+	resp, err := s.repo.GetUserByIDWithRoles(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
 
 	logger.FromContext(ctx).Debug("fetched user profile", zap.String("user_id", userID))
-
-	return &UserResponse{
-		ID:        user.ID,
-		Name:      user.Name,
-		Email:     user.Email,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-	}, nil
+	return resp, nil
 }

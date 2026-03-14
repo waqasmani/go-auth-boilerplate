@@ -11,6 +11,26 @@ import (
 	"time"
 )
 
+const assignUserRoleByName = `-- name: AssignUserRoleByName :execresult
+INSERT INTO user_roles (user_id, role_id)
+SELECT ?, r.id
+FROM roles r
+WHERE r.name = ?
+LIMIT 1
+`
+
+type AssignUserRoleByNameParams struct {
+	UserID string `json:"user_id"`
+	Name   string `json:"name"`
+}
+
+// Assigns a role to a user by role name rather than by hard-coded role_id.
+// The LIMIT 1 is defensive — role names are UNIQUE but this makes the intent
+// explicit and prevents a runaway insert if that constraint were ever dropped.
+func (q *Queries) AssignUserRoleByName(ctx context.Context, arg AssignUserRoleByNameParams) (sql.Result, error) {
+	return q.exec(ctx, q.assignUserRoleByNameStmt, assignUserRoleByName, arg.UserID, arg.Name)
+}
+
 const consumeRefreshToken = `-- name: ConsumeRefreshToken :execresult
 UPDATE refresh_tokens
 SET used_at = NOW()
@@ -77,6 +97,7 @@ const getRefreshTokenByHash = `-- name: GetRefreshTokenByHash :one
 SELECT id, user_id, token_hash, token_family, expires_at, used_at, revoked_at, created_at
 FROM refresh_tokens
 WHERE token_hash = ?
+AND revoked_at IS NULL
 LIMIT 1
 `
 
@@ -117,6 +138,68 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 	return i, err
 }
 
+const getUserByEmailWithRoles = `-- name: GetUserByEmailWithRoles :many
+SELECT
+    u.id,
+    u.email,
+    u.password_hash,
+    u.name,
+    u.created_at,
+    u.updated_at,
+    r.id          AS role_id,
+    r.name        AS role_name,
+    r.description AS role_description
+FROM users u
+LEFT JOIN user_roles ur ON ur.user_id = u.id
+LEFT JOIN roles r       ON r.id       = ur.role_id
+WHERE u.email = ?
+`
+
+type GetUserByEmailWithRolesRow struct {
+	ID              string         `json:"id"`
+	Email           string         `json:"email"`
+	PasswordHash    string         `json:"password_hash"`
+	Name            string         `json:"name"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
+	RoleID          sql.NullInt32  `json:"role_id"`
+	RoleName        sql.NullString `json:"role_name"`
+	RoleDescription sql.NullString `json:"role_description"`
+}
+
+func (q *Queries) GetUserByEmailWithRoles(ctx context.Context, email string) ([]GetUserByEmailWithRolesRow, error) {
+	rows, err := q.query(ctx, q.getUserByEmailWithRolesStmt, getUserByEmailWithRoles, email)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GetUserByEmailWithRolesRow{}
+	for rows.Next() {
+		var i GetUserByEmailWithRolesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Email,
+			&i.PasswordHash,
+			&i.Name,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.RoleID,
+			&i.RoleName,
+			&i.RoleDescription,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getUserByID = `-- name: GetUserByID :one
 SELECT id, email, password_hash, name, created_at, updated_at
 FROM users
@@ -136,6 +219,68 @@ func (q *Queries) GetUserByID(ctx context.Context, id string) (User, error) {
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const getUserByIDWithRoles = `-- name: GetUserByIDWithRoles :many
+SELECT
+    u.id,
+    u.email,
+    u.password_hash,
+    u.name,
+    u.created_at,
+    u.updated_at,
+    r.id          AS role_id,
+    r.name        AS role_name,
+    r.description AS role_description
+FROM users u
+LEFT JOIN user_roles ur ON ur.user_id = u.id
+LEFT JOIN roles r       ON r.id       = ur.role_id
+WHERE u.id = ?
+`
+
+type GetUserByIDWithRolesRow struct {
+	ID              string         `json:"id"`
+	Email           string         `json:"email"`
+	PasswordHash    string         `json:"password_hash"`
+	Name            string         `json:"name"`
+	CreatedAt       time.Time      `json:"created_at"`
+	UpdatedAt       time.Time      `json:"updated_at"`
+	RoleID          sql.NullInt32  `json:"role_id"`
+	RoleName        sql.NullString `json:"role_name"`
+	RoleDescription sql.NullString `json:"role_description"`
+}
+
+func (q *Queries) GetUserByIDWithRoles(ctx context.Context, id string) ([]GetUserByIDWithRolesRow, error) {
+	rows, err := q.query(ctx, q.getUserByIDWithRolesStmt, getUserByIDWithRoles, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []GetUserByIDWithRolesRow{}
+	for rows.Next() {
+		var i GetUserByIDWithRolesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Email,
+			&i.PasswordHash,
+			&i.Name,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.RoleID,
+			&i.RoleName,
+			&i.RoleDescription,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const revokeRefreshToken = `-- name: RevokeRefreshToken :exec

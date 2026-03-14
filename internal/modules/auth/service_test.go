@@ -3,6 +3,7 @@ package auth_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -47,6 +48,42 @@ func (r *stubRepo) WithTx(_ context.Context, fn func(tx auth.Repository) error) 
 	return fn(r)
 }
 
+func (r *stubRepo) GetUserByEmailWithRoles(_ context.Context, email string) (*auth.UserWithRoles, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, u := range r.users {
+		if u.Email == email {
+			return &auth.UserWithRoles{
+				ID:           u.ID,
+				Name:         u.Name,
+				Email:        u.Email,
+				PasswordHash: u.PasswordHash,
+				Roles:        []string{},
+				CreatedAt:    u.CreatedAt,
+				UpdatedAt:    u.UpdatedAt,
+			}, nil
+		}
+	}
+	return nil, apperrors.ErrNotFound
+}
+
+func (r *stubRepo) GetUserByIDWithRoles(_ context.Context, id string) (*auth.UserWithRoles, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	u, ok := r.users[id]
+	if !ok {
+		return nil, apperrors.ErrNotFound
+	}
+	return &auth.UserWithRoles{
+		ID:           u.ID,
+		Name:         u.Name,
+		Email:        u.Email,
+		PasswordHash: u.PasswordHash,
+		Roles:        []string{},
+		CreatedAt:    u.CreatedAt,
+		UpdatedAt:    u.UpdatedAt,
+	}, nil
+}
 func (r *stubRepo) GetUserByEmail(_ context.Context, email string) (*db.User, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -67,9 +104,22 @@ func (r *stubRepo) GetUserByID(_ context.Context, id string) (*db.User, error) {
 	return nil, apperrors.ErrNotFound
 }
 
+func (r *stubRepo) AssignUserRole(_ context.Context, _, _ string) error {
+	return nil
+}
+
 func (r *stubRepo) CreateUser(_ context.Context, params db.CreateUserParams) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// Mirror the MySQL UNIQUE KEY uq_users_email constraint.
+	// The real repo gets this for free from error 1062; the stub must enforce it explicitly.
+	for _, u := range r.users {
+		if u.Email == params.Email {
+			return apperrors.ErrEmailAlreadyExists
+		}
+	}
+
 	r.users[params.ID] = &db.User{
 		ID:           params.ID,
 		Email:        params.Email,
@@ -190,6 +240,7 @@ func TestRegister_DuplicateEmail(t *testing.T) {
 		Email:    "alice@example.com",
 		Password: "securepassword",
 	})
+	fmt.Println(err)
 	if err == nil {
 		t.Fatal("expected conflict error")
 	}
@@ -322,5 +373,118 @@ func TestRefresh_TokenReuse_Concurrent(t *testing.T) {
 
 	if successes != 1 {
 		t.Errorf("expected exactly 1 successful refresh, got %d", successes)
+	}
+}
+
+// seedToken inserts a token record directly into the stub, bypassing the
+// normal issue flow.  Used by logout tests that need pre-expired or
+// pre-revoked tokens that could never arrive via the service itself.
+func (r *stubRepo) seedToken(tok *db.RefreshToken) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tokens[tok.TokenHash] = tok
+}
+
+// ─── Logout tests ─────────────────────────────────────────────────────────────
+
+// TestLogout_ValidToken_RevokesFamily is the happy path: a live token causes
+// its entire session family to be revoked.
+func TestLogout_ValidToken_RevokesFamily(t *testing.T) {
+	repo := newStubRepo()
+	svc := newTestService(repo)
+
+	loginResp, _ := svc.Register(context.Background(), auth.RegisterRequest{
+		Name: "Eve", Email: "eve@example.com", Password: "password123",
+	})
+
+	if err := svc.Logout(context.Background(), auth.LogoutRequest{
+		RefreshToken: loginResp.RefreshToken,
+	}); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// A subsequent refresh must fail because the family is now revoked.
+	_, err := svc.Refresh(context.Background(), auth.RefreshRequest{
+		RefreshToken: loginResp.RefreshToken,
+	})
+	if err == nil {
+		t.Fatal("expected error after logout, got nil")
+	}
+}
+
+// TestLogout_MissingToken_IsIdempotent confirms that presenting a token that
+// does not exist in the database is silently accepted — the session was
+// already gone.
+func TestLogout_MissingToken_IsIdempotent(t *testing.T) {
+	repo := newStubRepo()
+	svc := newTestService(repo)
+
+	err := svc.Logout(context.Background(), auth.LogoutRequest{
+		RefreshToken: "token-that-was-never-issued",
+	})
+	if err != nil {
+		t.Fatalf("missing token should be treated as already logged out, got %v", err)
+	}
+}
+
+// TestLogout_ExpiredToken_IsIdempotent is the key regression test for the
+// oracle bug.  An attacker holding a stolen-but-expired token must get the
+// same silent 200/204 as any other no-op logout, not an error that reveals
+// the token's history.
+func TestLogout_ExpiredToken_IsIdempotent(t *testing.T) {
+	repo := newStubRepo()
+	svc := newTestService(repo)
+
+	// Seed an expired token directly — it can never be issued through the
+	// normal service flow because ExpiresAt is always set to now+RefreshTTL.
+	const rawToken = "expired-raw-token-value"
+	repo.seedToken(&db.RefreshToken{
+		ID:          "expired-id",
+		UserID:      "some-user",
+		TokenHash:   platformauth.HashRefreshToken(rawToken),
+		TokenFamily: "some-family",
+		ExpiresAt:   time.Now().Add(-24 * time.Hour), // expired yesterday
+	})
+
+	err := svc.Logout(context.Background(), auth.LogoutRequest{
+		RefreshToken: rawToken,
+	})
+	if err != nil {
+		t.Fatalf("expired token should be silently accepted, got %v", err)
+	}
+
+	// The family must NOT have been touched — revoking an expired family leaks
+	// information and is a no-op from a security perspective.
+	repo.mu.Lock()
+	revoked := repo.revokedFamilies["some-family"]
+	repo.mu.Unlock()
+	if revoked {
+		t.Error("logout with expired token should not revoke the family")
+	}
+}
+
+// TestLogout_RevokedToken_IsIdempotent ensures that presenting a token whose
+// family was already revoked (e.g. a prior logout or reuse event) returns
+// success with no state change, not an error that reveals revocation status.
+func TestLogout_RevokedToken_IsIdempotent(t *testing.T) {
+	repo := newStubRepo()
+	svc := newTestService(repo)
+
+	loginResp, _ := svc.Register(context.Background(), auth.RegisterRequest{
+		Name: "Frank", Email: "frank@example.com", Password: "password123",
+	})
+
+	// First logout: revokes the family.
+	_ = svc.Logout(context.Background(), auth.LogoutRequest{
+		RefreshToken: loginResp.RefreshToken,
+	})
+
+	// Second logout with the same token: family is already revoked.
+	// Must return nil, not an error that distinguishes "revoked" from "missing".
+	err := svc.Logout(context.Background(), auth.LogoutRequest{
+		RefreshToken: loginResp.RefreshToken,
+	})
+	if err != nil {
+		t.Fatalf("second logout with revoked token should be silently accepted, got %v", err)
 	}
 }

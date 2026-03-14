@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"net/http"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/waqasmani/go-auth-boilerplate/internal/db"
 	apperrors "github.com/waqasmani/go-auth-boilerplate/internal/errors"
 )
@@ -15,38 +18,14 @@ import (
 type Repository interface {
 	GetUserByEmail(ctx context.Context, email string) (*db.User, error)
 	GetUserByID(ctx context.Context, id string) (*db.User, error)
+	GetUserByIDWithRoles(ctx context.Context, id string) (*UserWithRoles, error)
+	GetUserByEmailWithRoles(ctx context.Context, email string) (*UserWithRoles, error)
 	CreateUser(ctx context.Context, params db.CreateUserParams) error
 	CreateRefreshToken(ctx context.Context, params db.CreateRefreshTokenParams) error
 	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (*db.RefreshToken, error)
-
-	// ConsumeRefreshToken atomically marks the token as used in a single UPDATE
-	// that includes a "used_at IS NULL" guard. It returns true when this caller
-	// won the race (RowsAffected == 1) and false when another request already
-	// consumed the token (RowsAffected == 0), which the service treats as reuse.
+	AssignUserRole(ctx context.Context, userID, roleName string) error
 	ConsumeRefreshToken(ctx context.Context, id string) (bool, error)
-
 	RevokeRefreshTokenFamily(ctx context.Context, family string) error
-	RevokeRefreshToken(ctx context.Context, id string) error
-
-	// WithTx executes fn inside a single database transaction.
-	//
-	// The Repository passed to fn is backed by a transaction-scoped *db.Queries
-	// (via queries.WithTx), so every call inside fn participates in the same
-	// transaction.  WithTx commits when fn returns nil and rolls back otherwise.
-	//
-	// Callers should never pass the outer Repository into fn — always use the
-	// tx-scoped one provided as the argument so the atomicity guarantee holds.
-	//
-	// Example — register user + issue first refresh token atomically:
-	//
-	//	var tokenResp *TokenResponse
-	//	err = s.repo.WithTx(ctx, func(tx Repository) error {
-	//	    if err := tx.CreateUser(ctx, userParams); err != nil {
-	//	        return err
-	//	    }
-	//	    tokenResp, err = s.issueTokenPair(ctx, tx, userID, email, roles, "")
-	//	    return err
-	//	})
 	WithTx(ctx context.Context, fn func(tx Repository) error) error
 }
 
@@ -104,6 +83,53 @@ func (r *repository) GetUserByEmail(ctx context.Context, email string) (*db.User
 	return &user, nil
 }
 
+func (r *repository) GetUserByEmailWithRoles(ctx context.Context, email string) (*UserWithRoles, error) {
+	rows, err := r.queries.GetUserByEmailWithRoles(ctx, email)
+	if err != nil {
+		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
+	}
+	if len(rows) == 0 {
+		return nil, apperrors.ErrNotFound
+	}
+
+	result := &UserWithRoles{
+		ID:           rows[0].ID,
+		Name:         rows[0].Name,
+		Email:        rows[0].Email,
+		Roles:        []string{},
+		PasswordHash: rows[0].PasswordHash,
+		CreatedAt:    rows[0].CreatedAt,
+		UpdatedAt:    rows[0].UpdatedAt,
+	}
+
+	for _, row := range rows {
+		if row.RoleName.Valid {
+			result.Roles = append(result.Roles, row.RoleName.String)
+		}
+	}
+
+	return result, nil
+}
+
+func (r *repository) AssignUserRole(ctx context.Context, userID, roleName string) error {
+	result, err := r.queries.AssignUserRoleByName(ctx, db.AssignUserRoleByNameParams{
+		UserID: userID,
+		Name:   roleName,
+	})
+	if err != nil {
+		return apperrors.Wrap(apperrors.ErrInternalServer, err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return apperrors.Wrap(apperrors.ErrInternalServer, err)
+	}
+	if affected == 0 {
+		return apperrors.New("ROLE_NOT_FOUND",
+			fmt.Sprintf("role %q does not exist", roleName),
+			http.StatusInternalServerError, nil)
+	}
+	return nil
+}
 func (r *repository) GetUserByID(ctx context.Context, id string) (*db.User, error) {
 	user, err := r.queries.GetUserByID(ctx, id)
 	if err != nil {
@@ -115,8 +141,41 @@ func (r *repository) GetUserByID(ctx context.Context, id string) (*db.User, erro
 	return &user, nil
 }
 
+func (r *repository) GetUserByIDWithRoles(ctx context.Context, id string) (*UserWithRoles, error) {
+	rows, err := r.queries.GetUserByIDWithRoles(ctx, id)
+	if err != nil {
+		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
+	}
+
+	if len(rows) == 0 {
+		return nil, apperrors.ErrNotFound
+	}
+
+	result := &UserWithRoles{
+		ID:           rows[0].ID,
+		Name:         rows[0].Name,
+		Email:        rows[0].Email,
+		Roles:        []string{},
+		PasswordHash: rows[0].PasswordHash,
+		CreatedAt:    rows[0].CreatedAt,
+		UpdatedAt:    rows[0].UpdatedAt,
+	}
+
+	for _, row := range rows {
+		if row.RoleName.Valid {
+			result.Roles = append(result.Roles, row.RoleName.String)
+		}
+	}
+	return result, nil
+}
+
 func (r *repository) CreateUser(ctx context.Context, params db.CreateUserParams) error {
 	if err := r.queries.CreateUser(ctx, params); err != nil {
+		// Check for MySQL duplicate entry error (unique constraint violation on email)
+		var mysqlErr *mysql.MySQLError
+		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
+			return apperrors.ErrEmailAlreadyExists
+		}
 		return apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
 	return nil
@@ -124,6 +183,13 @@ func (r *repository) CreateUser(ctx context.Context, params db.CreateUserParams)
 
 func (r *repository) CreateRefreshToken(ctx context.Context, params db.CreateRefreshTokenParams) error {
 	if err := r.queries.CreateRefreshToken(ctx, params); err != nil {
+		var mysqlErr *mysql.MySQLError
+		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1452 {
+			// The user was deleted between the read and this write.
+			// Surfacing ErrNotFound lets the service return a 404/401
+			// rather than an opaque 500.
+			return apperrors.Wrap(apperrors.ErrNotFound, err)
+		}
 		return apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
 	return nil
@@ -157,13 +223,6 @@ func (r *repository) ConsumeRefreshToken(ctx context.Context, id string) (bool, 
 
 func (r *repository) RevokeRefreshTokenFamily(ctx context.Context, family string) error {
 	if err := r.queries.RevokeRefreshTokenFamily(ctx, family); err != nil {
-		return apperrors.Wrap(apperrors.ErrInternalServer, err)
-	}
-	return nil
-}
-
-func (r *repository) RevokeRefreshToken(ctx context.Context, id string) error {
-	if err := r.queries.RevokeRefreshToken(ctx, id); err != nil {
 		return apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
 	return nil

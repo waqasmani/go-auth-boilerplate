@@ -109,7 +109,11 @@ func TestNewMigrator_EmptyFS_ReturnsError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
-	defer db.Close()
+	defer func() {
+		if cerr := db.Close(); cerr != nil {
+			t.Logf("failed to close db: %v", cerr)
+		}
+	}()
 
 	_, err = newMigrator(db, emptyFS)
 	if err == nil {

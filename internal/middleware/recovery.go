@@ -1,9 +1,8 @@
 package middleware
 
 import (
-	"net/http"
-
 	"github.com/gin-gonic/gin"
+	apperrors "github.com/waqasmani/go-auth-boilerplate/internal/errors"
 	"github.com/waqasmani/go-auth-boilerplate/internal/response"
 	"go.uber.org/zap"
 )
@@ -20,13 +19,7 @@ func Recovery(log *zap.Logger) gin.HandlerFunc {
 					zap.String("method", c.Request.Method),
 					zap.String("path", c.Request.URL.Path),
 				)
-				c.AbortWithStatusJSON(http.StatusInternalServerError, response.Response{
-					Success: false,
-					Error: &response.ErrorBody{
-						Code:    "INTERNAL_SERVER_ERROR",
-						Message: "an unexpected error occurred",
-					},
-				})
+				response.Error(c, apperrors.ErrInternalServer)
 			}
 		}()
 		c.Next()

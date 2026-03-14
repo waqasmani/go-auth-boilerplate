@@ -1,0 +1,232 @@
+basePath: /api/v1
+definitions:
+  github_com_waqasmani_go-auth-boilerplate_internal_response.ErrorBody:
+    properties:
+      code:
+        type: string
+      details:
+        additionalProperties:
+          type: string
+        type: object
+      message:
+        type: string
+    type: object
+  github_com_waqasmani_go-auth-boilerplate_internal_response.Response:
+    properties:
+      data: {}
+      error:
+        $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.ErrorBody'
+      message:
+        type: string
+      success:
+        type: boolean
+    type: object
+  internal_modules_auth.LoginRequest:
+    properties:
+      email:
+        type: string
+      password:
+        minLength: 1
+        type: string
+    required:
+    - email
+    - password
+    type: object
+  internal_modules_auth.LogoutRequest:
+    properties:
+      refresh_token:
+        type: string
+    required:
+    - refresh_token
+    type: object
+  internal_modules_auth.RefreshRequest:
+    properties:
+      refresh_token:
+        type: string
+    required:
+    - refresh_token
+    type: object
+  internal_modules_auth.RegisterRequest:
+    properties:
+      email:
+        type: string
+      name:
+        maxLength: 100
+        minLength: 2
+        type: string
+      password:
+        maxLength: 72
+        minLength: 12
+        type: string
+    required:
+    - email
+    - name
+    - password
+    type: object
+  internal_modules_auth.TokenResponse:
+    properties:
+      access_token:
+        type: string
+      access_token_expires_at:
+        type: string
+      refresh_token:
+        type: string
+      refresh_token_expires_at:
+        type: string
+      token_type:
+        type: string
+    type: object
+  internal_modules_users.UserResponse:
+    properties:
+      created_at:
+        type: string
+      email:
+        type: string
+      id:
+        type: string
+      name:
+        type: string
+      roles:
+        items:
+          type: string
+        type: array
+      updated_at:
+        type: string
+    type: object
+host: localhost:8080
+info:
+  contact:
+    name: Waqas Mani
+    url: http://github.com/waqasmani/go-auth-boilerplate
+  description: Production-grade JWT authentication service.
+  license:
+    name: MIT
+  title: Go Auth Boilerplate API
+  version: "1.0"
+paths:
+  /auth/login:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Login payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_modules_auth.LoginRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+            - properties:
+                data:
+                  $ref: '#/definitions/internal_modules_auth.TokenResponse'
+              type: object
+      summary: Login
+      tags:
+      - auth
+  /auth/logout:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Logout payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_modules_auth.LogoutRequest'
+      produces:
+      - application/json
+      responses:
+        "204":
+          description: No Content
+      summary: Logout (revoke refresh token family)
+      tags:
+      - auth
+  /auth/refresh:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Refresh payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_modules_auth.RefreshRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+            - properties:
+                data:
+                  $ref: '#/definitions/internal_modules_auth.TokenResponse'
+              type: object
+      summary: Refresh token pair
+      tags:
+      - auth
+  /auth/register:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Registration payload
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_modules_auth.RegisterRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: Created
+          schema:
+            allOf:
+            - $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+            - properties:
+                data:
+                  $ref: '#/definitions/internal_modules_auth.TokenResponse'
+              type: object
+      summary: Register a new user
+      tags:
+      - auth
+  /users/me:
+    get:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+            - properties:
+                data:
+                  $ref: '#/definitions/internal_modules_users.UserResponse'
+              type: object
+      security:
+      - BearerAuth: []
+      summary: Get current user profile
+      tags:
+      - users
+schemes:
+- http
+- https
+securityDefinitions:
+  BearerAuth:
+    description: 'Format: "Bearer <token>"'
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"

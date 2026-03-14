@@ -1,9 +1,11 @@
 package response
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-playground/validator/v10"
 	apperrors "github.com/waqasmani/go-auth-boilerplate/internal/errors"
 )
 
@@ -75,4 +77,64 @@ func ValidationError(c *gin.Context, details map[string]string) {
 			Details: details,
 		},
 	})
+}
+
+// BindAndValidate binds the request body as JSON and validates the resulting
+// struct against business rules. It returns a typed AppError on failure.
+func BindAndValidate(c *gin.Context, req any, v *validator.Validate) bool {
+	if err := c.ShouldBindJSON(req); err != nil {
+		ValidationError(c, map[string]string{"body": "malformed or invalid JSON body"})
+		return false
+	}
+
+	if err := v.Struct(req); err != nil {
+		var validationErrs validator.ValidationErrors
+		if errors.As(err, &validationErrs) {
+			fields := make(map[string]string, len(validationErrs))
+			for _, fe := range validationErrs {
+				fields[fieldName(fe)] = humanMessage(fe.Tag())
+			}
+			ValidationError(c, fields)
+		} else {
+			// Catch-all: still must write a response.
+			ValidationError(c, map[string]string{"body": "invalid request format"})
+		}
+		return false
+	}
+
+	return true
+}
+
+// fieldName extracts the JSON tag name from the validator FieldError so the
+// response key matches what the client sent, not the Go struct field name.
+// "Password" (struct) → "password" (json tag) closes a secondary leak where
+// internal naming conventions are visible to API consumers.
+func fieldName(fe validator.FieldError) string {
+	return fe.Field()
+}
+
+// humanMessage converts a validator tag into a generic, non-revealing message.
+// It deliberately omits parameter values (fe.Param()) to avoid leaking schema
+// constraints such as minimum password length or maximum field sizes.
+func humanMessage(tag string) string {
+	switch tag {
+	case "required":
+		return "this field is required"
+	case "email":
+		return "invalid email address"
+	case "min":
+		return "value does not meet minimum length or size requirements"
+	case "max":
+		return "value exceeds maximum length or size"
+	case "url", "uri":
+		return "invalid URL format"
+	case "uuid", "uuid4":
+		return "invalid identifier format"
+	case "oneof":
+		return "value is not one of the accepted options"
+	case "alphanum":
+		return "only alphanumeric characters are allowed"
+	default:
+		return "invalid field format"
+	}
 }

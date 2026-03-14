@@ -1,10 +1,16 @@
 package auth
 
 import (
+	"net/http"
+	"net/url"
+	"reflect"
+	"strings"
+
 	"github.com/gin-gonic/gin"
 	"github.com/go-playground/validator/v10"
 	"go.uber.org/zap"
 
+	"github.com/waqasmani/go-auth-boilerplate/internal/config"
 	"github.com/waqasmani/go-auth-boilerplate/internal/platform/logger"
 	"github.com/waqasmani/go-auth-boilerplate/internal/response"
 )
@@ -13,14 +19,24 @@ import (
 type Handler struct {
 	svc      Service
 	validate *validator.Validate
+	cfg      *config.Config
 }
 
 // NewHandler constructs an auth handler.
-func NewHandler(svc Service) *Handler {
-	return &Handler{
-		svc:      svc,
-		validate: validator.New(),
-	}
+func NewHandler(svc Service, cfg *config.Config) *Handler {
+	v := validator.New()
+
+	// Register json tag names so validation errors report "password" not "Password".
+	// This closes the struct naming leak and aligns error keys with request fields.
+	v.RegisterTagNameFunc(func(fld reflect.StructField) string {
+		name := strings.SplitN(fld.Tag.Get("json"), ",", 2)[0]
+		if name == "-" || name == "" {
+			return fld.Name
+		}
+		return name
+	})
+
+	return &Handler{svc: svc, validate: v, cfg: cfg}
 }
 
 // Register godoc
@@ -33,7 +49,7 @@ func NewHandler(svc Service) *Handler {
 // @Router       /auth/register [post]
 func (h *Handler) Register(c *gin.Context) {
 	var req RegisterRequest
-	if !bindAndValidate(c, &req, h.validate) {
+	if !response.BindAndValidate(c, &req, h.validate) {
 		return
 	}
 
@@ -45,6 +61,7 @@ func (h *Handler) Register(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
+	h.setCookie(c, tokenResp.RefreshToken)
 	response.Created(c, tokenResp)
 }
 
@@ -58,7 +75,7 @@ func (h *Handler) Register(c *gin.Context) {
 // @Router       /auth/login [post]
 func (h *Handler) Login(c *gin.Context) {
 	var req LoginRequest
-	if !bindAndValidate(c, &req, h.validate) {
+	if !response.BindAndValidate(c, &req, h.validate) {
 		return
 	}
 
@@ -67,6 +84,7 @@ func (h *Handler) Login(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
+	h.setCookie(c, tokenResp.RefreshToken)
 	response.OK(c, tokenResp)
 }
 
@@ -80,7 +98,12 @@ func (h *Handler) Login(c *gin.Context) {
 // @Router       /auth/refresh [post]
 func (h *Handler) Refresh(c *gin.Context) {
 	var req RefreshRequest
-	if !bindAndValidate(c, &req, h.validate) {
+
+	// Try cookie first (web)
+	refreshToken, err := c.Cookie("refresh_token")
+	if err == nil {
+		req.RefreshToken = refreshToken
+	} else if !response.BindAndValidate(c, &req, h.validate) {
 		return
 	}
 
@@ -89,6 +112,10 @@ func (h *Handler) Refresh(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
+
+	// Set cookie for web clients
+	h.setCookie(c, tokenResp.RefreshToken)
+
 	response.OK(c, tokenResp)
 }
 
@@ -102,7 +129,12 @@ func (h *Handler) Refresh(c *gin.Context) {
 // @Router       /auth/logout [post]
 func (h *Handler) Logout(c *gin.Context) {
 	var req LogoutRequest
-	if !bindAndValidate(c, &req, h.validate) {
+
+	// Try cookie first (web)
+	refreshToken, err := c.Cookie("refresh_token")
+	if err == nil {
+		req.RefreshToken = refreshToken
+	} else if !response.BindAndValidate(c, &req, h.validate) {
 		return
 	}
 
@@ -110,25 +142,51 @@ func (h *Handler) Logout(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
+
+	if refreshToken != "" {
+		c.SetSameSite(http.SameSiteLaxMode)
+		h.clearCookie(c)
+	}
 	response.NoContent(c)
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// Cookie helper func
+func (h *Handler) setCookie(c *gin.Context, token string) {
+	u, err := url.Parse(h.cfg.FrontEndDomain)
+	domain := ""
+	if err == nil {
+		domain = u.Hostname()
+	}
 
-// bindAndValidate binds JSON and runs struct validation.
-// Returns false and writes an error response when binding or validation fails.
-func bindAndValidate(c *gin.Context, req interface{}, v *validator.Validate) bool {
-	if err := c.ShouldBindJSON(req); err != nil {
-		response.ValidationError(c, map[string]string{"body": err.Error()})
-		return false
+	secure := h.cfg.AppEnv == "production"
+
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie(
+		"refresh_token",
+		token,
+		int(h.cfg.RefreshTTL.Seconds()),
+		"/",
+		domain,
+		secure, // Secure only in production
+		true,   // HttpOnly ALWAYS true
+	)
+}
+
+func (h *Handler) clearCookie(c *gin.Context) {
+	u, err := url.Parse(h.cfg.FrontEndDomain)
+	domain := ""
+	if err == nil {
+		domain = u.Hostname()
 	}
-	if err := v.Struct(req); err != nil {
-		fields := make(map[string]string)
-		for _, fe := range err.(validator.ValidationErrors) {
-			fields[fe.Field()] = fe.Tag()
-		}
-		response.ValidationError(c, fields)
-		return false
-	}
-	return true
+
+	secure := h.cfg.AppEnv == "production"
+	c.SetCookie(
+		"refresh_token",
+		"",
+		-1,
+		"/",
+		domain,
+		secure, // Secure only in production
+		true,   // HttpOnly ALWAYS true
+	)
 }

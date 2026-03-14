@@ -465,7 +465,7 @@ func TestHashRefreshToken_IsHex64Chars(t *testing.T) {
 		t.Errorf("hash length = %d, want 64", len(h))
 	}
 	for _, c := range h {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			t.Errorf("non-hex character %q in hash %q", c, h)
 			break
 		}
@@ -481,16 +481,6 @@ func assertAppErrorCode(t *testing.T, err error, wantCode string) {
 	if err == nil {
 		t.Fatalf("expected AppError with code %q, got nil", wantCode)
 	}
-	type coder interface{ Error() string }
-	// Use a duck-typed check so the test file doesn't import the errors package.
-	type appErr interface {
-		Error() string
-		Unwrap() error
-	}
-	// Walk the error chain looking for an *AppError by checking for a Code field
-	// via the apperrors.As pattern — replicated here to avoid a circular import.
-	type withCode interface{ GetCode() string }
-
 	// Simplest portable approach: stringify and check prefix.
 	// AppError.Error() returns "[CODE] message" so we can check the prefix.
 	errStr := err.Error()

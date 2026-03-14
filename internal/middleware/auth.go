@@ -11,7 +11,9 @@ import (
 )
 
 const (
+	// ClaimsKey is the context key used to store authenticated user claims.
 	ClaimsKey = "claims"
+	// UserIDKey is the context key used to store authenticated user id.
 	UserIDKey = "user_id"
 )
 
@@ -49,9 +51,19 @@ func Auth(jwtHelper *platformauth.JWT, log *zap.Logger) gin.HandlerFunc {
 	}
 }
 
-// MustGetClaims extracts JWT claims from the gin context (panics if absent).
+// MustGetClaims extracts JWT claims from the gin context.
+// It panics when claims are absent, which means the Auth middleware was not
+// applied before this handler. Use only on routes that are protected by Auth.
 func MustGetClaims(c *gin.Context) *platformauth.Claims {
-	val, _ := c.Get(ClaimsKey)
-	claims, _ := val.(*platformauth.Claims)
+	val, exists := c.Get(ClaimsKey)
+	if !exists {
+		panic("middleware: MustGetClaims called on a route without Auth middleware — " +
+			"add middleware.Auth to the route group")
+	}
+	claims, ok := val.(*platformauth.Claims)
+	if !ok || claims == nil {
+		panic("middleware: ClaimsKey is set but does not contain *platformauth.Claims — " +
+			"this is a bug in the Auth middleware")
+	}
 	return claims
 }

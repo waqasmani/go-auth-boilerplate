@@ -1,8 +1,10 @@
+// Package app orchestrates application startup, dependency wiring, and lifecycle management.
 package app
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
@@ -89,7 +91,13 @@ func New(migrationsFS fs.FS) (*App, error) {
 	logJWTKeySet(log, cfg.JWTKeys)
 
 	// ─── Modules ───────────────────────────────────────────────────────────────
-	authMod := authmodule.NewModule(sqlDB, queries, jwtHelper, log)
+	authMod := authmodule.NewModule(authmodule.ModuleConfig{
+		SqlDB:   sqlDB,
+		Queries: queries,
+		Jwt:     jwtHelper,
+		Log:     log,
+		Cfg:     cfg,
+	})
 	usersMod := usersmodule.NewModule(queries, log)
 
 	// ─── Router ────────────────────────────────────────────────────────────────
@@ -110,6 +118,7 @@ func New(migrationsFS fs.FS) (*App, error) {
 			cfg.SecHSTSEnabled,
 			cfg.SecHSTSMaxAge,
 		),
+		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
 	}
 	engine := router.New(cfg.AppEnv, log, jwtHelper, authMod, usersMod, routerOpts)
 
@@ -159,19 +168,22 @@ func (a *App) Shutdown() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	var errs []error
 	if err := a.server.Shutdown(ctx); err != nil {
 		a.log.Error("server shutdown error", zap.Error(err))
+		errs = append(errs, err)
 	}
 	if err := a.queries.Close(); err != nil {
 		a.log.Error("prepared statements close error", zap.Error(err))
+		errs = append(errs, err)
 	}
 	if err := a.db.Close(); err != nil {
 		a.log.Error("database close error", zap.Error(err))
+		errs = append(errs, err)
 	}
-
 	a.log.Info("server stopped")
 	_ = a.log.Sync()
-	return nil
+	return errors.Join(errs...)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

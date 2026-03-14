@@ -1,8 +1,11 @@
 package auth
 
 import (
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"github.com/waqasmani/go-auth-boilerplate/internal/middleware"
+	"golang.org/x/time/rate"
 )
 
 // RegisterRoutes attaches auth endpoints to a RouterGroup.
@@ -27,6 +30,11 @@ func RegisterRoutes(rg *gin.RouterGroup, h *Handler, rlCfg middleware.RateLimitC
 	}
 
 	// Unrestricted routes — no rate limiting.
-	rg.POST("/refresh", h.Refresh)
+	rg.POST("/refresh", middleware.RateLimit(middleware.RateLimitConfig{
+		Rate:    rate.Limit(1),   // tokens per second
+		Burst:   5,               // maximum tokens that can be used in a burst
+		TTL:     1 * time.Minute, // time window for rate limiting
+		MaxKeys: 10_000,          // max unique keys to track (e.g., per IP)
+	}), h.Refresh)
 	rg.POST("/logout", h.Logout)
 }

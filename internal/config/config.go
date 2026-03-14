@@ -1,9 +1,11 @@
+// Package config holds all application configuration.
 package config
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -37,15 +39,22 @@ type Config struct {
 	RateLimitTTL     time.Duration
 	RateLimitMaxKeys int
 
-	// ─── CORS ─────────────────────────────────────────────────────────────────
 	CORSAllowedOrigins   []string
 	CORSAllowedHeaders   []string
 	CORSAllowCredentials bool
 	CORSMaxAge           int
 
+	// ─── Front End Domain ───────────────────────────────────────────────────────
+	FrontEndDomain string
+
 	// ─── Secure Headers ───────────────────────────────────────────────────────
 	SecHSTSEnabled bool
 	SecHSTSMaxAge  int
+
+	// TrustedProxyCIDRs is the list of CIDR blocks that are allowed to set
+	// X-Forwarded-For / X-Real-IP headers.  Should be the CIDR of your LB
+	// or ingress controller.  Empty means no proxy is trusted (direct mode).
+	TrustedProxyCIDRs []string
 }
 
 // JWTKeyConfig is a single signing key entry as stored in config / env vars.
@@ -124,10 +133,19 @@ func Load() (*Config, error) {
 		CORSAllowCredentials: parseBool("CORS_ALLOW_CREDENTIALS", true),
 		CORSMaxAge:           parseInt("CORS_MAX_AGE", 43200),
 
-		SecHSTSEnabled: parseBool("SEC_HSTS_ENABLED", false),
-		SecHSTSMaxAge:  parseInt("SEC_HSTS_MAX_AGE", 63_072_000),
+		FrontEndDomain:    getEnv("FRONT_END_DOMAIN", "http://localhost:3000"),
+		SecHSTSEnabled:    parseBool("SEC_HSTS_ENABLED", false),
+		SecHSTSMaxAge:     parseInt("SEC_HSTS_MAX_AGE", 63_072_000),
+		TrustedProxyCIDRs: parseStringSlice("TRUSTED_PROXY_CIDRS", []string{"10.0.0.0/8"}),
 	}
 
+	if cfg.FrontEndDomain == "" {
+		return nil, fmt.Errorf("config: FRONT_END_DOMAIN is required")
+	}
+	u, err := url.Parse(cfg.FrontEndDomain)
+	if err != nil || u.Hostname() == "" {
+		return nil, fmt.Errorf("config: FRONT_END_DOMAIN=%q is not a valid URL with a hostname", cfg.FrontEndDomain)
+	}
 	// ── Duration fields ───────────────────────────────────────────────────────
 	cfg.AccessTTL, err = parseDuration("JWT_ACCESS_TTL", "15m")
 	if err != nil {
@@ -202,6 +220,17 @@ func validateJWTKeys(keys []JWTKeyConfig) error {
 		if k.Secret == "" {
 			return fmt.Errorf("key %q has an empty secret", k.ID)
 		}
+		// ── NEW ──────────────────────────────────────────────────────────────
+		// RFC 7518 §3.2 requires the HMAC key to be at least as long as the
+		// hash output. For HS256 that is 32 bytes. Shorter keys are structurally
+		// accepted by the JWT library but are cryptographically weak.
+		if len(k.Secret) < 32 {
+			return fmt.Errorf(
+				"key %q secret is %d bytes — minimum 32 bytes required for HS256 (RFC 7518 §3.2)",
+				k.ID, len(k.Secret),
+			)
+		}
+		// ─────────────────────────────────────────────────────────────────────
 		if _, dup := seen[k.ID]; dup {
 			return fmt.Errorf("duplicate key id %q", k.ID)
 		}
@@ -251,6 +280,13 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
+// sanitizeNumericEnv strips underscore thousand-separators that are valid in
+// Go numeric literals (e.g. "10_000") but are rejected by strconv functions.
+// It also trims leading/trailing whitespace for good measure.
+func sanitizeNumericEnv(s string) string {
+	return strings.ReplaceAll(strings.TrimSpace(s), "_", "")
+}
+
 func parseDuration(key, fallback string) (time.Duration, error) {
 	raw := getEnv(key, fallback)
 	d, err := time.ParseDuration(raw)
@@ -265,7 +301,7 @@ func parseFloat(key string, fallback float64) float64 {
 	if raw == "" {
 		return fallback
 	}
-	v, err := strconv.ParseFloat(raw, 64)
+	v, err := strconv.ParseFloat(sanitizeNumericEnv(raw), 64)
 	if err != nil {
 		return fallback
 	}
@@ -277,9 +313,10 @@ func parseInt(key string, fallback int) int {
 	if raw == "" {
 		return fallback
 	}
-	v, err := strconv.Atoi(raw)
+	v, err := strconv.Atoi(sanitizeNumericEnv(raw))
 	if err != nil {
-		return fallback
+		// Panic or return a sentinel; at minimum, log loudly.
+		panic(fmt.Sprintf("config: %s=%q is not a valid integer", key, raw))
 	}
 	return v
 }

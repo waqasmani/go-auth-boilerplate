@@ -1,3 +1,4 @@
+// Package logger provides a structured, level-based logging interface with environment-aware output.
 package logger
 
 import (

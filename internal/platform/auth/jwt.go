@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -56,6 +58,7 @@ type TokenPair struct {
 	RefreshTokenHashed string // SHA-256 hash (stored in DB)
 	RefreshTokenFamily string
 	RefreshExpiresAt   time.Time
+	AccessExpiresAt    time.Time
 }
 
 // JWTConfig holds JWT configuration.
@@ -106,6 +109,17 @@ func NewJWT(cfg JWTConfig) *JWT {
 		if k.Secret == "" {
 			panic(fmt.Sprintf("jwt: key %q has an empty Secret", k.ID))
 		}
+		// ── NEW ──────────────────────────────────────────────────────────────────
+		// Defense-in-depth: config.validateJWTKeys enforces this first.
+		// This panic fires only when NewJWT is called outside the normal
+		// config.Load → app.New path (e.g. in a test helper or a future CLI tool).
+		if len(k.Secret) < 32 {
+			panic(fmt.Sprintf(
+				"jwt: key %q secret is %d bytes — minimum 32 bytes required for HS256 (RFC 7518 §3.2)",
+				k.ID, len(k.Secret),
+			))
+		}
+		// ─────────────────────────────────────────────────────────────────────────
 		if _, dup := keyByID[k.ID]; dup {
 			panic(fmt.Sprintf("jwt: duplicate key ID %q — key IDs must be unique", k.ID))
 		}
@@ -126,6 +140,18 @@ func NewJWT(cfg JWTConfig) *JWT {
 	}
 
 	return &JWT{cfg: cfg, activeKey: activeKey, keyByID: keyByID}
+}
+
+// generateSecureToken creates a URL-safe base64 encoded string
+// with n bytes of entropy (n * 8 bits).
+// 64 bytes = 512 bits of entropy.
+func generateSecureToken() (string, error) {
+	b := make([]byte, 64)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("crypto: generate token: %w", err)
+	}
+	// Use URL-safe encoding without padding for cookies/headers
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 // GenerateTokenPair creates a new access + refresh token pair.
@@ -163,10 +189,13 @@ func (j *JWT) GenerateTokenPair(userID, email string, roles []string, family str
 		return nil, fmt.Errorf("jwt: sign access token: %w", err)
 	}
 
-	// Refresh token — opaque UUID (not a JWT).
-	rawRefresh := uuid.NewString()
+	rawRefresh, err := generateSecureToken()
+	if err != nil {
+		return nil, fmt.Errorf("jwt: generate refresh token: %w", err)
+	}
 	hashedRefresh := hashToken(rawRefresh)
 	refreshExp := now.Add(j.cfg.RefreshTTL)
+	accessExp := now.Add(j.cfg.AccessTTL)
 
 	if family == "" {
 		family = uuid.NewString()
@@ -178,6 +207,7 @@ func (j *JWT) GenerateTokenPair(userID, email string, roles []string, family str
 		RefreshTokenHashed: hashedRefresh,
 		RefreshTokenFamily: family,
 		RefreshExpiresAt:   refreshExp,
+		AccessExpiresAt:    accessExp,
 	}, nil
 }
 

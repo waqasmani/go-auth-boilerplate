@@ -1,3 +1,4 @@
+// Package errors is the central error type for the application
 package errors
 
 import (
@@ -57,74 +58,104 @@ func As(err error) (*AppError, bool) {
 
 // ─── Common Application Error Instances ───────────────────────────────────────
 
-var (
-	ErrInternalServer = &AppError{
-		Code:       "INTERNAL_SERVER_ERROR",
-		Message:    "an unexpected error occurred",
-		HTTPStatus: http.StatusInternalServerError,
-	}
-	ErrNotFound = &AppError{
-		Code:       "NOT_FOUND",
-		Message:    "resource not found",
-		HTTPStatus: http.StatusNotFound,
-	}
-	ErrUnauthorized = &AppError{
-		Code:       "UNAUTHORIZED",
-		Message:    "authentication required",
-		HTTPStatus: http.StatusUnauthorized,
-	}
-	ErrForbidden = &AppError{
-		Code:       "FORBIDDEN",
-		Message:    "you do not have permission to perform this action",
-		HTTPStatus: http.StatusForbidden,
-	}
-	ErrBadRequest = &AppError{
-		Code:       "BAD_REQUEST",
-		Message:    "invalid request",
-		HTTPStatus: http.StatusBadRequest,
-	}
-	ErrConflict = &AppError{
-		Code:       "CONFLICT",
-		Message:    "resource already exists",
-		HTTPStatus: http.StatusConflict,
-	}
+// ErrInternalServer is returned when an unexpected internal server error occurs.
+var ErrInternalServer = &AppError{
+	Code:       "INTERNAL_SERVER_ERROR",
+	Message:    "an unexpected error occurred",
+	HTTPStatus: http.StatusInternalServerError,
+}
 
-	// Auth-specific errors
-	ErrInvalidCredentials = &AppError{
-		Code:       "INVALID_CREDENTIALS",
-		Message:    "invalid email or password",
-		HTTPStatus: http.StatusUnauthorized,
-	}
-	ErrTokenExpired = &AppError{
-		Code:       "TOKEN_EXPIRED",
-		Message:    "token has expired",
-		HTTPStatus: http.StatusUnauthorized,
-	}
-	ErrTokenInvalid = &AppError{
-		Code:       "TOKEN_INVALID",
-		Message:    "token is invalid",
-		HTTPStatus: http.StatusUnauthorized,
-	}
-	ErrTokenRevoked = &AppError{
-		Code:       "TOKEN_REVOKED",
-		Message:    "token has been revoked",
-		HTTPStatus: http.StatusUnauthorized,
-	}
-	ErrTokenReuse = &AppError{
-		Code:       "TOKEN_REUSE_DETECTED",
-		Message:    "token reuse detected — all sessions have been revoked",
-		HTTPStatus: http.StatusUnauthorized,
-	}
-	ErrEmailAlreadyExists = &AppError{
-		Code:       "EMAIL_ALREADY_EXISTS",
-		Message:    "an account with this email already exists",
-		HTTPStatus: http.StatusConflict,
-	}
+// ErrNotFound is returned when a requested resource does not exist.
+var ErrNotFound = &AppError{
+	Code:       "NOT_FOUND",
+	Message:    "resource not found",
+	HTTPStatus: http.StatusNotFound,
+}
 
-	// Validation error
-	ErrValidation = &AppError{
-		Code:       "VALIDATION_ERROR",
-		Message:    "request validation failed",
-		HTTPStatus: http.StatusUnprocessableEntity,
-	}
-)
+// ErrUnauthorized is returned when authentication is required but missing or invalid.
+var ErrUnauthorized = &AppError{
+	Code:       "UNAUTHORIZED",
+	Message:    "authentication required",
+	HTTPStatus: http.StatusUnauthorized,
+}
+
+// ErrForbidden is returned when the user lacks permission for the requested action.
+var ErrForbidden = &AppError{
+	Code:       "FORBIDDEN",
+	Message:    "you do not have permission to perform this action",
+	HTTPStatus: http.StatusForbidden,
+}
+
+// ErrBadRequest is returned when the request payload is malformed or invalid.
+var ErrBadRequest = &AppError{
+	Code:       "BAD_REQUEST",
+	Message:    "invalid request",
+	HTTPStatus: http.StatusBadRequest,
+}
+
+// ErrConflict is returned when a request conflicts with the current state of the server.
+var ErrConflict = &AppError{
+	Code:       "CONFLICT",
+	Message:    "resource already exists",
+	HTTPStatus: http.StatusConflict,
+}
+
+// Auth-specific errors
+
+// ErrInvalidCredentials is returned when login credentials fail verification.
+var ErrInvalidCredentials = &AppError{
+	Code:       "INVALID_CREDENTIALS",
+	Message:    "invalid email or password",
+	HTTPStatus: http.StatusUnauthorized,
+}
+
+// ErrTokenExpired is returned when a presented token has passed its expiration time.
+var ErrTokenExpired = &AppError{
+	Code:       "TOKEN_EXPIRED",
+	Message:    "token has expired",
+	HTTPStatus: http.StatusUnauthorized,
+}
+
+// ErrTokenInvalid is returned when a token fails signature or format validation.
+var ErrTokenInvalid = &AppError{
+	Code:       "TOKEN_INVALID",
+	Message:    "token is invalid",
+	HTTPStatus: http.StatusUnauthorized,
+}
+
+// ErrTokenRevoked is returned when a token has been explicitly revoked before expiry.
+var ErrTokenRevoked = &AppError{
+	Code:       "TOKEN_REVOKED",
+	Message:    "token has been revoked",
+	HTTPStatus: http.StatusUnauthorized,
+}
+
+// ErrTokenReuse is returned when token reuse is detected, triggering cascade revocation.
+var ErrTokenReuse = &AppError{
+	Code:       "TOKEN_REUSE_DETECTED",
+	Message:    "token reuse detected — all sessions have been revoked",
+	HTTPStatus: http.StatusUnauthorized,
+}
+
+// ErrEmailAlreadyExists is returned when attempting to register with a duplicate email.
+var ErrEmailAlreadyExists = &AppError{
+	Code:       "EMAIL_ALREADY_EXISTS",
+	Message:    "an account with this email already exists",
+	HTTPStatus: http.StatusConflict,
+}
+
+// Validation errors
+
+// ErrValidation is returned when request data fails schema or business rule validation.
+var ErrValidation = &AppError{
+	Code:       "VALIDATION_ERROR",
+	Message:    "request validation failed",
+	HTTPStatus: http.StatusUnprocessableEntity,
+}
+
+// ErrRateLimitExceeded returns the JSON body for a 429 response.
+var ErrRateLimitExceeded = &AppError{
+	Code:       "RATE_LIMIT_EXCEEDED",
+	Message:    "too many requests — slow down and try again",
+	HTTPStatus: http.StatusTooManyRequests,
+}

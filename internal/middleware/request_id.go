@@ -5,8 +5,12 @@ import (
 	"github.com/google/uuid"
 )
 
-const RequestIDHeader = "X-Request-ID"
-const RequestIDKey = "request_id"
+const (
+	// RequestIDHeader is the HTTP header key used to propagate request IDs.
+	RequestIDHeader = "X-Request-ID"
+	// RequestIDKey is the context key used to store the request ID internally.
+	RequestIDKey = "request_id"
+)
 
 // RequestID injects or propagates a unique request ID.
 func RequestID() gin.HandlerFunc {

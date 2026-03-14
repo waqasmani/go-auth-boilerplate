@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/waqasmani/go-auth-boilerplate/internal/config"
 	"github.com/waqasmani/go-auth-boilerplate/internal/modules/auth"
 )
 
@@ -41,7 +42,7 @@ func TestLoginHandler_BadJSON(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 
-	h := auth.NewHandler(&stubService{})
+	h := auth.NewHandler(&stubService{}, &config.Config{})
 	r.POST("/login", h.Login)
 
 	w := httptest.NewRecorder()
@@ -58,7 +59,7 @@ func TestLoginHandler_ValidationError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 
-	h := auth.NewHandler(&stubService{})
+	h := auth.NewHandler(&stubService{}, &config.Config{})
 	r.POST("/login", h.Login)
 
 	body, _ := json.Marshal(map[string]string{"email": "not-an-email", "password": "pw"})
@@ -85,7 +86,7 @@ func TestLoginHandler_Success(t *testing.T) {
 			}, nil
 		},
 	}
-	h := auth.NewHandler(svc)
+	h := auth.NewHandler(svc, &config.Config{})
 	r.POST("/login", h.Login)
 
 	body, _ := json.Marshal(auth.LoginRequest{Email: "user@example.com", Password: "password123"})

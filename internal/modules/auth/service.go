@@ -44,16 +44,7 @@ func NewService(repo Repository, jwt *platformauth.JWT, log *zap.Logger) Service
 func (s *service) Register(ctx context.Context, req RegisterRequest) (*TokenResponse, error) {
 	log := logger.FromContext(ctx).With(zap.String("email", req.Email))
 
-	// Check email uniqueness before opening a transaction — avoids holding
-	// locks during a read that is very likely to succeed on the hot path.
-	_, err := s.repo.GetUserByEmail(ctx, req.Email)
-	if err == nil {
-		return nil, apperrors.ErrEmailAlreadyExists
-	}
-	if appErr, ok := apperrors.As(err); !ok || appErr.Code != apperrors.ErrNotFound.Code {
-		return nil, err
-	}
-
+	normalizedEmail := strings.ToLower(strings.TrimSpace(req.Email))
 	hash, err := platformauth.HashPassword(req.Password)
 	if err != nil {
 		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
@@ -62,7 +53,7 @@ func (s *service) Register(ctx context.Context, req RegisterRequest) (*TokenResp
 	userID := uuid.NewString()
 	userParams := db.CreateUserParams{
 		ID:           userID,
-		Email:        strings.ToLower(strings.TrimSpace(req.Email)),
+		Email:        normalizedEmail,
 		PasswordHash: hash,
 		Name:         strings.TrimSpace(req.Name),
 	}
@@ -74,8 +65,11 @@ func (s *service) Register(ctx context.Context, req RegisterRequest) (*TokenResp
 		if err := tx.CreateUser(ctx, userParams); err != nil {
 			return err
 		}
+		if err := tx.AssignUserRole(ctx, userID, "user"); err != nil {
+			return err
+		}
 		var txErr error
-		tokenResp, txErr = s.issueTokenPair(ctx, tx, userID, req.Email, []string{"user"}, "")
+		tokenResp, txErr = s.issueTokenPair(ctx, tx, userID, normalizedEmail, []string{"user"}, "")
 		return txErr
 	}); err != nil {
 		return nil, err
@@ -90,7 +84,7 @@ func (s *service) Register(ctx context.Context, req RegisterRequest) (*TokenResp
 // Login only writes a single row (CreateRefreshToken), so no transaction is
 // needed — a single INSERT is already atomic.
 func (s *service) Login(ctx context.Context, req LoginRequest) (*TokenResponse, error) {
-	user, err := s.repo.GetUserByEmail(ctx, strings.ToLower(strings.TrimSpace(req.Email)))
+	user, err := s.repo.GetUserByEmailWithRoles(ctx, strings.ToLower(strings.TrimSpace(req.Email)))
 	if err != nil {
 		if appErr, ok := apperrors.As(err); ok && appErr.Code == apperrors.ErrNotFound.Code {
 			return nil, apperrors.ErrInvalidCredentials
@@ -102,7 +96,7 @@ func (s *service) Login(ctx context.Context, req LoginRequest) (*TokenResponse, 
 		return nil, apperrors.ErrInvalidCredentials
 	}
 
-	tokenResp, err := s.issueTokenPair(ctx, s.repo, user.ID, user.Email, []string{"user"}, "")
+	tokenResp, err := s.issueTokenPair(ctx, s.repo, user.ID, user.Email, user.Roles, "")
 	if err != nil {
 		return nil, err
 	}
@@ -142,16 +136,35 @@ func (s *service) Refresh(ctx context.Context, req RefreshRequest) (*TokenRespon
 		return nil, apperrors.ErrTokenExpired
 	}
 
-	// ── 3. Revocation check (family-level logout) ─────────────────────────────
+	// ── 3. Revocation and reuse detection ─────────────────────────────────────────
+	// Both conditions indicate the token should not be honored, but the cause
+	// determines the log severity and the error returned to the caller.
+	//
+	// RevokedAt.Valid  — family was invalidated by a prior logout or a reuse event.
+	//                    Silently return 401; no need to re-revoke.
+	//
+	// UsedAt.Valid     — token was already rotated. Presenting it is a strong
+	//                    signal of theft or replay. Re-revoke the family to
+	//                    invalidate any sibling sessions that may still be live,
+	//                    then return 401.
 	if token.RevokedAt.Valid {
 		return nil, apperrors.ErrTokenRevoked
+	}
+
+	if token.UsedAt.Valid {
+		s.log.Warn("used token presented — possible replay attack, revoking family",
+			zap.String("family", token.TokenFamily),
+			zap.String("user_id", token.UserID),
+		)
+		_ = s.repo.RevokeRefreshTokenFamily(ctx, token.TokenFamily)
+		return nil, apperrors.ErrTokenReuse
 	}
 
 	// ── 4. Fetch user for up-to-date claims (outside tx — read-only) ──────────
 	// If the user is deleted between this read and the transaction, the foreign
 	// key constraint on refresh_tokens.user_id will cause CreateRefreshToken to
 	// fail and the transaction to roll back cleanly.
-	user, err := s.repo.GetUserByID(ctx, token.UserID)
+	user, err := s.repo.GetUserByIDWithRoles(ctx, token.UserID)
 	if err != nil {
 		return nil, err
 	}
@@ -170,7 +183,7 @@ func (s *service) Refresh(ctx context.Context, req RefreshRequest) (*TokenRespon
 			return apperrors.ErrTokenReuse
 		}
 
-		tokenResp, err = s.issueTokenPair(ctx, tx, user.ID, user.Email, []string{"user"}, token.TokenFamily)
+		tokenResp, err = s.issueTokenPair(ctx, tx, user.ID, user.Email, user.Roles, token.TokenFamily)
 		return err
 	}); err != nil {
 		// Family revocation is a security action that must commit regardless of
@@ -190,19 +203,57 @@ func (s *service) Refresh(ctx context.Context, req RefreshRequest) (*TokenRespon
 	return tokenResp, nil
 }
 
+// Logout revokes the session family associated with the supplied refresh token.
+//
+// Uniform idempotency policy — all of the following return 204 with no action
+// and no distinguishable response, so the endpoint cannot be used as an oracle
+// to probe whether a given token was ever valid, when it expired, or whether
+// its session is still active:
+//
+//   - token not found in the database (already purged or never existed)
+//   - token found but already expired
+//   - token found but already revoked (family was invalidated by a prior logout
+//     or by reuse detection)
+//
+// Only when a token is found, unexpired, and not yet revoked does this function
+// perform the family revocation and emit a log line.  An attacker who holds a
+// stolen-then-expired refresh token learns nothing from calling this endpoint.
 func (s *service) Logout(ctx context.Context, req LogoutRequest) error {
 	tokenHash := platformauth.HashRefreshToken(req.RefreshToken)
 
 	token, err := s.repo.GetRefreshTokenByHash(ctx, tokenHash)
 	if err != nil {
-		// Idempotent: treat a missing token as already logged out.
+		// Missing token: treat as already logged out — no error, no action.
 		if appErr, ok := apperrors.As(err); ok && appErr.Code == apperrors.ErrTokenInvalid.Code {
 			return nil
 		}
 		return err
 	}
 
-	// Revoke entire family — all tokens from this login session are invalidated.
+	// Expired token: return success silently.  Revoking the family of an
+	// expired token is a no-op from a security standpoint (the tokens cannot
+	// be used) but it leaks the information that the token was once valid and
+	// which family it belonged to.
+	if time.Now().UTC().After(token.ExpiresAt) {
+		return nil
+	}
+
+	// Already-revoked token: return success silently.  Acting on a revoked
+	// token (e.g. calling RevokeRefreshTokenFamily again) is idempotent at the
+	// DB level, but responding differently to revoked vs. unrevoked tokens lets
+	// a caller distinguish the two states — an unnecessary information leak.
+	if token.RevokedAt.Valid {
+		return nil
+	}
+
+	if token.UsedAt.Valid {
+		// token was rotated — revoke the whole family for safety
+		_ = s.repo.RevokeRefreshTokenFamily(ctx, token.TokenFamily)
+		return nil
+	}
+
+	// Token is valid and active — revoke the entire family so all concurrent
+	// sessions derived from this login are invalidated in one operation.
 	if err = s.repo.RevokeRefreshTokenFamily(ctx, token.TokenFamily); err != nil {
 		return err
 	}
@@ -238,9 +289,10 @@ func (s *service) issueTokenPair(ctx context.Context, repo Repository, userID, e
 	}
 
 	return &TokenResponse{
-		AccessToken:  pair.AccessToken,
-		RefreshToken: pair.RefreshToken,
-		TokenType:    "Bearer",
-		ExpiresAt:    pair.RefreshExpiresAt,
+		AccessToken:           pair.AccessToken,
+		RefreshToken:          pair.RefreshToken,
+		TokenType:             "Bearer",
+		AccessTokenExpiresAt:  pair.AccessExpiresAt,
+		RefreshTokenExpiresAt: pair.RefreshExpiresAt,
 	}, nil
 }

@@ -5,6 +5,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/waqasmani/go-auth-boilerplate/internal/config"
 	"github.com/waqasmani/go-auth-boilerplate/internal/db"
 	platformauth "github.com/waqasmani/go-auth-boilerplate/internal/platform/auth"
 )
@@ -13,6 +14,14 @@ import (
 type Module struct {
 	Handler *Handler
 	Service Service
+}
+
+type ModuleConfig struct {
+	SqlDB   *sql.DB
+	Queries *db.Queries
+	Jwt     *platformauth.JWT
+	Log     *zap.Logger
+	Cfg     *config.Config
 }
 
 // NewModule constructs the auth module with its dependencies.
@@ -29,10 +38,10 @@ type Module struct {
 //
 // Ownership of both sqlDB and queries stays in app.go, which calls
 // queries.Close() and db.Close() during graceful shutdown in the correct order.
-func NewModule(sqlDB *sql.DB, queries *db.Queries, jwt *platformauth.JWT, log *zap.Logger) *Module {
-	repo := NewRepository(sqlDB, queries)
-	svc := NewService(repo, jwt, log)
-	h := NewHandler(svc)
+func NewModule(m ModuleConfig) *Module {
+	repo := NewRepository(m.SqlDB, m.Queries)
+	svc := NewService(repo, m.Jwt, m.Log)
+	h := NewHandler(svc, m.Cfg)
 
 	return &Module{
 		Handler: h,
