@@ -32,7 +32,7 @@ Production-ready Go authentication boilerplate with JWT access + refresh tokens,
 
 ### Prerequisites
 
-- Go 1.22+
+- Go 1.25+
 - Docker + Docker Compose
 - [sqlc](https://docs.sqlc.dev/en/latest/overview/install.html) — for regenerating DB code
 - [swag](https://github.com/swaggo/swag) — for regenerating Swagger docs
