@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -60,8 +61,23 @@ func setupTestServer(t *testing.T) *testServer {
 	})
 
 	// ── Migrations ─────────────────────────────────────────────────────────────
-	if err := database.RunMigrations(sqlDB, migrations.FS, log); err != nil {
-		t.Fatalf("setup: run migrations: %v", err)
+	// golang-migrate's MySQL driver requires multiStatements=true to execute
+	// migration files that contain more than one SQL statement (e.g. a CREATE
+	// TABLE followed by seed INSERTs in the same file). The application pool
+	// intentionally omits this flag — multiStatements widens the SQL-injection
+	// surface by allowing stacked queries. A dedicated short-lived pool is
+	// opened here solely for the migration run and closed immediately after.
+	migrDSN := migrationDSN(dsn)
+	migrDB, err := database.New(database.DefaultConfig(migrDSN))
+	if err != nil {
+		t.Fatalf("setup: open migration db: %v", err)
+	}
+	if merr := database.RunMigrations(migrDB, migrations.FS, log); merr != nil {
+		_ = migrDB.Close()
+		t.Fatalf("setup: run migrations: %v", merr)
+	}
+	if cerr := migrDB.Close(); cerr != nil {
+		t.Logf("setup: close migration db: %v", cerr)
 	}
 
 	// ── Prepared statements ────────────────────────────────────────────────────
@@ -151,6 +167,20 @@ func setupTestServer(t *testing.T) *testServer {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// migrationDSN appends multiStatements=true to dsn so that golang-migrate can
+// execute migration files that contain more than one SQL statement. It is used
+// only for the short-lived migration pool; the application pool uses the plain
+// dsn to avoid widening the SQL-injection surface.
+func migrationDSN(dsn string) string {
+	if strings.Contains(dsn, "multiStatements=") {
+		return dsn // already set by the caller — leave it unchanged
+	}
+	if strings.Contains(dsn, "?") {
+		return dsn + "&multiStatements=true"
+	}
+	return dsn + "?multiStatements=true"
+}
+
 // requireEnv returns the value of key, or skips the test if it is unset.
 // This replaces the //go:build integration constraint: tests are always
 // compiled (so go list / IDEs are happy) but skipped when the DB is absent.
@@ -201,13 +231,20 @@ func postJSON(t *testing.T, url string, payload any, extraHeaders ...string) (in
 		req.Header.Set(extraHeaders[i], extraHeaders[i+1])
 	}
 	resp, err := http.DefaultClient.Do(req)
-	defer func() {
-		_ = resp.Body.Close()
-	}()
 	if err != nil {
 		t.Fatalf("do request: %v", err)
 	}
-	return drainAndDecode(t, resp)
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if cerr := resp.Body.Close(); cerr != nil {
+			t.Logf("postJSON: close body: %v", cerr)
+		}
+	}()
+	var m map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil && err != io.EOF {
+		t.Fatalf("decode response body: %v", err)
+	}
+	return resp.StatusCode, m
 }
 
 // postJSONDiscardBody fires a POST request and discards the response body.
@@ -245,24 +282,13 @@ func getJSON(t *testing.T, url, bearer string) (int, map[string]any) {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
 	resp, err := http.DefaultClient.Do(req)
-	defer func() {
-		_ = resp.Body.Close()
-	}()
 	if err != nil {
 		t.Fatalf("do request: %v", err)
 	}
-	return drainAndDecode(t, resp)
-}
-
-// drainAndDecode reads, closes, and JSON-decodes an HTTP response body.
-// Centralising this eliminates the bodyclose and errcheck findings at every
-// call site.
-func drainAndDecode(t *testing.T, resp *http.Response) (int, map[string]any) {
-	t.Helper()
 	defer func() {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		if cerr := resp.Body.Close(); cerr != nil {
-			t.Logf("drainAndDecode: close body: %v", cerr)
+			t.Logf("getJSON: close body: %v", cerr)
 		}
 	}()
 	var m map[string]any

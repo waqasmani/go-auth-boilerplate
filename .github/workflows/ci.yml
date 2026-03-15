@@ -54,9 +54,11 @@ jobs:
           govulncheck ./...
 
       - name: Apply migrations
+        env:
+          MYSQL_PWD: rootpassword 
         run: |
-          for f in sql/migrations/*.sql; do
-            mysql -h 127.0.0.1 -u root -prootpassword auth_db_test < "$f"
+          for f in $(ls sql/migrations/*.up.sql | sort); do
+            mariadb -h 127.0.0.1 -u root auth_db_test < "$f"
           done
 
       - name: Run unit tests
