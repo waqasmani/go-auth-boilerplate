@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-playground/validator/v10"
+
 	apperrors "github.com/waqasmani/go-auth-boilerplate/internal/errors"
 )
 
