@@ -10,21 +10,8 @@ linters:
     - gocritic
     - bodyclose
     - misspell
-  settings:
-    goimports:
-      local-prefixes: github.com/waqasmani/go-auth-boilerplate
 
 formatters:
   enable:
     - gofmt
     - goimports
-
-issues:
-  exclusions:
-    rules:
-      - path: _test\.go
-        linters:
-          - errcheck
-      - path: internal/db/
-        linters:
-          - unused
