@@ -4,10 +4,11 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
+
 	apperrors "github.com/waqasmani/go-auth-boilerplate/internal/errors"
 	platformauth "github.com/waqasmani/go-auth-boilerplate/internal/platform/auth"
 	"github.com/waqasmani/go-auth-boilerplate/internal/response"
-	"go.uber.org/zap"
 )
 
 const (

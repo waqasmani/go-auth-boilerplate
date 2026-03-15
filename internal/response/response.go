@@ -3,9 +3,11 @@ package response
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-playground/validator/v10"
+
 	apperrors "github.com/waqasmani/go-auth-boilerplate/internal/errors"
 )
 
@@ -82,6 +84,30 @@ func ValidationError(c *gin.Context, details map[string]string) {
 // BindAndValidate binds the request body as JSON and validates the resulting
 // struct against business rules. It returns a typed AppError on failure.
 func BindAndValidate(c *gin.Context, req any, v *validator.Validate) bool {
+	// Reject requests whose Content-Type is not application/json before
+	// attempting to decode the body.
+	//
+	// HasPrefix rather than exact equality tolerates legitimate variations
+	// such as "application/json; charset=utf-8" that some clients send.
+	//
+	// This check runs before ShouldBindJSON for two reasons:
+	//   1. ShouldBindJSON will happily decode any body regardless of the
+	//      declared media type, so a text/plain body containing valid JSON
+	//      would otherwise succeed silently.
+	//   2. When Content-Type is correct but the body is absent, the error
+	//      from ShouldBindJSON ("EOF") is unambiguous and the existing
+	//      "malformed or invalid JSON body" message is accurate.
+	if ct := c.GetHeader("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		c.JSON(http.StatusUnsupportedMediaType, Response{
+			Success: false,
+			Error: &ErrorBody{
+				Code:    "UNSUPPORTED_MEDIA_TYPE",
+				Message: `Content-Type must be "application/json"`,
+			},
+		})
+		return false
+	}
+
 	if err := c.ShouldBindJSON(req); err != nil {
 		ValidationError(c, map[string]string{"body": "malformed or invalid JSON body"})
 		return false

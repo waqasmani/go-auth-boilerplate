@@ -83,34 +83,6 @@ func (r *repository) GetUserByEmail(ctx context.Context, email string) (*db.User
 	return &user, nil
 }
 
-func (r *repository) GetUserByEmailWithRoles(ctx context.Context, email string) (*UserWithRoles, error) {
-	rows, err := r.queries.GetUserByEmailWithRoles(ctx, email)
-	if err != nil {
-		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
-	}
-	if len(rows) == 0 {
-		return nil, apperrors.ErrNotFound
-	}
-
-	result := &UserWithRoles{
-		ID:           rows[0].ID,
-		Name:         rows[0].Name,
-		Email:        rows[0].Email,
-		Roles:        []string{},
-		PasswordHash: rows[0].PasswordHash,
-		CreatedAt:    rows[0].CreatedAt,
-		UpdatedAt:    rows[0].UpdatedAt,
-	}
-
-	for _, row := range rows {
-		if row.RoleName.Valid {
-			result.Roles = append(result.Roles, row.RoleName.String)
-		}
-	}
-
-	return result, nil
-}
-
 func (r *repository) AssignUserRole(ctx context.Context, userID, roleName string) error {
 	result, err := r.queries.AssignUserRoleByName(ctx, db.AssignUserRoleByNameParams{
 		UserID: userID,
@@ -139,34 +111,6 @@ func (r *repository) GetUserByID(ctx context.Context, id string) (*db.User, erro
 		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
 	return &user, nil
-}
-
-func (r *repository) GetUserByIDWithRoles(ctx context.Context, id string) (*UserWithRoles, error) {
-	rows, err := r.queries.GetUserByIDWithRoles(ctx, id)
-	if err != nil {
-		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
-	}
-
-	if len(rows) == 0 {
-		return nil, apperrors.ErrNotFound
-	}
-
-	result := &UserWithRoles{
-		ID:           rows[0].ID,
-		Name:         rows[0].Name,
-		Email:        rows[0].Email,
-		Roles:        []string{},
-		PasswordHash: rows[0].PasswordHash,
-		CreatedAt:    rows[0].CreatedAt,
-		UpdatedAt:    rows[0].UpdatedAt,
-	}
-
-	for _, row := range rows {
-		if row.RoleName.Valid {
-			result.Roles = append(result.Roles, row.RoleName.String)
-		}
-	}
-	return result, nil
 }
 
 func (r *repository) CreateUser(ctx context.Context, params db.CreateUserParams) error {
@@ -226,4 +170,63 @@ func (r *repository) RevokeRefreshTokenFamily(ctx context.Context, family string
 		return apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
 	return nil
+}
+
+func (r *repository) GetUserByEmailWithRoles(ctx context.Context, email string) (*UserWithRoles, error) {
+	rows, err := r.queries.GetUserByEmailWithRoles(ctx, email)
+	if err != nil {
+		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
+	}
+	if len(rows) == 0 {
+		return nil, apperrors.ErrNotFound
+	}
+
+	result := &UserWithRoles{
+		ID:           rows[0].ID,
+		Name:         rows[0].Name,
+		Email:        rows[0].Email,
+		Roles:        []string{},
+		PasswordHash: rows[0].PasswordHash,
+		// TwoFaEnabled is TINYINT(1); sqlc maps it to bool with tinyInt1isBool=true
+		// in the DSN or a type_override in sqlc.yaml. If your generated type is
+		// int8 instead, change to: rows[0].TwoFaEnabled != 0
+		TwoFAEnabled:  rows[0].TwoFaEnabled,
+		EmailVerified: rows[0].EmailVerifiedAt.Valid,
+		CreatedAt:     rows[0].CreatedAt,
+		UpdatedAt:     rows[0].UpdatedAt,
+	}
+	for _, row := range rows {
+		if row.RoleName.Valid {
+			result.Roles = append(result.Roles, row.RoleName.String)
+		}
+	}
+	return result, nil
+}
+
+func (r *repository) GetUserByIDWithRoles(ctx context.Context, id string) (*UserWithRoles, error) {
+	rows, err := r.queries.GetUserByIDWithRoles(ctx, id)
+	if err != nil {
+		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
+	}
+	if len(rows) == 0 {
+		return nil, apperrors.ErrNotFound
+	}
+
+	result := &UserWithRoles{
+		ID:            rows[0].ID,
+		Name:          rows[0].Name,
+		Email:         rows[0].Email,
+		Roles:         []string{},
+		PasswordHash:  rows[0].PasswordHash,
+		TwoFAEnabled:  rows[0].TwoFaEnabled,
+		EmailVerified: rows[0].EmailVerifiedAt.Valid,
+		CreatedAt:     rows[0].CreatedAt,
+		UpdatedAt:     rows[0].UpdatedAt,
+	}
+	for _, row := range rows {
+		if row.RoleName.Valid {
+			result.Roles = append(result.Roles, row.RoleName.String)
+		}
+	}
+	return result, nil
 }

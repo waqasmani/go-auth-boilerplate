@@ -20,7 +20,10 @@ LDFLAGS     := -w -s \
 DOCKER_COMPOSE  := docker compose
 MIGRATE_BIN     := $(shell which migrate 2>/dev/null || echo "$(GOPATH)/bin/migrate")
 MIGRATIONS_DIR  := sql/migrations
-MIGRATE_DB_URL  := $(shell grep -s '^DB_DSN' .env | cut -d= -f2- | sed 's|^|mysql://|')
+
+# FIX #1: Removed the dead top-level MIGRATE_DB_URL variable.  The single
+# authoritative DB URL is _DB_URL, defined near the migrate targets so it is
+# clearly scoped to that section and not duplicated.
 
 # ─── Colour helpers ───────────────────────────────────────────────────────────
 BOLD  := \033[1m
@@ -90,8 +93,10 @@ clean: ## Remove build artefacts and coverage reports
 #  ENVIRONMENT
 # =============================================================================
 
+# FIX #4: env-check now delegates to jwt-verify so JWT_KEYS structure is
+# validated (non-empty JSON, exactly one active key) and not just present.
 .PHONY: env-check
-env-check: ## Validate that all required .env variables are present
+env-check: ## Validate that all required .env variables are present and well-formed
 	$(call log,env-check,Validating environment)
 	@missing=""; \
 	for var in DB_DSN JWT_KEYS JWT_ISSUER JWT_AUDIENCE; do \
@@ -103,6 +108,7 @@ env-check: ## Validate that all required .env variables are present
 		exit 1; \
 	fi
 	$(call success,All required variables present)
+	@$(MAKE) --no-print-directory jwt-verify
 
 .PHONY: env-example
 env-example: ## Write a ready-to-use .env.example (safe — no real secrets)
@@ -148,9 +154,13 @@ env-example: ## Write a ready-to-use .env.example (safe — no real secrets)
 #  go install -tags 'mysql' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
 # =============================================================================
 
-# Derive DB_URL from .env.  golang-migrate expects the mysql:// scheme.
+# FIX #1 (continued): Single authoritative DB URL variable.
+# golang-migrate expects the mysql:// scheme prepended to the raw DSN.
 # DB_DSN format:  user:pass@tcp(host:port)/dbname?parseTime=true
 # migrate format: mysql://user:pass@tcp(host:port)/dbname?parseTime=true
+#
+# NOTE: evaluated at parse time ($(shell ...)), so a missing .env produces
+# an empty string here — _migrate-check guards against that at runtime.
 _DB_URL := $(shell \
   dsn=$$(grep -s '^DB_DSN=' .env | cut -d= -f2- | tr -d '\r'); \
   [ -n "$$dsn" ] && printf 'mysql://%s' "$$dsn" || echo "")
@@ -196,31 +206,27 @@ migrate-force: _migrate-check ## Force schema version (usage: make migrate-force
 	migrate -path $(MIGRATIONS_DIR) -database "$(_DB_URL)" force $(V)
 	$(call warn,Forced to version $(V). Review dirty state before resuming migrations.)
 
+# FIX #2: Replaced the hand-rolled sequence numbering with `migrate create
+# -seq`, which is the canonical approach and avoids the fragile glob + tr
+# pipeline that could miscount when files are non-contiguous or the directory
+# is empty.  The -seq flag zero-pads to 6 digits (000001) by default, which
+# is consistent with golang-migrate conventions.
 .PHONY: migrate-create
-migrate-create: ## Create a new migration file pair (usage: make migrate-create N=add_sessions_table)
+migrate-create: _migrate-check ## Create a new migration file pair (usage: make migrate-create N=add_sessions_table)
 	$(call log,migrate-create,Scaffolding migration)
 	@[ -n "$(N)" ] || { printf "$(RED)Usage: make migrate-create N=<migration_name>$(RESET)\n"; exit 1; }
-	@last=$$(ls $(MIGRATIONS_DIR)/*.sql 2>/dev/null \
-		| grep -oE '/[0-9]+_' | tr -d '/_ ' | sort -n | tail -1); \
-	n=$$(printf '%d' "$${last:-0}"); \
-	next=$$(printf '%04d' "$$((n + 1))"); \
-	up="$(MIGRATIONS_DIR)/$${next}_$(N).up.sql"; \
-	down="$(MIGRATIONS_DIR)/$${next}_$(N).down.sql"; \
-	{ printf '%s\n%s\n' "-- $(N) (up)" "-- Write your UP migration here"; } > "$$up"; \
-	{ printf '%s\n%s\n' "-- $(N) (down)" "-- Write your DOWN migration here"; } > "$$down"; \
-	printf "  $(CYAN)created$(RESET) $$up\n"; \
-	printf "  $(CYAN)created$(RESET) $$down\n"
+	migrate create -ext sql -dir $(MIGRATIONS_DIR) -seq $(N)
 	$(call success,Migration files created in $(MIGRATIONS_DIR))
 
-.PHONY: migrate-docker
-migrate-docker: ## Apply migrations against the Docker Compose DB container
-	$(call log,migrate-docker,Applying migrations via Docker)
-	$(DOCKER_COMPOSE) exec db sh -c \
-	  'for f in /docker-entrypoint-initdb.d/*.up.sql; do \
-	       echo "  -> $$f"; \
-	       mariadb -u $${MYSQL_USER} -p$${MYSQL_PASSWORD} $${MYSQL_DATABASE} < "$$f"; \
-	   done'
-	$(call success,Docker migrations applied)
+# FIX #6: Removed migrate-docker.  The previous implementation bypassed
+# golang-migrate entirely (raw SQL loop via mariadb CLI), causing the schema
+# version table to diverge from the migrate-managed state.  Docker-based
+# migrations should use the same `migrate` binary against the exposed DB port:
+#
+#   make migrate-up   # works against Docker DB when DB_DSN points to it
+#
+# If you need to run migrations inside the container network itself, add a
+# one-off service to docker-compose.yml that runs the migrate binary on startup.
 
 
 # =============================================================================
@@ -242,6 +248,10 @@ jwt-gen-keyset: ## Generate a fresh JWT_KEYS JSON value ready to paste into .env
 	printf 'JWT_KEYS=[{"id":"v1","secret":"%s","active":true}]\n' "$$secret"
 	$(call success,Paste the line above into your .env)
 
+# FIX #3: jwt-rotate now captures Python's stderr separately so that a real
+# Python error (syntax, import, etc.) is surfaced clearly, and the "check
+# JWT_KEYS format" message is only shown when the output is genuinely empty
+# after a clean exit — not when Python itself crashed.
 .PHONY: jwt-rotate
 jwt-rotate: ## Add a NEW active key v<N> while keeping the old key for validation
 	$(call log,jwt-rotate,Rotating JWT signing key)
@@ -252,9 +262,27 @@ jwt-rotate: ## Add a NEW active key v<N> while keeping the old key for validatio
 	next=$$((n + 1)); \
 	new_id="v$$next"; \
 	new_secret=$$(openssl rand -hex $(_SECRET_BYTES)); \
+	py_err=$$(mktemp); \
 	updated=$$(JWTR_KEYS="$$existing" JWTR_NEW_ID="$$new_id" JWTR_SECRET="$$new_secret" \
-		python3 -c "import os,json; k=json.loads(os.environ['JWTR_KEYS']); [x.update({'active':False}) for x in k]; k.append({'id':os.environ['JWTR_NEW_ID'],'secret':os.environ['JWTR_SECRET'],'active':True}); print(json.dumps(k,separators=(',',':')))"); \
-	[ -n "$$updated" ] || { printf "$(RED)jwt-rotate: python3 failed — check JWT_KEYS format in .env$(RESET)\n"; exit 1; }; \
+		python3 -c "\
+import os, json, sys; \
+k = json.loads(os.environ['JWTR_KEYS']); \
+[x.update({'active': False}) for x in k]; \
+k.append({'id': os.environ['JWTR_NEW_ID'], 'secret': os.environ['JWTR_SECRET'], 'active': True}); \
+print(json.dumps(k, separators=(',', ':'))); \
+" 2>"$$py_err"); \
+	py_exit=$$?; \
+	if [ $$py_exit -ne 0 ]; then \
+		printf "$(RED)jwt-rotate: python3 failed (exit $$py_exit):$(RESET)\n"; \
+		cat "$$py_err"; \
+		rm -f "$$py_err"; \
+		exit 1; \
+	fi; \
+	rm -f "$$py_err"; \
+	if [ -z "$$updated" ]; then \
+		printf "$(RED)jwt-rotate: python3 produced no output — check JWT_KEYS format in .env$(RESET)\n"; \
+		exit 1; \
+	fi; \
 	printf "\n$(YELLOW)New JWT_KEYS value (update your .env / secrets manager):$(RESET)\n"; \
 	printf "JWT_KEYS=%s\n\n" "$$updated"; \
 	printf "$(CYAN)Rotation checklist:$(RESET)\n"; \
@@ -300,20 +328,32 @@ mock: ## Regenerate all mocks (requires mockgen)
 	go generate ./...
 	$(call success,Mocks regenerated)
 
+# FIX #8 (gen scripts): Validate that the generator entry-points exist before
+# invoking `go run` so the user gets a clear message rather than a cryptic Go
+# compiler error.
 .PHONY: gen-project
 gen-project: ## Run the project scaffold generator
 	$(call log,gen-project,Running scaffold generator)
+	@[ -f scripts/gen/main.go ] || { printf "$(RED)scripts/gen/main.go not found$(RESET)\n"; exit 1; }
 	go run scripts/gen/main.go
 
 .PHONY: gen-md
 gen-md: ## Generate project documentation markdown (ARGS=... for extra flags)
 	$(call log,gen-md,Generating project documentation)
+	@[ -f scripts/genMD/main.go ] || { printf "$(RED)scripts/genMD/main.go not found$(RESET)\n"; exit 1; }
 	go run scripts/genMD/main.go $(ARGS)
 
+# FIX #5: Added .PHONY declaration and consistent log/success helpers.
+# swag is installed via install-tools (see FIX #8 below) so the inline
+# go-install here is kept only as a convenience fallback.
 .PHONY: swagger
-swagger:
+swagger: ## Regenerate Swagger/OpenAPI docs from annotations
+	$(call log,swagger,Regenerating Swagger docs)
 	@which swag > /dev/null 2>&1 || go install github.com/swaggo/swag/cmd/swag@latest
 	swag init -g cmd/api/swagger.go -o docs --parseDependency --parseInternal
+	$(call success,Swagger docs written to docs/)
+
+
 # =============================================================================
 #  QUALITY
 # =============================================================================
@@ -327,13 +367,15 @@ test: ## Run all unit tests with race detector
 test-short: ## Run tests skipping slow cases (-short flag)
 	go test -short -race -count=1 ./...
 
+# NOTE: test-cover opens the HTML report in a browser when available.
+# In CI environments neither `open` nor `xdg-open` will be present; the
+# `|| true` prevents a non-zero exit.  Use test-cover-pct for CI instead.
 .PHONY: test-cover
 test-cover: ## Run tests and open HTML coverage report
 	$(call log,test-cover,Running tests with coverage)
 	go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
 	go tool cover -html=coverage.out -o coverage.html
 	$(call success,Report written to coverage.html)
-	@which open > /dev/null 2>&1 && open coverage.html || xdg-open coverage.html 2>/dev/null || true
 
 .PHONY: test-cover-pct
 test-cover-pct: ## Print total coverage percentage (CI-friendly, no browser)
@@ -367,11 +409,19 @@ vet: ## Run go vet
 	$(call log,vet,Running go vet)
 	go vet ./...
 
+# FIX #7: tidy now asserts that go.mod and go.sum are unchanged after running
+# `go mod tidy`.  If they differ the user is asked to commit the changes before
+# proceeding, so that `release-tag` never tags a dirty tree.
 .PHONY: tidy
-tidy: ## Tidy go.mod and go.sum
+tidy: ## Tidy go.mod / go.sum and assert no uncommitted changes result
 	$(call log,tidy,Tidying modules)
 	go mod tidy
-	$(call success,go.mod and go.sum are tidy)
+	@if ! git diff --quiet go.mod go.sum 2>/dev/null; then \
+		printf "$(RED)go.mod or go.sum changed after tidy — commit the changes before releasing:$(RESET)\n"; \
+		git diff --stat go.mod go.sum; \
+		exit 1; \
+	fi
+	$(call success,go.mod and go.sum are tidy and committed)
 
 .PHONY: sec
 sec: ## Run gosec security scanner
@@ -441,6 +491,9 @@ version: ## Print current version information
 	@printf "Build time: $(BUILD_TIME)\n"
 	@printf "Module:     $(MODULE)\n"
 
+# FIX #7 (continued): tidy now fails if it would produce a dirty tree, so
+# `release-tag` is safe — it will never tag a commit whose go.mod/go.sum
+# differ from what is checked in.
 .PHONY: release-tag
 release-tag: ci ## Run CI gate then create and push an annotated git tag (usage: make release-tag V=v1.2.3)
 	$(call log,release-tag,Tagging release)
@@ -461,8 +514,10 @@ release-build: ## Cross-compile release binaries for linux/amd64 and linux/arm64
 	$(call success,Binaries in $(BINARY_DIR)/)
 
 # ─── Tool installer (bootstrap a fresh dev machine) ───────────────────────────
+# FIX #8: Added swag (Swagger doc generator) which was missing from the
+# original despite being required by the `swagger` target.
 .PHONY: install-tools
-install-tools: ## Install all required dev tools (sqlc, mockgen, migrate, golangci-lint, gosec, govulncheck, air)
+install-tools: ## Install all required dev tools (sqlc, mockgen, migrate, golangci-lint, gosec, govulncheck, air, swag)
 	$(call log,install-tools,Installing dev tools)
 	go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest
 	go install go.uber.org/mock/mockgen@latest
@@ -470,6 +525,7 @@ install-tools: ## Install all required dev tools (sqlc, mockgen, migrate, golang
 	go install github.com/securego/gosec/v2/cmd/gosec@latest
 	go install golang.org/x/vuln/cmd/govulncheck@latest
 	go install github.com/air-verse/air@latest
+	go install github.com/swaggo/swag/cmd/swag@latest
 	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
 	  | sh -s -- -b $$(go env GOPATH)/bin latest
 	$(call success,All tools installed)

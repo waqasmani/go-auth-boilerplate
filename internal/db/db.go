@@ -27,14 +27,23 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.assignUserRoleByNameStmt, err = db.PrepareContext(ctx, assignUserRoleByName); err != nil {
 		return nil, fmt.Errorf("error preparing query AssignUserRoleByName: %w", err)
 	}
+	if q.consumeEmailTokenStmt, err = db.PrepareContext(ctx, consumeEmailToken); err != nil {
+		return nil, fmt.Errorf("error preparing query ConsumeEmailToken: %w", err)
+	}
 	if q.consumeRefreshTokenStmt, err = db.PrepareContext(ctx, consumeRefreshToken); err != nil {
 		return nil, fmt.Errorf("error preparing query ConsumeRefreshToken: %w", err)
+	}
+	if q.createEmailTokenStmt, err = db.PrepareContext(ctx, createEmailToken); err != nil {
+		return nil, fmt.Errorf("error preparing query CreateEmailToken: %w", err)
 	}
 	if q.createRefreshTokenStmt, err = db.PrepareContext(ctx, createRefreshToken); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateRefreshToken: %w", err)
 	}
 	if q.createUserStmt, err = db.PrepareContext(ctx, createUser); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateUser: %w", err)
+	}
+	if q.getEmailTokenByHashStmt, err = db.PrepareContext(ctx, getEmailTokenByHash); err != nil {
+		return nil, fmt.Errorf("error preparing query GetEmailTokenByHash: %w", err)
 	}
 	if q.getRefreshTokenByHashStmt, err = db.PrepareContext(ctx, getRefreshTokenByHash); err != nil {
 		return nil, fmt.Errorf("error preparing query GetRefreshTokenByHash: %w", err)
@@ -51,11 +60,23 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getUserByIDWithRolesStmt, err = db.PrepareContext(ctx, getUserByIDWithRoles); err != nil {
 		return nil, fmt.Errorf("error preparing query GetUserByIDWithRoles: %w", err)
 	}
+	if q.invalidateUserTokensByTypeStmt, err = db.PrepareContext(ctx, invalidateUserTokensByType); err != nil {
+		return nil, fmt.Errorf("error preparing query InvalidateUserTokensByType: %w", err)
+	}
+	if q.markEmailVerifiedStmt, err = db.PrepareContext(ctx, markEmailVerified); err != nil {
+		return nil, fmt.Errorf("error preparing query MarkEmailVerified: %w", err)
+	}
 	if q.revokeRefreshTokenStmt, err = db.PrepareContext(ctx, revokeRefreshToken); err != nil {
 		return nil, fmt.Errorf("error preparing query RevokeRefreshToken: %w", err)
 	}
 	if q.revokeRefreshTokenFamilyStmt, err = db.PrepareContext(ctx, revokeRefreshTokenFamily); err != nil {
 		return nil, fmt.Errorf("error preparing query RevokeRefreshTokenFamily: %w", err)
+	}
+	if q.revokeUserRefreshTokensStmt, err = db.PrepareContext(ctx, revokeUserRefreshTokens); err != nil {
+		return nil, fmt.Errorf("error preparing query RevokeUserRefreshTokens: %w", err)
+	}
+	if q.updateUserPasswordHashStmt, err = db.PrepareContext(ctx, updateUserPasswordHash); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdateUserPasswordHash: %w", err)
 	}
 	return &q, nil
 }
@@ -67,9 +88,19 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing assignUserRoleByNameStmt: %w", cerr)
 		}
 	}
+	if q.consumeEmailTokenStmt != nil {
+		if cerr := q.consumeEmailTokenStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing consumeEmailTokenStmt: %w", cerr)
+		}
+	}
 	if q.consumeRefreshTokenStmt != nil {
 		if cerr := q.consumeRefreshTokenStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing consumeRefreshTokenStmt: %w", cerr)
+		}
+	}
+	if q.createEmailTokenStmt != nil {
+		if cerr := q.createEmailTokenStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing createEmailTokenStmt: %w", cerr)
 		}
 	}
 	if q.createRefreshTokenStmt != nil {
@@ -80,6 +111,11 @@ func (q *Queries) Close() error {
 	if q.createUserStmt != nil {
 		if cerr := q.createUserStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing createUserStmt: %w", cerr)
+		}
+	}
+	if q.getEmailTokenByHashStmt != nil {
+		if cerr := q.getEmailTokenByHashStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getEmailTokenByHashStmt: %w", cerr)
 		}
 	}
 	if q.getRefreshTokenByHashStmt != nil {
@@ -107,6 +143,16 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getUserByIDWithRolesStmt: %w", cerr)
 		}
 	}
+	if q.invalidateUserTokensByTypeStmt != nil {
+		if cerr := q.invalidateUserTokensByTypeStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing invalidateUserTokensByTypeStmt: %w", cerr)
+		}
+	}
+	if q.markEmailVerifiedStmt != nil {
+		if cerr := q.markEmailVerifiedStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing markEmailVerifiedStmt: %w", cerr)
+		}
+	}
 	if q.revokeRefreshTokenStmt != nil {
 		if cerr := q.revokeRefreshTokenStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing revokeRefreshTokenStmt: %w", cerr)
@@ -115,6 +161,16 @@ func (q *Queries) Close() error {
 	if q.revokeRefreshTokenFamilyStmt != nil {
 		if cerr := q.revokeRefreshTokenFamilyStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing revokeRefreshTokenFamilyStmt: %w", cerr)
+		}
+	}
+	if q.revokeUserRefreshTokensStmt != nil {
+		if cerr := q.revokeUserRefreshTokensStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing revokeUserRefreshTokensStmt: %w", cerr)
+		}
+	}
+	if q.updateUserPasswordHashStmt != nil {
+		if cerr := q.updateUserPasswordHashStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updateUserPasswordHashStmt: %w", cerr)
 		}
 	}
 	return err
@@ -154,35 +210,49 @@ func (q *Queries) queryRow(ctx context.Context, stmt *sql.Stmt, query string, ar
 }
 
 type Queries struct {
-	db                           DBTX
-	tx                           *sql.Tx
-	assignUserRoleByNameStmt     *sql.Stmt
-	consumeRefreshTokenStmt      *sql.Stmt
-	createRefreshTokenStmt       *sql.Stmt
-	createUserStmt               *sql.Stmt
-	getRefreshTokenByHashStmt    *sql.Stmt
-	getUserByEmailStmt           *sql.Stmt
-	getUserByEmailWithRolesStmt  *sql.Stmt
-	getUserByIDStmt              *sql.Stmt
-	getUserByIDWithRolesStmt     *sql.Stmt
-	revokeRefreshTokenStmt       *sql.Stmt
-	revokeRefreshTokenFamilyStmt *sql.Stmt
+	db                             DBTX
+	tx                             *sql.Tx
+	assignUserRoleByNameStmt       *sql.Stmt
+	consumeEmailTokenStmt          *sql.Stmt
+	consumeRefreshTokenStmt        *sql.Stmt
+	createEmailTokenStmt           *sql.Stmt
+	createRefreshTokenStmt         *sql.Stmt
+	createUserStmt                 *sql.Stmt
+	getEmailTokenByHashStmt        *sql.Stmt
+	getRefreshTokenByHashStmt      *sql.Stmt
+	getUserByEmailStmt             *sql.Stmt
+	getUserByEmailWithRolesStmt    *sql.Stmt
+	getUserByIDStmt                *sql.Stmt
+	getUserByIDWithRolesStmt       *sql.Stmt
+	invalidateUserTokensByTypeStmt *sql.Stmt
+	markEmailVerifiedStmt          *sql.Stmt
+	revokeRefreshTokenStmt         *sql.Stmt
+	revokeRefreshTokenFamilyStmt   *sql.Stmt
+	revokeUserRefreshTokensStmt    *sql.Stmt
+	updateUserPasswordHashStmt     *sql.Stmt
 }
 
 func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 	return &Queries{
-		db:                           tx,
-		tx:                           tx,
-		assignUserRoleByNameStmt:     q.assignUserRoleByNameStmt,
-		consumeRefreshTokenStmt:      q.consumeRefreshTokenStmt,
-		createRefreshTokenStmt:       q.createRefreshTokenStmt,
-		createUserStmt:               q.createUserStmt,
-		getRefreshTokenByHashStmt:    q.getRefreshTokenByHashStmt,
-		getUserByEmailStmt:           q.getUserByEmailStmt,
-		getUserByEmailWithRolesStmt:  q.getUserByEmailWithRolesStmt,
-		getUserByIDStmt:              q.getUserByIDStmt,
-		getUserByIDWithRolesStmt:     q.getUserByIDWithRolesStmt,
-		revokeRefreshTokenStmt:       q.revokeRefreshTokenStmt,
-		revokeRefreshTokenFamilyStmt: q.revokeRefreshTokenFamilyStmt,
+		db:                             tx,
+		tx:                             tx,
+		assignUserRoleByNameStmt:       q.assignUserRoleByNameStmt,
+		consumeEmailTokenStmt:          q.consumeEmailTokenStmt,
+		consumeRefreshTokenStmt:        q.consumeRefreshTokenStmt,
+		createEmailTokenStmt:           q.createEmailTokenStmt,
+		createRefreshTokenStmt:         q.createRefreshTokenStmt,
+		createUserStmt:                 q.createUserStmt,
+		getEmailTokenByHashStmt:        q.getEmailTokenByHashStmt,
+		getRefreshTokenByHashStmt:      q.getRefreshTokenByHashStmt,
+		getUserByEmailStmt:             q.getUserByEmailStmt,
+		getUserByEmailWithRolesStmt:    q.getUserByEmailWithRolesStmt,
+		getUserByIDStmt:                q.getUserByIDStmt,
+		getUserByIDWithRolesStmt:       q.getUserByIDWithRolesStmt,
+		invalidateUserTokensByTypeStmt: q.invalidateUserTokensByTypeStmt,
+		markEmailVerifiedStmt:          q.markEmailVerifiedStmt,
+		revokeRefreshTokenStmt:         q.revokeRefreshTokenStmt,
+		revokeRefreshTokenFamilyStmt:   q.revokeRefreshTokenFamilyStmt,
+		revokeUserRefreshTokensStmt:    q.revokeUserRefreshTokensStmt,
+		updateUserPasswordHashStmt:     q.updateUserPasswordHashStmt,
 	}
 }

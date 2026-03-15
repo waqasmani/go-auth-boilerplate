@@ -14,20 +14,53 @@ type Querier interface {
 	// The LIMIT 1 is defensive — role names are UNIQUE but this makes the intent
 	// explicit and prevents a runaway insert if that constraint were ever dropped.
 	AssignUserRoleByName(ctx context.Context, arg AssignUserRoleByNameParams) (sql.Result, error)
+	// Atomically marks a token as used. The WHERE guard ensures exactly
+	// one concurrent caller gets RowsAffected = 1; any racing caller gets
+	// 0, which the service treats as a replay attempt.
+	ConsumeEmailToken(ctx context.Context, id string) (sql.Result, error)
 	// Atomically marks a refresh token as used in a single UPDATE.
 	// The WHERE used_at IS NULL guard means exactly one concurrent caller
 	// will get RowsAffected = 1; every other caller racing on the same token
 	// gets RowsAffected = 0, which the service layer treats as token reuse.
 	ConsumeRefreshToken(ctx context.Context, id string) (sql.Result, error)
+	// Inserts a new email token record. The raw token is never stored;
+	// only the SHA-256 hex hash (CHAR(64)) is persisted, matching the
+	// same pattern as refresh_tokens.
+	CreateEmailToken(ctx context.Context, arg CreateEmailTokenParams) error
 	CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) error
 	CreateUser(ctx context.Context, arg CreateUserParams) error
+	// Retrieves the full token record by its SHA-256 hex hash so the
+	// service layer can inspect used_at / expires_at before consuming it.
+	// No WHERE used_at IS NULL filter — the service layer decides which
+	// state transitions are valid for each token_type.
+	GetEmailTokenByHash(ctx context.Context, tokenHash string) (EmailToken, error)
+	// BUG FIX: removed `AND revoked_at IS NULL` — the previous filter made the
+	// token.RevokedAt.Valid checks in auth/service.go unreachable dead code.
+	// The application layer now receives the full record and returns the correct
+	// typed error (ErrTokenRevoked vs ErrTokenInvalid) for each case.
 	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (RefreshToken, error)
 	GetUserByEmail(ctx context.Context, email string) (User, error)
 	GetUserByEmailWithRoles(ctx context.Context, email string) ([]GetUserByEmailWithRolesRow, error)
 	GetUserByID(ctx context.Context, id string) (User, error)
 	GetUserByIDWithRoles(ctx context.Context, id string) ([]GetUserByIDWithRolesRow, error)
+	// Soft-deletes (marks used) all live tokens of a given type for a
+	// user before issuing a new one. Prevents a user from holding multiple
+	// valid reset/verify tokens simultaneously.
+	InvalidateUserTokensByType(ctx context.Context, arg InvalidateUserTokensByTypeParams) error
+	// Stamps email_verified_at once the user clicks the verification link.
+	// Idempotent: calling it on an already-verified user is a safe no-op
+	// (the column will simply be updated to NOW() again).
+	MarkEmailVerified(ctx context.Context, id string) error
 	RevokeRefreshToken(ctx context.Context, id string) error
 	RevokeRefreshTokenFamily(ctx context.Context, tokenFamily string) error
+	// Called after a successful password reset to invalidate every active
+	// session for the user. Any attacker holding a stolen refresh token
+	// will get ErrTokenRevoked on their next /refresh call.
+	RevokeUserRefreshTokens(ctx context.Context, userID string) error
+	// Replaces the bcrypt hash after a successful password reset.
+	// updated_at is refreshed so cache-busting strategies based on that
+	// column work correctly.
+	UpdateUserPasswordHash(ctx context.Context, arg UpdateUserPasswordHashParams) error
 }
 
 var _ Querier = (*Queries)(nil)

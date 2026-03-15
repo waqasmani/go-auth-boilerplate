@@ -18,9 +18,11 @@ import (
 	"github.com/waqasmani/go-auth-boilerplate/internal/config"
 	dbpkg "github.com/waqasmani/go-auth-boilerplate/internal/db"
 	authmodule "github.com/waqasmani/go-auth-boilerplate/internal/modules/auth"
+	emailmodule "github.com/waqasmani/go-auth-boilerplate/internal/modules/auth_email"
 	usersmodule "github.com/waqasmani/go-auth-boilerplate/internal/modules/users"
 	platformauth "github.com/waqasmani/go-auth-boilerplate/internal/platform/auth"
 	"github.com/waqasmani/go-auth-boilerplate/internal/platform/database"
+	mailer "github.com/waqasmani/go-auth-boilerplate/internal/platform/email"
 	"github.com/waqasmani/go-auth-boilerplate/internal/platform/logger"
 	"github.com/waqasmani/go-auth-boilerplate/internal/router"
 )
@@ -90,6 +92,17 @@ func New(migrationsFS fs.FS) (*App, error) {
 
 	logJWTKeySet(log, cfg.JWTKeys)
 
+	m, _ := mailer.New(mailer.Config{
+		Host:     cfg.EmailSMTPHost, // empty string = no-op mailer
+		Port:     cfg.EmailSMTPPort,
+		Username: cfg.EmailSMTPUser,
+		Password: cfg.EmailSMTPPass,
+		UseTLS:   cfg.EmailSMTPUseTLS,
+		From:     cfg.EmailFrom,
+	})
+	if m.Enabled() {
+		log.Info("email mailer ready", zap.String("host", cfg.EmailSMTPHost))
+	}
 	// ─── Modules ───────────────────────────────────────────────────────────────
 	authMod := authmodule.NewModule(authmodule.ModuleConfig{
 		SqlDB:   sqlDB,
@@ -98,6 +111,21 @@ func New(migrationsFS fs.FS) (*App, error) {
 		Log:     log,
 		Cfg:     cfg,
 	})
+
+	emailAuthMod := emailmodule.NewModule(emailmodule.ModuleConfig{
+		Queries:        queries,
+		Mailer:         m,
+		Log:            log,
+		FrontEndDomain: cfg.FrontEndDomain,
+		// authMod.Service satisfies authemail.TokenIssuer structurally —
+		// Go's duck typing, no import of the auth package needed here.
+		TokenIssuer: authMod.Service,
+		Cfg:         cfg,
+	})
+	// Complete the bidirectional wiring. emailAuthMod.Service satisfies
+	// auth.MFAChallenger (same InitiateChallenge signature). Must be called
+	// before the server starts accepting traffic.
+	authMod.Service.SetMFAChallenger(emailAuthMod.Service)
 	usersMod := usersmodule.NewModule(queries, log)
 
 	// ─── Router ────────────────────────────────────────────────────────────────
@@ -119,8 +147,9 @@ func New(migrationsFS fs.FS) (*App, error) {
 			cfg.SecHSTSMaxAge,
 		),
 		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
+		CookieCSRF:        router.CookieCSRFConfigFromValues(cfg.FrontEndDomain),
 	}
-	engine := router.New(cfg.AppEnv, log, jwtHelper, authMod, usersMod, routerOpts)
+	engine := router.New(cfg.AppEnv, log, jwtHelper, authMod, usersMod, routerOpts, emailAuthMod)
 
 	server := &http.Server{
 		Addr:         ":" + cfg.AppPort,

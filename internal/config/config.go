@@ -55,6 +55,13 @@ type Config struct {
 	// X-Forwarded-For / X-Real-IP headers.  Should be the CIDR of your LB
 	// or ingress controller.  Empty means no proxy is trusted (direct mode).
 	TrustedProxyCIDRs []string
+
+	EmailSMTPHost   string
+	EmailSMTPPort   int
+	EmailSMTPUser   string
+	EmailSMTPPass   string
+	EmailSMTPUseTLS bool
+	EmailFrom       string
 }
 
 // JWTKeyConfig is a single signing key entry as stored in config / env vars.
@@ -117,28 +124,45 @@ func Load() (*Config, error) {
 
 	// ── Optional variables with defaults ──────────────────────────────────────
 	cfg := &Config{
-		AppEnv:      getEnv("APP_ENV", "development"),
-		AppPort:     getEnv("APP_PORT", "8080"),
-		DBDSN:       dbDSN,
-		JWTKeys:     jwtKeys,
-		JWTIssuer:   getEnv("JWT_ISSUER", "go-auth-boilerplate"),
-		JWTAudience: getEnv("JWT_AUDIENCE", "go-auth-boilerplate-users"),
-
-		RateLimitRate:    parseFloat("RATE_LIMIT_RATE", 5.0),
-		RateLimitBurst:   parseInt("RATE_LIMIT_BURST", 10),
-		RateLimitMaxKeys: parseInt("RATE_LIMIT_MAX_KEYS", 10_000),
-
+		AppEnv:               getEnv("APP_ENV", "development"),
+		AppPort:              getEnv("APP_PORT", "8080"),
+		DBDSN:                dbDSN,
+		JWTKeys:              jwtKeys,
+		JWTIssuer:            getEnv("JWT_ISSUER", "go-auth-boilerplate"),
+		JWTAudience:          getEnv("JWT_AUDIENCE", "go-auth-boilerplate-users"),
+		RateLimitRate:        parseFloat("RATE_LIMIT_RATE", 5.0),
 		CORSAllowedOrigins:   parseStringSlice("CORS_ALLOWED_ORIGINS", []string{"http://localhost:3000"}),
 		CORSAllowedHeaders:   parseStringSlice("CORS_ALLOWED_HEADERS", []string{"Authorization", "Content-Type", "X-Request-ID"}),
 		CORSAllowCredentials: parseBool("CORS_ALLOW_CREDENTIALS", true),
-		CORSMaxAge:           parseInt("CORS_MAX_AGE", 43200),
-
-		FrontEndDomain:    getEnv("FRONT_END_DOMAIN", "http://localhost:3000"),
-		SecHSTSEnabled:    parseBool("SEC_HSTS_ENABLED", false),
-		SecHSTSMaxAge:     parseInt("SEC_HSTS_MAX_AGE", 63_072_000),
-		TrustedProxyCIDRs: parseStringSlice("TRUSTED_PROXY_CIDRS", []string{"10.0.0.0/8"}),
+		FrontEndDomain:       getEnv("FRONT_END_DOMAIN", "http://localhost:3000"),
+		SecHSTSEnabled:       parseBool("SEC_HSTS_ENABLED", false),
+		TrustedProxyCIDRs:    parseStringSlice("TRUSTED_PROXY_CIDRS", []string{""}),
+		EmailSMTPHost:        getEnv("EMAIL_SMTP_HOST", ""), // empty = disabled
+		EmailSMTPUser:        getEnv("EMAIL_SMTP_USERNAME", ""),
+		EmailSMTPPass:        getEnv("EMAIL_SMTP_PASSWORD", ""),
+		EmailSMTPUseTLS:      parseBool("EMAIL_SMTP_USE_TLS", false),
+		EmailFrom:            getEnv("EMAIL_FROM", "App <noreply@example.com>"),
 	}
-
+	cfg.EmailSMTPPort, err = parseInt("EMAIL_SMTP_PORT", 1025)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	cfg.RateLimitBurst, err = parseInt("RATE_LIMIT_BURST", 10)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	cfg.RateLimitMaxKeys, err = parseInt("RATE_LIMIT_MAX_KEYS", 10_000)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	cfg.CORSMaxAge, err = parseInt("CORS_MAX_AGE", 43200)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	cfg.SecHSTSMaxAge, err = parseInt("SEC_HSTS_MAX_AGE", 63_072_000)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
 	if cfg.FrontEndDomain == "" {
 		return nil, fmt.Errorf("config: FRONT_END_DOMAIN is required")
 	}
@@ -308,17 +332,16 @@ func parseFloat(key string, fallback float64) float64 {
 	return v
 }
 
-func parseInt(key string, fallback int) int {
+func parseInt(key string, fallback int) (int, error) {
 	raw := os.Getenv(key)
 	if raw == "" {
-		return fallback
+		return fallback, nil
 	}
 	v, err := strconv.Atoi(sanitizeNumericEnv(raw))
 	if err != nil {
-		// Panic or return a sentinel; at minimum, log loudly.
-		panic(fmt.Sprintf("config: %s=%q is not a valid integer", key, raw))
+		return 0, fmt.Errorf("config: %s=%q is not a valid integer", key, raw)
 	}
-	return v
+	return v, nil
 }
 
 func parseBool(key string, fallback bool) bool {
