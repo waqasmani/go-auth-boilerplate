@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -52,7 +53,11 @@ func setupTestServer(t *testing.T) *testServer {
 	if err != nil {
 		t.Fatalf("setup: connect database: %v", err)
 	}
-	t.Cleanup(func() { sqlDB.Close() })
+	t.Cleanup(func() {
+		if cerr := sqlDB.Close(); cerr != nil {
+			t.Logf("setup: close database: %v", cerr)
+		}
+	})
 
 	// ── Migrations ─────────────────────────────────────────────────────────────
 	if err := database.RunMigrations(sqlDB, migrations.FS, log); err != nil {
@@ -66,7 +71,11 @@ func setupTestServer(t *testing.T) *testServer {
 	if err != nil {
 		t.Fatalf("setup: prepare statements: %v", err)
 	}
-	t.Cleanup(func() { queries.Close() })
+	t.Cleanup(func() {
+		if cerr := queries.Close(); cerr != nil {
+			t.Logf("setup: close prepared statements: %v", cerr)
+		}
+	})
 
 	// ── JWT ────────────────────────────────────────────────────────────────────
 	// JWTConfig uses a Keys slice (multi-key rotation support).
@@ -102,7 +111,6 @@ func setupTestServer(t *testing.T) *testServer {
 	}
 
 	// ── Modules ────────────────────────────────────────────────────────────────
-	// auth module — NewModule now accepts a ModuleConfig struct.
 	authMod := authmodule.NewModule(authmodule.ModuleConfig{
 		SqlDB:   sqlDB,
 		Queries: queries,
@@ -111,10 +119,10 @@ func setupTestServer(t *testing.T) *testServer {
 		Cfg:     cfg,
 	})
 
-	// email-auth module — Mailer is nil (email disabled in tests).
+	// Mailer is nil — email sending is disabled in CI.
 	emailMod := emailmodule.NewModule(emailmodule.ModuleConfig{
 		Queries:        queries,
-		Mailer:         nil, // no SMTP in CI
+		Mailer:         nil,
 		Log:            log,
 		FrontEndDomain: "http://localhost:3000",
 		TokenIssuer:    authMod.Service,
@@ -128,9 +136,6 @@ func setupTestServer(t *testing.T) *testServer {
 	usersMod := usersmodule.NewModule(queries, log)
 
 	// ── Router ─────────────────────────────────────────────────────────────────
-	// router.New requires (env, log, jwt, authMod, usersMod, Options, emailMod).
-	// Use DefaultOptions — CSRF is the "http://localhost:3000" origin match which
-	// our test requests don't send a cookie for, so the CSRF check is a no-op.
 	routerOpts := router.Options{
 		RateLimit:     router.RateLimitConfigFromValues(100, 200, time.Minute, 10_000),
 		CORS:          router.CORSConfigFromValues([]string{"http://localhost:3000"}, nil, true, 600),
@@ -178,10 +183,12 @@ func parseDurationOrDefault(t *testing.T, key string, fallback time.Duration) ti
 	return d
 }
 
-// postJSON fires a POST request with a JSON body and returns the response.
-func postJSON(t *testing.T, url string, body any, extraHeaders ...string) *http.Response {
+// postJSON fires a POST request with a JSON body and returns the decoded
+// response body together with the HTTP status code. The response body is
+// always drained and closed before returning, satisfying bodyclose.
+func postJSON(t *testing.T, url string, payload any, extraHeaders ...string) (int, map[string]any) {
 	t.Helper()
-	b, err := json.Marshal(body)
+	b, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("marshal request body: %v", err)
 	}
@@ -194,14 +201,41 @@ func postJSON(t *testing.T, url string, body any, extraHeaders ...string) *http.
 		req.Header.Set(extraHeaders[i], extraHeaders[i+1])
 	}
 	resp, err := http.DefaultClient.Do(req)
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	if err != nil {
 		t.Fatalf("do request: %v", err)
 	}
-	return resp
+	return drainAndDecode(t, resp)
 }
 
-// getJSON fires a GET request with an Authorization header.
-func getJSON(t *testing.T, url, bearer string) *http.Response {
+// postJSONDiscardBody fires a POST request and discards the response body.
+// Use this for setup calls whose response content is not needed by the test.
+func postJSONDiscardBody(t *testing.T, url string, payload any) {
+	t.Helper()
+	b, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(b))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do request: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	if cerr := resp.Body.Close(); cerr != nil {
+		t.Logf("postJSONDiscardBody: close body: %v", cerr)
+	}
+}
+
+// getJSON fires a GET request with an optional Authorization header and
+// returns the decoded response body and HTTP status code.
+func getJSON(t *testing.T, url, bearer string) (int, map[string]any) {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
@@ -211,20 +245,31 @@ func getJSON(t *testing.T, url, bearer string) *http.Response {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
 	resp, err := http.DefaultClient.Do(req)
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	if err != nil {
 		t.Fatalf("do request: %v", err)
 	}
-	return resp
+	return drainAndDecode(t, resp)
 }
 
-func decodeResponse(t *testing.T, resp *http.Response) map[string]any {
+// drainAndDecode reads, closes, and JSON-decodes an HTTP response body.
+// Centralising this eliminates the bodyclose and errcheck findings at every
+// call site.
+func drainAndDecode(t *testing.T, resp *http.Response) (int, map[string]any) {
 	t.Helper()
-	defer resp.Body.Close()
+	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if cerr := resp.Body.Close(); cerr != nil {
+			t.Logf("drainAndDecode: close body: %v", cerr)
+		}
+	}()
 	var m map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil && err != io.EOF {
 		t.Fatalf("decode response body: %v", err)
 	}
-	return m
+	return resp.StatusCode, m
 }
 
 func uniqueEmail(prefix string) string {
@@ -238,17 +283,15 @@ func uniqueEmail(prefix string) string {
 func TestIntegration_Register_Success(t *testing.T) {
 	ts := setupTestServer(t)
 
-	resp := postJSON(t, ts.url("/api/v1/auth/register"), map[string]string{
+	status, body := postJSON(t, ts.url("/api/v1/auth/register"), map[string]string{
 		"name":     "Integration User",
 		"email":    uniqueEmail("register"),
 		"password": "strongpassword1234",
 	})
-	body := decodeResponse(t, resp)
 
-	if resp.StatusCode != http.StatusCreated {
-		t.Errorf("expected 201, got %d; body: %v", resp.StatusCode, body)
+	if status != http.StatusCreated {
+		t.Errorf("expected 201, got %d; body: %v", status, body)
 	}
-
 	data, ok := body["data"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected data object in response")
@@ -267,21 +310,21 @@ func TestIntegration_Register_DuplicateEmail(t *testing.T) {
 	ts := setupTestServer(t)
 	email := uniqueEmail("dup")
 
-	postJSON(t, ts.url("/api/v1/auth/register"), map[string]string{
+	// First registration — result not needed.
+	postJSONDiscardBody(t, ts.url("/api/v1/auth/register"), map[string]string{
 		"name":     "First User",
 		"email":    email,
 		"password": "strongpassword1234",
 	})
 
-	resp := postJSON(t, ts.url("/api/v1/auth/register"), map[string]string{
+	status, body := postJSON(t, ts.url("/api/v1/auth/register"), map[string]string{
 		"name":     "Second User",
 		"email":    email,
 		"password": "strongpassword1234",
 	})
-	body := decodeResponse(t, resp)
 
-	if resp.StatusCode != http.StatusConflict {
-		t.Errorf("expected 409, got %d; body: %v", resp.StatusCode, body)
+	if status != http.StatusConflict {
+		t.Errorf("expected 409, got %d; body: %v", status, body)
 	}
 }
 
@@ -290,15 +333,14 @@ func TestIntegration_Register_DuplicateEmail(t *testing.T) {
 func TestIntegration_Register_ValidationError(t *testing.T) {
 	ts := setupTestServer(t)
 
-	resp := postJSON(t, ts.url("/api/v1/auth/register"), map[string]string{
+	status, body := postJSON(t, ts.url("/api/v1/auth/register"), map[string]string{
 		"name":     "User",
 		"email":    uniqueEmail("val"),
 		"password": "short",
 	})
-	body := decodeResponse(t, resp)
 
-	if resp.StatusCode != http.StatusUnprocessableEntity {
-		t.Errorf("expected 422, got %d; body: %v", resp.StatusCode, body)
+	if status != http.StatusUnprocessableEntity {
+		t.Errorf("expected 422, got %d; body: %v", status, body)
 	}
 }
 
@@ -308,49 +350,47 @@ func TestIntegration_Login_InvalidCredentials(t *testing.T) {
 	ts := setupTestServer(t)
 	email := uniqueEmail("login-wrong")
 
-	// Register first.
-	postJSON(t, ts.url("/api/v1/auth/register"), map[string]string{
+	// Register — response not needed.
+	postJSONDiscardBody(t, ts.url("/api/v1/auth/register"), map[string]string{
 		"name":     "Login Test",
 		"email":    email,
 		"password": "correctpassword1234",
 	})
 
-	resp := postJSON(t, ts.url("/api/v1/auth/login"), map[string]string{
+	status, body := postJSON(t, ts.url("/api/v1/auth/login"), map[string]string{
 		"email":    email,
 		"password": "wrongpassword1234",
 	})
-	body := decodeResponse(t, resp)
 
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("expected 401, got %d; body: %v", resp.StatusCode, body)
+	if status != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d; body: %v", status, body)
 	}
 }
 
 // TestIntegration_Login_EmailNotVerified verifies that an account whose email
 // has not been verified cannot log in (403 EMAIL_NOT_VERIFIED).
 //
-// Note: registration does NOT auto-verify email — email_verified_at stays NULL
-// until the user clicks the verification link. This is the expected gate.
+// Registration does NOT auto-verify email — email_verified_at stays NULL until
+// the user clicks the verification link. This is the expected gate.
 func TestIntegration_Login_EmailNotVerified(t *testing.T) {
 	ts := setupTestServer(t)
 	email := uniqueEmail("unverified")
 
-	// Register (creates account with email_verified_at = NULL).
-	postJSON(t, ts.url("/api/v1/auth/register"), map[string]string{
+	// Register — creates account with email_verified_at = NULL.
+	postJSONDiscardBody(t, ts.url("/api/v1/auth/register"), map[string]string{
 		"name":     "Unverified",
 		"email":    email,
 		"password": "correctpassword1234",
 	})
 
 	// Attempt login before email is verified.
-	resp := postJSON(t, ts.url("/api/v1/auth/login"), map[string]string{
+	status, body := postJSON(t, ts.url("/api/v1/auth/login"), map[string]string{
 		"email":    email,
 		"password": "correctpassword1234",
 	})
-	body := decodeResponse(t, resp)
 
-	if resp.StatusCode != http.StatusForbidden {
-		t.Errorf("expected 403, got %d; body: %v", resp.StatusCode, body)
+	if status != http.StatusForbidden {
+		t.Errorf("expected 403, got %d; body: %v", status, body)
 	}
 	if errObj, ok := body["error"].(map[string]any); ok {
 		if code, _ := errObj["code"].(string); code != "EMAIL_NOT_VERIFIED" {
@@ -364,13 +404,12 @@ func TestIntegration_Login_EmailNotVerified(t *testing.T) {
 func TestIntegration_Refresh_InvalidToken(t *testing.T) {
 	ts := setupTestServer(t)
 
-	resp := postJSON(t, ts.url("/api/v1/auth/refresh"), map[string]string{
+	status, body := postJSON(t, ts.url("/api/v1/auth/refresh"), map[string]string{
 		"refresh_token": "not-a-real-token",
 	})
-	body := decodeResponse(t, resp)
 
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("expected 401, got %d; body: %v", resp.StatusCode, body)
+	if status != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d; body: %v", status, body)
 	}
 }
 
@@ -379,15 +418,13 @@ func TestIntegration_Refresh_InvalidToken(t *testing.T) {
 func TestIntegration_Logout_InvalidToken(t *testing.T) {
 	ts := setupTestServer(t)
 
-	resp := postJSON(t, ts.url("/api/v1/auth/logout"), map[string]string{
+	status, body := postJSON(t, ts.url("/api/v1/auth/logout"), map[string]string{
 		"refresh_token": "token-that-never-existed",
 	})
 
-	if resp.StatusCode != http.StatusNoContent {
-		body := decodeResponse(t, resp)
-		t.Errorf("expected 204, got %d; body: %v", resp.StatusCode, body)
+	if status != http.StatusNoContent {
+		t.Errorf("expected 204, got %d; body: %v", status, body)
 	}
-	resp.Body.Close()
 }
 
 // TestIntegration_GetMe_Unauthorized verifies that /users/me rejects requests
@@ -395,10 +432,9 @@ func TestIntegration_Logout_InvalidToken(t *testing.T) {
 func TestIntegration_GetMe_Unauthorized(t *testing.T) {
 	ts := setupTestServer(t)
 
-	resp := getJSON(t, ts.url("/api/v1/users/me"), "")
-	body := decodeResponse(t, resp)
+	status, body := getJSON(t, ts.url("/api/v1/users/me"), "")
 
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("expected 401, got %d; body: %v", resp.StatusCode, body)
+	if status != http.StatusUnauthorized {
+		t.Errorf("expected 401, got %d; body: %v", status, body)
 	}
 }
