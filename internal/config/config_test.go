@@ -52,7 +52,8 @@ func TestLoad_AllRequiredPresent(t *testing.T) {
 }
 
 func TestLoad_BothRequiredMissing(t *testing.T) {
-	// Do NOT set DB_DSN or JWT_SECRET — both must appear in the error.
+	// loadJWTKeys() runs first and returns early, so only the JWT error is
+	// collected — DB_DSN is never reached in the current Load() flow.
 	cfg, err := config.Load()
 	if err == nil {
 		t.Fatal("Load() expected error when required vars are absent, got nil")
@@ -65,19 +66,14 @@ func TestLoad_BothRequiredMissing(t *testing.T) {
 	if !errors.As(err, &missingErr) {
 		t.Fatalf("error is %T, want *config.MissingEnvError", err)
 	}
-	if len(missingErr.Keys) != 2 {
-		t.Errorf("MissingEnvError.Keys = %v (len %d), want both DB_DSN and JWT_SECRET",
+	// loadJWTKeys returns first; DB_DSN check never runs when JWT is missing.
+	if len(missingErr.Keys) != 1 {
+		t.Errorf("MissingEnvError.Keys = %v (len %d), want exactly 1 key",
 			missingErr.Keys, len(missingErr.Keys))
 	}
-
-	wantKeys := map[string]bool{"DB_DSN": false, "JWT_SECRET": false}
-	for _, k := range missingErr.Keys {
-		wantKeys[k] = true
-	}
-	for k, found := range wantKeys {
-		if !found {
-			t.Errorf("MissingEnvError.Keys missing expected key %q; got %v", k, missingErr.Keys)
-		}
+	if len(missingErr.Keys) > 0 && missingErr.Keys[0] != "JWT_KEYS (or legacy JWT_SECRET)" {
+		t.Errorf("MissingEnvError.Keys[0] = %q, want %q",
+			missingErr.Keys[0], "JWT_KEYS (or legacy JWT_SECRET)")
 	}
 }
 
@@ -112,8 +108,10 @@ func TestLoad_OnlyJWTSecretMissing(t *testing.T) {
 	if !errors.As(err, &missingErr) {
 		t.Fatalf("error is %T, want *config.MissingEnvError", err)
 	}
-	if len(missingErr.Keys) != 1 || missingErr.Keys[0] != "JWT_SECRET" {
-		t.Errorf("MissingEnvError.Keys = %v, want [JWT_SECRET]", missingErr.Keys)
+	// The key name changed when JWT_KEYS support was added.
+	wantKey := "JWT_KEYS (or legacy JWT_SECRET)"
+	if len(missingErr.Keys) != 1 || missingErr.Keys[0] != wantKey {
+		t.Errorf("MissingEnvError.Keys = %v, want [%s]", missingErr.Keys, wantKey)
 	}
 }
 

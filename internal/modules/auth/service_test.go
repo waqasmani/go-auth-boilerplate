@@ -147,15 +147,23 @@ func (r *stubRepo) CreateRefreshToken(_ context.Context, params db.CreateRefresh
 func (r *stubRepo) GetRefreshTokenByHash(_ context.Context, hash string) (*db.RefreshToken, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	t, ok := r.tokens[hash]
 	if !ok {
 		return nil, apperrors.ErrTokenInvalid
 	}
-	// Reflect family-level revocations into the returned record.
+
+	// copy the struct so callers never hold a pointer into the shared
+	// map. Without this, concurrent reads in the service race with the write
+	// in ConsumeRefreshToken (which sets t.UsedAt under the same mutex).
+	snapshot := *t
+
+	// Reflect family-level revocations into the snapshot.
 	if r.revokedFamilies[t.TokenFamily] {
-		t.RevokedAt = sql.NullTime{Time: time.Now(), Valid: true}
+		snapshot.RevokedAt = sql.NullTime{Time: time.Now(), Valid: true}
 	}
-	return t, nil
+
+	return &snapshot, nil
 }
 
 // ConsumeRefreshToken mirrors the atomic DB behaviour:

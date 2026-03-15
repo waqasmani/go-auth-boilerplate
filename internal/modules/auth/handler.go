@@ -67,11 +67,17 @@ func (h *Handler) Register(c *gin.Context) {
 
 // Login godoc
 // @Summary      Login
+// @Description  Returns TokenResponse for normal accounts. Returns MFAChallengeResponse
+// @Description  (requires_mfa: true) when the account has 2FA enabled — the client must
+// @Description  then POST { code, mfa_token } to /auth/otp/verify to receive tokens.
 // @Tags         auth
 // @Accept       json
 // @Produce      json
 // @Param        body body LoginRequest true "Login payload"
 // @Success      200 {object} response.Response{data=TokenResponse}
+// @Success      200 {object} response.Response{data=MFAChallengeResponse}
+// @Failure      401 {object} response.Response
+// @Failure      403 {object} response.Response "Email not verified or 2FA required"
 // @Router       /auth/login [post]
 func (h *Handler) Login(c *gin.Context) {
 	var req LoginRequest
@@ -79,13 +85,22 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	tokenResp, err := h.svc.Login(c.Request.Context(), req)
+	result, err := h.svc.Login(c.Request.Context(), req)
 	if err != nil {
 		response.Error(c, err)
 		return
 	}
-	h.setCookie(c, tokenResp.RefreshToken)
-	response.OK(c, tokenResp)
+
+	// Exactly one branch fires — the discriminated union guarantees this.
+	if result.Challenge != nil {
+		// Do NOT set a cookie — no refresh token exists yet.
+		// The client must complete the OTP step first.
+		response.OK(c, result.Challenge)
+		return
+	}
+
+	h.setCookie(c, result.Token.RefreshToken)
+	response.OK(c, result.Token)
 }
 
 // Refresh godoc
@@ -143,10 +158,8 @@ func (h *Handler) Logout(c *gin.Context) {
 		return
 	}
 
-	if refreshToken != "" {
-		c.SetSameSite(http.SameSiteLaxMode)
-		h.clearCookie(c)
-	}
+	c.SetSameSite(http.SameSiteLaxMode)
+	h.clearCookie(c)
 	response.NoContent(c)
 }
 

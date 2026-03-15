@@ -121,22 +121,37 @@ func TestNewMigrator_EmptyFS_ReturnsError(t *testing.T) {
 	}
 }
 
-func TestNewMigrator_ValidFS_NilDB_FailsAtDriverStep(t *testing.T) {
-	// An FS with a correctly-named file passes the source-driver step and fails
-	// at the MySQL driver step (nil *sql.DB), confirming the source is accepted.
+func TestNewMigrator_ValidFS_UnreachableDB_FailsAtDriverStep(t *testing.T) {
+	// An FS with correctly-named files passes the iofs source step.
+	// The MySQL driver step then fails because the DSN is unreachable,
+	// confirming the two steps are exercised in the right order.
+	//
+	// Note: we must NOT pass a nil *sql.DB — mysqldrv.WithInstance calls
+	// db.Ping() unconditionally and will panic on nil. sql.Open is lazy
+	// (no dial), so the returned *sql.DB is non-nil even for a bogus DSN.
 	validFS := fstest.MapFS{
 		"000001_init.up.sql":   &fstest.MapFile{Data: []byte("CREATE TABLE t (id INT);")},
 		"000001_init.down.sql": &fstest.MapFile{Data: []byte("DROP TABLE t;")},
 	}
 
-	_, err := newMigrator(nil, validFS)
-	// The error must come from the MySQL driver step, not the iofs step.
-	if err == nil {
-		t.Error("newMigrator() must return an error when sqlDB is nil")
+	db, err := sql.Open("mysql", "user:pass@tcp(127.0.0.1:1)/nonexistent")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
 	}
-	// Must NOT be an iofs source error (source was valid).
+	defer func() {
+		if cerr := db.Close(); cerr != nil {
+			t.Logf("db.Close: %v", cerr)
+		}
+	}()
+
+	_, err = newMigrator(db, validFS)
+	// The error must come from the MySQL driver step (Ping failed), not from
+	// the iofs source step (the FS was valid).
+	if err == nil {
+		t.Error("newMigrator() must return an error when the DB is unreachable")
+	}
 	if errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("newMigrator() error should be from the mysql driver step, not FS: %v", err)
+		t.Errorf("error should be from the mysql driver step, not FS: %v", err)
 	}
 }
 

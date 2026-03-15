@@ -6,8 +6,63 @@ package db
 
 import (
 	"database/sql"
+	"database/sql/driver"
+	"fmt"
 	"time"
 )
+
+type EmailTokensTokenType string
+
+const (
+	EmailTokensTokenTypeVerify EmailTokensTokenType = "verify"
+	EmailTokensTokenTypeReset  EmailTokensTokenType = "reset"
+	EmailTokensTokenTypeOtp    EmailTokensTokenType = "otp"
+)
+
+func (e *EmailTokensTokenType) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = EmailTokensTokenType(s)
+	case string:
+		*e = EmailTokensTokenType(s)
+	default:
+		return fmt.Errorf("unsupported scan type for EmailTokensTokenType: %T", src)
+	}
+	return nil
+}
+
+type NullEmailTokensTokenType struct {
+	EmailTokensTokenType EmailTokensTokenType `json:"email_tokens_token_type"`
+	Valid                bool                 `json:"valid"` // Valid is true if EmailTokensTokenType is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullEmailTokensTokenType) Scan(value interface{}) error {
+	if value == nil {
+		ns.EmailTokensTokenType, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.EmailTokensTokenType.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullEmailTokensTokenType) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.EmailTokensTokenType), nil
+}
+
+type EmailToken struct {
+	ID        string               `json:"id"`
+	UserID    string               `json:"user_id"`
+	TokenHash string               `json:"token_hash"`
+	TokenType EmailTokensTokenType `json:"token_type"`
+	UsedAt    sql.NullTime         `json:"used_at"`
+	ExpiresAt time.Time            `json:"expires_at"`
+	CreatedAt time.Time            `json:"created_at"`
+}
 
 type RefreshToken struct {
 	ID          string       `json:"id"`
@@ -29,12 +84,14 @@ type Role struct {
 }
 
 type User struct {
-	ID           string    `json:"id"`
-	Email        string    `json:"email"`
-	PasswordHash string    `json:"password_hash"`
-	Name         string    `json:"name"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID              string       `json:"id"`
+	Email           string       `json:"email"`
+	PasswordHash    string       `json:"password_hash"`
+	Name            string       `json:"name"`
+	EmailVerifiedAt sql.NullTime `json:"email_verified_at"`
+	TwoFaEnabled    bool         `json:"two_fa_enabled"`
+	CreatedAt       time.Time    `json:"created_at"`
+	UpdatedAt       time.Time    `json:"updated_at"`
 }
 
 type UserRole struct {

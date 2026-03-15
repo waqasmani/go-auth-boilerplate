@@ -129,13 +129,13 @@ func defaultDialSMTP(ctx context.Context, addr string, tlsCfg *tls.Config) (smtp
 	}
 
 	if dErr := conn.SetDeadline(time.Now().Add(smtpTimeout)); dErr != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, dErr
 	}
 
 	c, cErr := smtp.NewClient(conn, host)
 	if cErr != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, cErr
 	}
 	return c, nil

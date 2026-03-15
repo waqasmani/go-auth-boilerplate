@@ -159,3 +159,23 @@ var ErrRateLimitExceeded = &AppError{
 	Message:    "too many requests — slow down and try again",
 	HTTPStatus: http.StatusTooManyRequests,
 }
+
+// ErrCSRFRejected is returned when a cookie-bearing request fails the
+// Origin / Referer validation check in the CookieCSRF middleware.
+// The message is deliberately generic to avoid leaking which header was
+// missing or mismatched.
+var ErrCSRFRejected = &AppError{
+	Code:       "CSRF_REJECTED",
+	Message:    "request origin could not be verified",
+	HTTPStatus: http.StatusForbidden,
+}
+
+// ErrEmailNotVerified is returned when login is attempted on an account whose
+// email address has not yet been confirmed. The client should redirect to a
+// "check your inbox" screen and offer to resend the verification link via
+// POST /auth/resend-verification.
+var ErrEmailNotVerified = &AppError{
+	Code:       "EMAIL_NOT_VERIFIED",
+	Message:    "please verify your email address before signing in",
+	HTTPStatus: http.StatusForbidden,
+}
