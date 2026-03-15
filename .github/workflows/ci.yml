@@ -58,7 +58,7 @@ jobs:
           MYSQL_PWD: rootpassword 
         run: |
           for f in $(ls sql/migrations/*.up.sql | sort); do
-            mariadb -h 127.0.0.1 -u root auth_db_test < "$f"
+            mysql -h 127.0.0.1 -u root auth_db_test < "$f"
           done
 
       - name: Run unit tests
