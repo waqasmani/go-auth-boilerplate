@@ -170,7 +170,7 @@ func loadOAuthProviders() (map[string]OAuthProviderConfig, error) {
 				return nil, fmt.Errorf(
 					"oauth %s: OAUTH_%s_ALLOWED_REDIRECTS entry %q must be an https:// URL "+
 						"(web) or a custom-scheme URI (mobile, e.g. com.myapp://…). "+
-						"http:// and scheme-less URLs are not permitted.",
+						"http:// and scheme-less URLs are not permitted",
 					name, upper, raw,
 				)
 			}
@@ -262,7 +262,7 @@ func loadRedisConfig(cfg *Config) error {
 	if redisDSN == "" {
 		return fmt.Errorf(
 			"REDIS_DSN is required — Redis is a mandatory dependency with no in-memory fallback. " +
-				"Set REDIS_DSN to a reachable Redis instance (e.g. redis://localhost:6379/0).",
+				"Set REDIS_DSN to a reachable Redis instance (e.g. redis://localhost:6379/0)",
 		)
 	}
 

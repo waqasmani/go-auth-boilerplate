@@ -164,7 +164,7 @@ func validateSMTP(c *Config) error {
 	if c.EmailSMTPHost == "" {
 		return fmt.Errorf(
 			"config: EMAIL_SMTP_HOST is required — SMTP is a mandatory dependency with no stub mode. " +
-				"Set EMAIL_SMTP_HOST to a reachable SMTP server (e.g. localhost for MailHog in development).",
+				"Set EMAIL_SMTP_HOST to a reachable SMTP server (e.g. localhost for MailHog in development)",
 		)
 	}
 	if c.EmailSMTPPort < 1 || c.EmailSMTPPort > 65535 {
@@ -287,7 +287,7 @@ func validateCookieDomainPolicy(c *Config) error {
 			"refresh_token cookie to every subdomain of %q — this requires %s to prevent "+
 			"token leakage via HTTP downgrade or cross-subdomain navigation. "+
 			"Set %s, or remove the leading dot to restrict the cookie to the exact "+
-			"FRONT_END_DOMAIN hostname.",
+			"FRONT_END_DOMAIN hostname",
 		c.CookieDomain,
 		strings.TrimPrefix(c.CookieDomain, "."),
 		missing,

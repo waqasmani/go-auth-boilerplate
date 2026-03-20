@@ -5,6 +5,7 @@ package container
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io/fs"
 	"time"
@@ -178,7 +179,7 @@ func (c *Container) Close() error {
 	if c.Logger != nil {
 		_ = c.Logger.Sync()
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func jwtKeysFromConfig(keys []config.JWTKeyConfig) []platformauth.JWTKey {

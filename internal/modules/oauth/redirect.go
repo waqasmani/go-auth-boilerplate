@@ -47,11 +47,6 @@ func classifyRedirect(rawURL string) redirectKind {
 	}
 }
 
-// isWebRedirect reports whether rawURL is a valid HTTPS URL with a hostname.
-func isWebRedirect(rawURL string) bool {
-	return classifyRedirect(rawURL) == redirectKindWeb
-}
-
 // isCustomScheme reports whether rawURL uses a non-http(s) scheme.
 // Custom schemes (e.g. com.myapp://oauth/callback) are the mobile deep-link pattern.
 func isCustomScheme(rawURL string) bool {

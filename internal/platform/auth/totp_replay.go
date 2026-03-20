@@ -25,6 +25,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -116,11 +117,11 @@ func (s *redisReplayStore) CheckAndRecord(userID, code string) bool {
 
 	key := redisReplayKeyPrefix + replayCacheKey(userID, code)
 
-	set, err := s.rdb.SetNX(ctx, key, "", s.ttl).Result()
-	if err != nil {
-		// Always fail-closed: reject the code and log. A Redis outage should
-		// not silently reopen the TOTP replay window. Resolve availability at
-		// the infrastructure layer (Sentinel, Cluster, ElastiCache Multi-AZ).
+	set, err := s.rdb.SetArgs(ctx, key, "", goredis.SetArgs{
+		TTL:  s.ttl,
+		Mode: "NX",
+	}).Result()
+	if err != nil && !errors.Is(err, goredis.Nil) {
 		s.log.Error(
 			"totp_replay: redis unavailable — rejecting TOTP code (fail-closed) to prevent replay exposure; "+
 				"resolve Redis availability at the infrastructure layer",
@@ -128,7 +129,7 @@ func (s *redisReplayStore) CheckAndRecord(userID, code string) bool {
 		)
 		return false
 	}
-	return set
+	return set == "OK"
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
