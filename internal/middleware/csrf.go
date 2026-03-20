@@ -36,13 +36,20 @@ import (
 	"github.com/waqasmani/go-auth-boilerplate/internal/response"
 )
 
-// CookieCSRFConfig holds the single knob needed for the cookie-scoped CSRF check.
+// CookieCSRFConfig holds the configuration for the cookie-scoped CSRF check.
 type CookieCSRFConfig struct {
-	// TrustedOrigin is the frontend origin that is permitted to send
-	// cookie-bearing POST requests (e.g. "https://app.example.com").
-	// Scheme and host are extracted at construction time; any path component is
-	// ignored.  Derived from cfg.FrontEndDomain — no extra env var required.
-	TrustedOrigin string
+	// TrustedOrigins is the list of frontend origins permitted to send
+	// cookie-bearing POST requests (e.g. ["https://app.example.com",
+	// "https://admin.example.com"]).  Scheme and host are extracted at
+	// construction time; any path component is ignored.
+	//
+	// A single-element slice is the common case (one frontend domain).
+	// Multi-origin deployments — e.g. separate app and admin subdomains
+	// sharing one API — add entries here without code changes.
+	//
+	// Derived from cfg.FrontEndDomain via CookieCSRFConfigFromValues; set
+	// directly when multiple origins are required.
+	TrustedOrigins []string
 }
 
 // CookieCSRF returns a Gin middleware that enforces Origin / Referer validation
@@ -54,31 +61,58 @@ type CookieCSRFConfig struct {
 //     the token in the JSON body (mobile apps, curl, etc.) are unaffected.
 //
 //  2. Cookie present, Origin header set → compare "scheme://host" against
-//     TrustedOrigin. Browsers set Origin on all cross-origin POST requests
-//     made via fetch() or XMLHttpRequest, making this the primary signal.
+//     each entry in TrustedOrigins. Browsers set Origin on all cross-origin
+//     POST requests made via fetch() or XMLHttpRequest, making this the
+//     primary signal.
 //
-//  3. Cookie present, no Origin, Referer set → extract origin from Referer and
-//     compare. Referer is suppressed by some privacy settings and the
-//     Referrer-Policy we set ("strict-origin-when-cross-origin"), but it is a
-//     useful fallback for same-origin page navigations.
+//  3. Cookie present, no Origin, Referer set → extract origin from Referer
+//     and compare against TrustedOrigins. Referer is suppressed by some
+//     privacy settings and the Referrer-Policy we set
+//     ("strict-origin-when-cross-origin"), but it is a useful fallback for
+//     same-origin page navigations.
 //
 //  4. Cookie present, neither Origin nor Referer → reject (fail-closed).
 //     A genuine browser POST always carries at least one of these headers.
 //     Absence is a strong signal of a tampered or synthetic request.
 //
 // Apply this middleware per-route on /auth/refresh and /auth/logout only.
-// There is no reason to run it globally: the other endpoints do not consume the
-// cookie and adding latency-free checks to every route is unnecessary noise.
+// There is no reason to run it globally: the other endpoints do not consume
+// the cookie and adding latency-free checks to every route is unnecessary
+// noise.
+//
+// Panics at startup when TrustedOrigins is empty or contains an entry that
+// cannot be normalised — configuration errors must be caught in CI rather
+// than silently accepting all origins in production.
 func CookieCSRF(cfg CookieCSRFConfig) gin.HandlerFunc {
-	trusted, err := normaliseOrigin(cfg.TrustedOrigin)
-	if err != nil {
-		// A bad TrustedOrigin is always a programming / configuration error —
-		// panic at startup so it is caught in CI rather than silently accepting
-		// all origins in production.
-		panic(fmt.Sprintf(
-			"middleware: CookieCSRF: invalid TrustedOrigin %q: %v",
-			cfg.TrustedOrigin, err,
-		))
+	if len(cfg.TrustedOrigins) == 0 {
+		panic("middleware: CookieCSRF: TrustedOrigins is empty — provide at least one trusted origin")
+	}
+
+	// Pre-normalise all trusted origins once at construction time so the hot
+	// path (every request) does no allocation or URL parsing.
+	trusted := make([]string, 0, len(cfg.TrustedOrigins))
+	for _, raw := range cfg.TrustedOrigins {
+		norm, err := normaliseOrigin(raw)
+		if err != nil {
+			panic(fmt.Sprintf(
+				"middleware: CookieCSRF: invalid TrustedOrigin %q: %v",
+				raw, err,
+			))
+		}
+		trusted = append(trusted, norm)
+	}
+
+	isTrusted := func(raw string) bool {
+		norm, err := normaliseOrigin(raw)
+		if err != nil {
+			return false
+		}
+		for _, t := range trusted {
+			if strings.EqualFold(norm, t) {
+				return true
+			}
+		}
+		return false
 	}
 
 	return func(c *gin.Context) {
@@ -91,8 +125,7 @@ func CookieCSRF(cfg CookieCSRFConfig) gin.HandlerFunc {
 
 		// ── 1. Origin header (primary signal) ─────────────────────────────────
 		if origin := c.GetHeader("Origin"); origin != "" {
-			norm, err := normaliseOrigin(origin)
-			if err != nil || !strings.EqualFold(norm, trusted) {
+			if !isTrusted(origin) {
 				denyCSRF(c)
 				return
 			}
@@ -104,8 +137,7 @@ func CookieCSRF(cfg CookieCSRFConfig) gin.HandlerFunc {
 		// Parsed as a full URL; only scheme+host is compared so that path
 		// differences (e.g. /login vs /dashboard) do not cause false negatives.
 		if referer := c.GetHeader("Referer"); referer != "" {
-			norm, err := normaliseOrigin(referer)
-			if err != nil || !strings.EqualFold(norm, trusted) {
+			if !isTrusted(referer) {
 				denyCSRF(c)
 				return
 			}
@@ -135,8 +167,8 @@ func normaliseOrigin(raw string) (string, error) {
 	if u.Scheme == "" || u.Host == "" {
 		return "", fmt.Errorf("missing scheme or host in %q", raw)
 	}
-	// Lower-case both components so the EqualFold in the middleware is
-	// redundant but kept for clarity; the real guard is here.
+	// Lower-case both components so EqualFold comparisons in the middleware
+	// are always matching against a consistent canonical form.
 	return strings.ToLower(u.Scheme + "://" + u.Host), nil
 }
 

@@ -51,6 +51,86 @@ func (q *Queries) ConsumeRefreshToken(ctx context.Context, id string) (sql.Resul
 	return q.exec(ctx, q.consumeRefreshTokenStmt, consumeRefreshToken, id)
 }
 
+const countRoleByName = `-- name: CountRoleByName :one
+SELECT COUNT(*) FROM roles WHERE name = ? LIMIT 1
+`
+
+// Used by the startup health-check in app.go to verify that required roles
+// have been seeded before the server begins accepting traffic.
+// Returns 0 when the role is absent, 1 when it exists.
+func (q *Queries) CountRoleByName(ctx context.Context, name string) (int64, error) {
+	row := q.queryRow(ctx, q.countRoleByNameStmt, countRoleByName, name)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const createOAuthUser = `-- name: CreateOAuthUser :exec
+INSERT INTO users (
+    id,
+    email,
+    password_hash,
+    name,
+    email_verified_at,
+    created_at,
+    updated_at
+) VALUES (?, ?, '', ?, NOW(), NOW(), NOW())
+`
+
+type CreateOAuthUserParams struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
+	Name  string `json:"name"`
+}
+
+// Creates a new OAuth-only user whose email address has been confirmed by the
+// provider (e.g. Google with email_verified=true). email_verified_at is
+// stamped NOW() so the Login gate allows this user without a verification step.
+// password_hash is empty because OAuth users never authenticate with a password.
+func (q *Queries) CreateOAuthUser(ctx context.Context, arg CreateOAuthUserParams) error {
+	_, err := q.exec(ctx, q.createOAuthUserStmt, createOAuthUser, arg.ID, arg.Email, arg.Name)
+	return err
+}
+
+const createOAuthUserUnverified = `-- name: CreateOAuthUserUnverified :exec
+INSERT INTO users (
+    id,
+    email,
+    password_hash,
+    name,
+    created_at,
+    updated_at
+) VALUES (?, ?, '', ?, NOW(), NOW())
+`
+
+type CreateOAuthUserUnverifiedParams struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
+	Name  string `json:"name"`
+}
+
+// Creates a new OAuth-only user for providers that do NOT guarantee email
+// ownership (e.g. Facebook public-app tier, where VerifiesEmail()=false).
+//
+// Security design:
+//   - email stores a UUID-based placeholder ("<userID>@oauth.invalid") rather
+//     than the provider's unverified address. The .invalid TLD is reserved by
+//     RFC 2606 and can never resolve or collide with a real address. This
+//     satisfies the NOT NULL + UNIQUE constraint on users.email without
+//     implying the address was confirmed.
+//   - email_verified_at is omitted (defaults to NULL) so the Login gate
+//     (service.Login checks user.EmailVerified) routes this user through the
+//     email-verification flow before granting a session. Without this, an
+//     attacker who creates a Facebook account with an email they do not own
+//     would receive a pre-verified local account.
+//   - The actual provider email, if any, is stored in
+//     user_oauth_accounts.provider_email for display purposes only. It must
+//     never be used for identity matching or treated as verified.
+func (q *Queries) CreateOAuthUserUnverified(ctx context.Context, arg CreateOAuthUserUnverifiedParams) error {
+	_, err := q.exec(ctx, q.createOAuthUserUnverifiedStmt, createOAuthUserUnverified, arg.ID, arg.Email, arg.Name)
+	return err
+}
+
 const createRefreshToken = `-- name: CreateRefreshToken :exec
 INSERT INTO
     refresh_tokens (
@@ -129,10 +209,6 @@ WHERE
 LIMIT 1
 `
 
-// BUG FIX: removed `AND revoked_at IS NULL` — the previous filter made the
-// token.RevokedAt.Valid checks in auth/service.go unreachable dead code.
-// The application layer now receives the full record and returns the correct
-// typed error (ErrTokenRevoked vs ErrTokenInvalid) for each case.
 func (q *Queries) GetRefreshTokenByHash(ctx context.Context, tokenHash string) (RefreshToken, error) {
 	row := q.queryRow(ctx, q.getRefreshTokenByHashStmt, getRefreshTokenByHash, tokenHash)
 	var i RefreshToken
@@ -149,8 +225,51 @@ func (q *Queries) GetRefreshTokenByHash(ctx context.Context, tokenHash string) (
 	return i, err
 }
 
+const getRefreshTokenByHashForUpdate = `-- name: GetRefreshTokenByHashForUpdate :one
+SELECT
+    id,
+    user_id,
+    token_hash,
+    token_family,
+    expires_at,
+    used_at,
+    revoked_at,
+    created_at
+FROM refresh_tokens
+WHERE
+    token_hash = ?
+LIMIT 1
+FOR UPDATE
+`
+
+// Retrieves the token row and acquires an InnoDB row-level write lock (FOR
+// UPDATE) for the duration of the calling transaction. The lock prevents any
+// concurrent transaction from modifying used_at or revoked_at between this
+// SELECT and the subsequent ConsumeRefreshToken UPDATE, closing the TOCTOU
+// window that existed when state checks happened on the pre-transaction
+// non-locking read.
+//
+// MUST be called inside an explicit transaction (i.e. on a *Queries value
+// returned by Queries.WithTx). Calling outside a transaction acquires a lock
+// that is released immediately, providing no serialisation guarantee.
+func (q *Queries) GetRefreshTokenByHashForUpdate(ctx context.Context, tokenHash string) (RefreshToken, error) {
+	row := q.queryRow(ctx, q.getRefreshTokenByHashForUpdateStmt, getRefreshTokenByHashForUpdate, tokenHash)
+	var i RefreshToken
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.TokenHash,
+		&i.TokenFamily,
+		&i.ExpiresAt,
+		&i.UsedAt,
+		&i.RevokedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, email, password_hash, name, email_verified_at, two_fa_enabled, created_at, updated_at FROM users WHERE email = ? LIMIT 1
+SELECT id, email, password_hash, name, email_verified_at, two_fa_enabled, mfa_method, totp_secret_encrypted, totp_enabled_at, created_at, updated_at FROM users WHERE email = ? LIMIT 1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -163,6 +282,9 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.Name,
 		&i.EmailVerifiedAt,
 		&i.TwoFaEnabled,
+		&i.MfaMethod,
+		&i.TotpSecretEncrypted,
+		&i.TotpEnabledAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -240,7 +362,7 @@ func (q *Queries) GetUserByEmailWithRoles(ctx context.Context, email string) ([]
 }
 
 const getUserByID = `-- name: GetUserByID :one
-SELECT id, email, password_hash, name, email_verified_at, two_fa_enabled, created_at, updated_at FROM users WHERE id = ? LIMIT 1
+SELECT id, email, password_hash, name, email_verified_at, two_fa_enabled, mfa_method, totp_secret_encrypted, totp_enabled_at, created_at, updated_at FROM users WHERE id = ? LIMIT 1
 `
 
 func (q *Queries) GetUserByID(ctx context.Context, id string) (User, error) {
@@ -253,6 +375,9 @@ func (q *Queries) GetUserByID(ctx context.Context, id string) (User, error) {
 		&i.Name,
 		&i.EmailVerifiedAt,
 		&i.TwoFaEnabled,
+		&i.MfaMethod,
+		&i.TotpSecretEncrypted,
+		&i.TotpEnabledAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -327,6 +452,36 @@ func (q *Queries) GetUserByIDWithRoles(ctx context.Context, id string) ([]GetUse
 		return nil, err
 	}
 	return items, nil
+}
+
+const getUserDisplayInfo = `-- name: GetUserDisplayInfo :one
+SELECT name, email FROM users WHERE id = ? LIMIT 1
+`
+
+type GetUserDisplayInfoRow struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+
+// Fetches the display name and email for a user by ID.
+// Used for audit logging during OAuth account linking.
+func (q *Queries) GetUserDisplayInfo(ctx context.Context, id string) (GetUserDisplayInfoRow, error) {
+	row := q.queryRow(ctx, q.getUserDisplayInfoStmt, getUserDisplayInfo, id)
+	var i GetUserDisplayInfoRow
+	err := row.Scan(&i.Name, &i.Email)
+	return i, err
+}
+
+const getUserIDByEmail = `-- name: GetUserIDByEmail :one
+SELECT id FROM users WHERE email = ? LIMIT 1
+`
+
+// Looks up a user ID by email address. Returns sql.ErrNoRows when not found.
+func (q *Queries) GetUserIDByEmail(ctx context.Context, email string) (string, error) {
+	row := q.queryRow(ctx, q.getUserIDByEmailStmt, getUserIDByEmail, email)
+	var id string
+	err := row.Scan(&id)
+	return id, err
 }
 
 const revokeRefreshToken = `-- name: RevokeRefreshToken :exec

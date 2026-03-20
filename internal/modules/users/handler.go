@@ -3,6 +3,7 @@ package users
 import (
 	"github.com/gin-gonic/gin"
 
+	apperrors "github.com/waqasmani/go-auth-boilerplate/internal/errors"
 	"github.com/waqasmani/go-auth-boilerplate/internal/middleware"
 	"github.com/waqasmani/go-auth-boilerplate/internal/response"
 )
@@ -25,7 +26,12 @@ func NewHandler(svc Service) *Handler {
 // @Success      200 {object} response.Response{data=UserResponse}
 // @Router       /users/me [get]
 func (h *Handler) Me(c *gin.Context) {
-	claims := middleware.MustGetClaims(c)
+	claims, ok := middleware.GetClaims(c)
+	if !ok {
+		response.Error(c, apperrors.ErrUnauthorized)
+		c.Abort()
+		return
+	}
 	userResp, err := h.svc.GetMe(c.Request.Context(), claims.UserID)
 	if err != nil {
 		response.Error(c, err)

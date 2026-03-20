@@ -1,158 +1,164 @@
-// Package app orchestrates application startup, dependency wiring, and lifecycle management.
+// Package app orchestrates application startup and lifecycle management.
+// Dependencies are wired via the container package.
 package app
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/waqasmani/go-auth-boilerplate/internal/config"
-	dbpkg "github.com/waqasmani/go-auth-boilerplate/internal/db"
+	"github.com/waqasmani/go-auth-boilerplate/internal/container"
+	"github.com/waqasmani/go-auth-boilerplate/internal/db"
 	authmodule "github.com/waqasmani/go-auth-boilerplate/internal/modules/auth"
 	emailmodule "github.com/waqasmani/go-auth-boilerplate/internal/modules/auth_email"
+	oauthmodule "github.com/waqasmani/go-auth-boilerplate/internal/modules/oauth"
 	usersmodule "github.com/waqasmani/go-auth-boilerplate/internal/modules/users"
-	platformauth "github.com/waqasmani/go-auth-boilerplate/internal/platform/auth"
-	"github.com/waqasmani/go-auth-boilerplate/internal/platform/database"
-	mailer "github.com/waqasmani/go-auth-boilerplate/internal/platform/email"
-	"github.com/waqasmani/go-auth-boilerplate/internal/platform/logger"
 	"github.com/waqasmani/go-auth-boilerplate/internal/router"
+)
+
+const (
+	tokenCleanupInterval  = 1 * time.Hour
+	serverShutdownTimeout = 15 * time.Second
+	mailerDrainTimeout    = 10 * time.Second
 )
 
 // App encapsulates the entire application.
 type App struct {
-	cfg     *config.Config
-	db      *sql.DB
-	queries *dbpkg.Queries
-	log     *zap.Logger
-	server  *http.Server
+	cfg        *config.Config
+	log        *zap.Logger
+	server     *http.Server
+	shutdownCh chan struct{}
+	container  *container.Container
 }
 
-// New builds and wires the application.
+// New builds and wires the application using the dependency container.
 func New(migrationsFS fs.FS) (*App, error) {
-	// ─── Config ────────────────────────────────────────────────────────────────
-	cfg, err := config.Load()
+	// ─── Initialize Container ──────────────────────────────────────────────────
+	cont, err := container.New(migrationsFS)
 	if err != nil {
-		return nil, fmt.Errorf("app: load config: %w", err)
+		return nil, fmt.Errorf("app: init container: %w", err)
 	}
 
-	// ─── Logger ────────────────────────────────────────────────────────────────
-	log, err := logger.New(cfg.AppEnv)
-	if err != nil {
-		return nil, fmt.Errorf("app: init logger: %w", err)
+	// ─── Health Check ──────────────────────────────────────────────────────────
+	checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer checkCancel()
+	if err = verifyRolesSeeded(checkCtx, cont.Queries); err != nil {
+		return nil, fmt.Errorf("app: startup health-check: %w", err)
 	}
 
-	// ─── Database ──────────────────────────────────────────────────────────────
-	dbCfg := database.DefaultConfig(cfg.DBDSN)
-	sqlDB, err := database.New(dbCfg)
-	if err != nil {
-		return nil, fmt.Errorf("app: connect database: %w", err)
-	}
-	log.Info("connected to database")
-
-	// ─── Migrations ────────────────────────────────────────────────────────────
-	if err = database.RunMigrations(sqlDB, migrationsFS, log); err != nil {
-		return nil, fmt.Errorf("app: run migrations: %w", err)
-	}
-
-	// ─── Prepared Statements ───────────────────────────────────────────────────
-	prepCtx, prepCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer prepCancel()
-
-	queries, err := dbpkg.Prepare(prepCtx, sqlDB)
-	if err != nil {
-		return nil, fmt.Errorf("app: prepare statements: %w", err)
-	}
-	log.Info("prepared statements ready")
-
-	// ─── JWT ───────────────────────────────────────────────────────────────────
-	// config.JWTKeyConfig and platformauth.JWTKey are structurally identical but
-	// live in separate packages to prevent an import cycle (platform/auth must
-	// not import config).  The conversion is a one-liner per key.
-	//
-	// NewJWT panics on an invalid key set (no active key, duplicate IDs, etc.).
-	// config.Load already validates the same invariants and returns a clean
-	// error, so a panic here means a programming error in Load, not an operator
-	// mistake.
-	jwtHelper := platformauth.NewJWT(platformauth.JWTConfig{
-		Keys:       jwtKeysFromConfig(cfg.JWTKeys),
-		Issuer:     cfg.JWTIssuer,
-		Audience:   cfg.JWTAudience,
-		AccessTTL:  cfg.AccessTTL,
-		RefreshTTL: cfg.RefreshTTL,
-	})
-
-	logJWTKeySet(log, cfg.JWTKeys)
-
-	m, _ := mailer.New(mailer.Config{
-		Host:     cfg.EmailSMTPHost, // empty string = no-op mailer
-		Port:     cfg.EmailSMTPPort,
-		Username: cfg.EmailSMTPUser,
-		Password: cfg.EmailSMTPPass,
-		UseTLS:   cfg.EmailSMTPUseTLS,
-		From:     cfg.EmailFrom,
-	})
-	if m.Enabled() {
-		log.Info("email mailer ready", zap.String("host", cfg.EmailSMTPHost))
-	}
 	// ─── Modules ───────────────────────────────────────────────────────────────
-	authMod := authmodule.NewModule(authmodule.ModuleConfig{
-		SqlDB:   sqlDB,
-		Queries: queries,
-		Jwt:     jwtHelper,
-		Log:     log,
-		Cfg:     cfg,
-	})
+	// Each NewModule now returns (*Module, error) so misconfiguration (bad key
+	// sets, missing Redis, empty StateSecret, unknown provider names) surfaces
+	// here as a structured fmt.Errorf chain rather than a raw panic stack trace.
 
-	emailAuthMod := emailmodule.NewModule(emailmodule.ModuleConfig{
-		Queries:        queries,
-		Mailer:         m,
-		Log:            log,
-		FrontEndDomain: cfg.FrontEndDomain,
-		// authMod.Service satisfies authemail.TokenIssuer structurally —
-		// Go's duck typing, no import of the auth package needed here.
-		TokenIssuer: authMod.Service,
-		Cfg:         cfg,
+	authMod, err := authmodule.NewModule(authmodule.ModuleConfig{
+		SqlDB:                   cont.DB,
+		Queries:                 cont.Queries,
+		Jwt:                     cont.JWT,
+		Log:                     cont.Logger,
+		AuditLog:                cont.AuditLog,
+		Cfg:                     cont.Config,
+		RDB:                     cont.RawRedis,
+		LoginEmailRateLimitRate: cont.Config.RateLimitLoginEmail,
 	})
-	// Complete the bidirectional wiring. emailAuthMod.Service satisfies
-	// auth.MFAChallenger (same InitiateChallenge signature). Must be called
-	// before the server starts accepting traffic.
+	if err != nil {
+		return nil, fmt.Errorf("app: init auth module: %w", err)
+	}
+
+	emailAuthMod, err := emailmodule.NewModule(emailmodule.ModuleConfig{
+		SqlDB:          cont.DB,
+		Queries:        cont.Queries,
+		Mailer:         cont.Mailer,
+		Log:            cont.Logger,
+		AuditLog:       cont.AuditLog,
+		FrontEndDomain: cont.Config.FrontEndDomain,
+		TokenIssuer:    authMod.Service,
+		Cfg:            cont.Config,
+		OTPSecret:      cont.Config.OTPSecret,
+		TOTPKeys:       cont.Config.TOTPKeys,
+		TOTPIssuer:     cont.Config.TOTPIssuer,
+		TOTPPeriod:     cont.Config.TOTPPeriod,
+		TOTPDigits:     cont.Config.TOTPDigits,
+		RDB:            cont.RawRedis,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("app: init email auth module: %w", err)
+	}
+
 	authMod.Service.SetMFAChallenger(emailAuthMod.Service)
-	usersMod := usersmodule.NewModule(queries, log)
+	authMod.Service.SetVerificationSender(emailAuthMod.Service)
+
+	usersMod := usersmodule.NewModule(cont.Queries, cont.Logger)
+
+	oauthMod, err := oauthmodule.NewModule(oauthmodule.ModuleConfig{
+		SqlDB:       cont.DB,
+		Queries:     cont.Queries,
+		Cfg:         cont.Config,
+		Log:         cont.Logger,
+		AuditLog:    cont.AuditLog,
+		TokenIssuer: authMod.Service,
+		TokenKeySet: cont.OAuthKeys,
+		StateSecret: cont.Config.OAuthStateSecret,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("app: init oauth module: %w", err)
+	}
 
 	// ─── Router ────────────────────────────────────────────────────────────────
 	routerOpts := router.Options{
 		RateLimit: router.RateLimitConfigFromValues(
-			cfg.RateLimitRate,
-			cfg.RateLimitBurst,
-			cfg.RateLimitTTL,
-			cfg.RateLimitMaxKeys,
+			cont.Config.RateLimitRate,
+			cont.Config.RateLimitBurst,
+			cont.Config.RateLimitTTL,
+			cont.Config.RateLimitMaxKeys,
 		),
+		RefreshRateLimit: router.RefreshRateLimitFromValues(cont.Config.RateLimitAuthRefresh),
+		EmailRateLimit: router.EmailRateLimitsFromValues(
+			cont.Config.RateLimitForgotPassword,
+			cont.Config.RateLimitResendVerify,
+			cont.Config.RateLimitResetPassword,
+			cont.Config.RateLimitVerifyEmail,
+			cont.Config.RateLimitOTPVerify,
+		),
+		OAuthRateLimits: oauthmodule.RateLimits{
+			Login:    cont.Config.RateLimitOAuthLogin,
+			Callback: cont.Config.RateLimitOAuthCallback,
+			Link:     cont.Config.RateLimitOAuthLink,
+			Exchange: cont.Config.RateLimitOAuthExchange,
+		},
 		CORS: router.CORSConfigFromValues(
-			cfg.CORSAllowedOrigins,
-			cfg.CORSAllowedHeaders,
-			cfg.CORSAllowCredentials,
-			cfg.CORSMaxAge,
+			cont.Config.CORSAllowedOrigins,
+			cont.Config.CORSAllowedHeaders,
+			cont.Config.CORSAllowCredentials,
+			cont.Config.CORSMaxAge,
 		),
 		SecureHeaders: router.SecureHeadersConfigFromValues(
-			cfg.SecHSTSEnabled,
-			cfg.SecHSTSMaxAge,
+			cont.Config.SecHSTSEnabled,
+			cont.Config.SecHSTSMaxAge,
 		),
-		TrustedProxyCIDRs: cfg.TrustedProxyCIDRs,
-		CookieCSRF:        router.CookieCSRFConfigFromValues(cfg.FrontEndDomain),
+		SqlDB:             cont.DB,
+		TrustedProxyCIDRs: cont.Config.TrustedProxyCIDRs,
+		CookieCSRF:        router.CookieCSRFConfigFromValues(cont.Config.CSRFTrustedOrigins),
+		ShutdownCh:        cont.ShutdownCh,
+		RedisClient:       cont.Redis,
+		RDB:               cont.RawRedis,
+		Log:               cont.Logger,
 	}
-	engine := router.New(cfg.AppEnv, log, jwtHelper, authMod, usersMod, routerOpts, emailAuthMod)
+
+	engine := router.New(cont.Config.AppEnv, cont.Logger, cont.JWT, authMod, usersMod, routerOpts, emailAuthMod, oauthMod)
 
 	server := &http.Server{
-		Addr:         ":" + cfg.AppPort,
+		Addr:         ":" + cont.Config.AppPort,
 		Handler:      engine,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
@@ -160,18 +166,18 @@ func New(migrationsFS fs.FS) (*App, error) {
 	}
 
 	return &App{
-		cfg:     cfg,
-		db:      sqlDB,
-		queries: queries,
-		log:     log,
-		server:  server,
+		cfg:        cont.Config,
+		log:        cont.Logger,
+		server:     server,
+		shutdownCh: cont.ShutdownCh,
+		container:  cont,
 	}, nil
 }
 
 // Run starts the HTTP server and blocks until a shutdown signal is received.
 func (a *App) Run() error {
-	shutdownCh := make(chan os.Signal, 1)
-	signal.Notify(shutdownCh, os.Interrupt, syscall.SIGTERM)
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -184,65 +190,80 @@ func (a *App) Run() error {
 	select {
 	case err := <-serverErr:
 		return fmt.Errorf("server error: %w", err)
-	case sig := <-shutdownCh:
+	case sig := <-sigCh:
 		a.log.Info("shutdown signal received", zap.String("signal", sig.String()))
 	}
 
+	close(a.shutdownCh)
 	return a.Shutdown()
 }
 
-// Shutdown gracefully stops the server, closes prepared statements, then
-// closes the connection pool.
+// Shutdown gracefully stops the server.
 func (a *App) Shutdown() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
 	var errs []error
-	if err := a.server.Shutdown(ctx); err != nil {
+
+	// Server drain — capped independently. Exhausting this budget must not
+	// steal time from the mailer drain: queued emails are real user-facing
+	// work that deserves its full window regardless of how long HTTP draining
+	// takes.
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
+	defer serverCancel()
+
+	if err := a.server.Shutdown(serverCtx); err != nil {
 		a.log.Error("server shutdown error", zap.Error(err))
 		errs = append(errs, err)
 	}
-	if err := a.queries.Close(); err != nil {
-		a.log.Error("prepared statements close error", zap.Error(err))
+
+	// Mailer drain — derived from context.Background(), not from serverCtx.
+	// This guarantees the full mailerDrainTimeout budget even when server
+	// drain consumes its entire 15 s window before returning.
+	if a.container.Mailer != nil {
+		mailerCtx, mailerCancel := context.WithTimeout(context.Background(), mailerDrainTimeout)
+		defer mailerCancel()
+		if err := a.container.Mailer.Shutdown(mailerCtx); err != nil {
+			a.log.Error("mailer shutdown error", zap.Error(err))
+			errs = append(errs, err)
+		}
+	}
+
+	if err := a.container.Close(); err != nil {
+		a.log.Error("container close error", zap.Error(err))
 		errs = append(errs, err)
 	}
-	if err := a.db.Close(); err != nil {
-		a.log.Error("database close error", zap.Error(err))
-		errs = append(errs, err)
-	}
+
 	a.log.Info("server stopped")
-	_ = a.log.Sync()
 	return errors.Join(errs...)
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-// jwtKeysFromConfig converts the config-package key slice to the platform/auth
-// key slice.  The two types are structurally identical; the conversion exists
-// only to break the config → platform/auth import that would create a cycle.
-func jwtKeysFromConfig(keys []config.JWTKeyConfig) []platformauth.JWTKey {
-	out := make([]platformauth.JWTKey, len(keys))
-	for i, k := range keys {
-		out[i] = platformauth.JWTKey{
-			ID:     k.ID,
-			Secret: k.Secret,
-			Active: k.Active,
+func verifyRolesSeeded(ctx context.Context, queries *db.Queries) error {
+	requiredRoles := []string{"user", "admin"}
+	var missing []string
+	for _, role := range requiredRoles {
+		count, err := queries.CountRoleByName(ctx, role)
+		if err != nil {
+			return fmt.Errorf("roles health-check failed for role %q: %w", role, err)
+		}
+		if count == 0 {
+			missing = append(missing, role)
 		}
 	}
-	return out
+	if len(missing) > 0 {
+		return fmt.Errorf("required role(s) [%s] not found in roles table", joinStrings(missing))
+	}
+	return nil
 }
 
-// logJWTKeySet logs the key IDs and their active/inactive status at startup
-// without ever logging secrets.  Useful for confirming which keys are loaded
-// after a rotation.
-func logJWTKeySet(log *zap.Logger, keys []config.JWTKeyConfig) {
-	ids := make([]string, len(keys))
-	for i, k := range keys {
-		status := "inactive"
-		if k.Active {
-			status = "active"
-		}
-		ids[i] = k.ID + "(" + status + ")"
+func joinStrings(s []string) string {
+	if len(s) == 0 {
+		return ""
 	}
-	log.Info("JWT key set loaded", zap.Strings("keys", ids))
+	if len(s) == 1 {
+		return s[0]
+	}
+	var result strings.Builder
+	result.WriteString(s[0])
+	for _, v := range s[1:] {
+		result.WriteString(", " + v)
+	}
+	return result.String()
 }

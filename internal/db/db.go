@@ -27,14 +27,32 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.assignUserRoleByNameStmt, err = db.PrepareContext(ctx, assignUserRoleByName); err != nil {
 		return nil, fmt.Errorf("error preparing query AssignUserRoleByName: %w", err)
 	}
+	if q.clearEmailVerifiedStmt, err = db.PrepareContext(ctx, clearEmailVerified); err != nil {
+		return nil, fmt.Errorf("error preparing query ClearEmailVerified: %w", err)
+	}
 	if q.consumeEmailTokenStmt, err = db.PrepareContext(ctx, consumeEmailToken); err != nil {
 		return nil, fmt.Errorf("error preparing query ConsumeEmailToken: %w", err)
+	}
+	if q.consumeLinkingStateStmt, err = db.PrepareContext(ctx, consumeLinkingState); err != nil {
+		return nil, fmt.Errorf("error preparing query ConsumeLinkingState: %w", err)
 	}
 	if q.consumeRefreshTokenStmt, err = db.PrepareContext(ctx, consumeRefreshToken); err != nil {
 		return nil, fmt.Errorf("error preparing query ConsumeRefreshToken: %w", err)
 	}
+	if q.countRoleByNameStmt, err = db.PrepareContext(ctx, countRoleByName); err != nil {
+		return nil, fmt.Errorf("error preparing query CountRoleByName: %w", err)
+	}
 	if q.createEmailTokenStmt, err = db.PrepareContext(ctx, createEmailToken); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateEmailToken: %w", err)
+	}
+	if q.createOAuthAccountStmt, err = db.PrepareContext(ctx, createOAuthAccount); err != nil {
+		return nil, fmt.Errorf("error preparing query CreateOAuthAccount: %w", err)
+	}
+	if q.createOAuthUserStmt, err = db.PrepareContext(ctx, createOAuthUser); err != nil {
+		return nil, fmt.Errorf("error preparing query CreateOAuthUser: %w", err)
+	}
+	if q.createOAuthUserUnverifiedStmt, err = db.PrepareContext(ctx, createOAuthUserUnverified); err != nil {
+		return nil, fmt.Errorf("error preparing query CreateOAuthUserUnverified: %w", err)
 	}
 	if q.createRefreshTokenStmt, err = db.PrepareContext(ctx, createRefreshToken); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateRefreshToken: %w", err)
@@ -42,11 +60,32 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.createUserStmt, err = db.PrepareContext(ctx, createUser); err != nil {
 		return nil, fmt.Errorf("error preparing query CreateUser: %w", err)
 	}
+	if q.deleteLinkingStateStmt, err = db.PrepareContext(ctx, deleteLinkingState); err != nil {
+		return nil, fmt.Errorf("error preparing query DeleteLinkingState: %w", err)
+	}
+	if q.disableUserTOTPStmt, err = db.PrepareContext(ctx, disableUserTOTP); err != nil {
+		return nil, fmt.Errorf("error preparing query DisableUserTOTP: %w", err)
+	}
+	if q.enableUserTOTPStmt, err = db.PrepareContext(ctx, enableUserTOTP); err != nil {
+		return nil, fmt.Errorf("error preparing query EnableUserTOTP: %w", err)
+	}
 	if q.getEmailTokenByHashStmt, err = db.PrepareContext(ctx, getEmailTokenByHash); err != nil {
 		return nil, fmt.Errorf("error preparing query GetEmailTokenByHash: %w", err)
 	}
+	if q.getOAuthAccountByProviderIDStmt, err = db.PrepareContext(ctx, getOAuthAccountByProviderID); err != nil {
+		return nil, fmt.Errorf("error preparing query GetOAuthAccountByProviderID: %w", err)
+	}
+	if q.getOAuthAccountByUserIDAndProviderStmt, err = db.PrepareContext(ctx, getOAuthAccountByUserIDAndProvider); err != nil {
+		return nil, fmt.Errorf("error preparing query GetOAuthAccountByUserIDAndProvider: %w", err)
+	}
+	if q.getOneTimeCodeForUpdateStmt, err = db.PrepareContext(ctx, getOneTimeCodeForUpdate); err != nil {
+		return nil, fmt.Errorf("error preparing query GetOneTimeCodeForUpdate: %w", err)
+	}
 	if q.getRefreshTokenByHashStmt, err = db.PrepareContext(ctx, getRefreshTokenByHash); err != nil {
 		return nil, fmt.Errorf("error preparing query GetRefreshTokenByHash: %w", err)
+	}
+	if q.getRefreshTokenByHashForUpdateStmt, err = db.PrepareContext(ctx, getRefreshTokenByHashForUpdate); err != nil {
+		return nil, fmt.Errorf("error preparing query GetRefreshTokenByHashForUpdate: %w", err)
 	}
 	if q.getUserByEmailStmt, err = db.PrepareContext(ctx, getUserByEmail); err != nil {
 		return nil, fmt.Errorf("error preparing query GetUserByEmail: %w", err)
@@ -60,11 +99,38 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.getUserByIDWithRolesStmt, err = db.PrepareContext(ctx, getUserByIDWithRoles); err != nil {
 		return nil, fmt.Errorf("error preparing query GetUserByIDWithRoles: %w", err)
 	}
+	if q.getUserDisplayInfoStmt, err = db.PrepareContext(ctx, getUserDisplayInfo); err != nil {
+		return nil, fmt.Errorf("error preparing query GetUserDisplayInfo: %w", err)
+	}
+	if q.getUserIDByEmailStmt, err = db.PrepareContext(ctx, getUserIDByEmail); err != nil {
+		return nil, fmt.Errorf("error preparing query GetUserIDByEmail: %w", err)
+	}
+	if q.getUserMFAMethodStmt, err = db.PrepareContext(ctx, getUserMFAMethod); err != nil {
+		return nil, fmt.Errorf("error preparing query GetUserMFAMethod: %w", err)
+	}
+	if q.getUserTOTPSecretEncryptedStmt, err = db.PrepareContext(ctx, getUserTOTPSecretEncrypted); err != nil {
+		return nil, fmt.Errorf("error preparing query GetUserTOTPSecretEncrypted: %w", err)
+	}
 	if q.invalidateUserTokensByTypeStmt, err = db.PrepareContext(ctx, invalidateUserTokensByType); err != nil {
 		return nil, fmt.Errorf("error preparing query InvalidateUserTokensByType: %w", err)
 	}
+	if q.linkOAuthAccountToUserStmt, err = db.PrepareContext(ctx, linkOAuthAccountToUser); err != nil {
+		return nil, fmt.Errorf("error preparing query LinkOAuthAccountToUser: %w", err)
+	}
+	if q.listOAuthAccountsByUserIDStmt, err = db.PrepareContext(ctx, listOAuthAccountsByUserID); err != nil {
+		return nil, fmt.Errorf("error preparing query ListOAuthAccountsByUserID: %w", err)
+	}
 	if q.markEmailVerifiedStmt, err = db.PrepareContext(ctx, markEmailVerified); err != nil {
 		return nil, fmt.Errorf("error preparing query MarkEmailVerified: %w", err)
+	}
+	if q.markOneTimeCodeUsedStmt, err = db.PrepareContext(ctx, markOneTimeCodeUsed); err != nil {
+		return nil, fmt.Errorf("error preparing query MarkOneTimeCodeUsed: %w", err)
+	}
+	if q.purgeExpiredLinkingStatesStmt, err = db.PrepareContext(ctx, purgeExpiredLinkingStates); err != nil {
+		return nil, fmt.Errorf("error preparing query PurgeExpiredLinkingStates: %w", err)
+	}
+	if q.purgeExpiredOneTimeCodesStmt, err = db.PrepareContext(ctx, purgeExpiredOneTimeCodes); err != nil {
+		return nil, fmt.Errorf("error preparing query PurgeExpiredOneTimeCodes: %w", err)
 	}
 	if q.revokeRefreshTokenStmt, err = db.PrepareContext(ctx, revokeRefreshToken); err != nil {
 		return nil, fmt.Errorf("error preparing query RevokeRefreshToken: %w", err)
@@ -74,6 +140,21 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.revokeUserRefreshTokensStmt, err = db.PrepareContext(ctx, revokeUserRefreshTokens); err != nil {
 		return nil, fmt.Errorf("error preparing query RevokeUserRefreshTokens: %w", err)
+	}
+	if q.setUserTOTPSecretStmt, err = db.PrepareContext(ctx, setUserTOTPSecret); err != nil {
+		return nil, fmt.Errorf("error preparing query SetUserTOTPSecret: %w", err)
+	}
+	if q.storeLinkingStateStmt, err = db.PrepareContext(ctx, storeLinkingState); err != nil {
+		return nil, fmt.Errorf("error preparing query StoreLinkingState: %w", err)
+	}
+	if q.storeOneTimeCodeStmt, err = db.PrepareContext(ctx, storeOneTimeCode); err != nil {
+		return nil, fmt.Errorf("error preparing query StoreOneTimeCode: %w", err)
+	}
+	if q.unlinkOAuthAccountStmt, err = db.PrepareContext(ctx, unlinkOAuthAccount); err != nil {
+		return nil, fmt.Errorf("error preparing query UnlinkOAuthAccount: %w", err)
+	}
+	if q.updateOAuthTokensStmt, err = db.PrepareContext(ctx, updateOAuthTokens); err != nil {
+		return nil, fmt.Errorf("error preparing query UpdateOAuthTokens: %w", err)
 	}
 	if q.updateUserPasswordHashStmt, err = db.PrepareContext(ctx, updateUserPasswordHash); err != nil {
 		return nil, fmt.Errorf("error preparing query UpdateUserPasswordHash: %w", err)
@@ -88,9 +169,19 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing assignUserRoleByNameStmt: %w", cerr)
 		}
 	}
+	if q.clearEmailVerifiedStmt != nil {
+		if cerr := q.clearEmailVerifiedStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing clearEmailVerifiedStmt: %w", cerr)
+		}
+	}
 	if q.consumeEmailTokenStmt != nil {
 		if cerr := q.consumeEmailTokenStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing consumeEmailTokenStmt: %w", cerr)
+		}
+	}
+	if q.consumeLinkingStateStmt != nil {
+		if cerr := q.consumeLinkingStateStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing consumeLinkingStateStmt: %w", cerr)
 		}
 	}
 	if q.consumeRefreshTokenStmt != nil {
@@ -98,9 +189,29 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing consumeRefreshTokenStmt: %w", cerr)
 		}
 	}
+	if q.countRoleByNameStmt != nil {
+		if cerr := q.countRoleByNameStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing countRoleByNameStmt: %w", cerr)
+		}
+	}
 	if q.createEmailTokenStmt != nil {
 		if cerr := q.createEmailTokenStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing createEmailTokenStmt: %w", cerr)
+		}
+	}
+	if q.createOAuthAccountStmt != nil {
+		if cerr := q.createOAuthAccountStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing createOAuthAccountStmt: %w", cerr)
+		}
+	}
+	if q.createOAuthUserStmt != nil {
+		if cerr := q.createOAuthUserStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing createOAuthUserStmt: %w", cerr)
+		}
+	}
+	if q.createOAuthUserUnverifiedStmt != nil {
+		if cerr := q.createOAuthUserUnverifiedStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing createOAuthUserUnverifiedStmt: %w", cerr)
 		}
 	}
 	if q.createRefreshTokenStmt != nil {
@@ -113,14 +224,49 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing createUserStmt: %w", cerr)
 		}
 	}
+	if q.deleteLinkingStateStmt != nil {
+		if cerr := q.deleteLinkingStateStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing deleteLinkingStateStmt: %w", cerr)
+		}
+	}
+	if q.disableUserTOTPStmt != nil {
+		if cerr := q.disableUserTOTPStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing disableUserTOTPStmt: %w", cerr)
+		}
+	}
+	if q.enableUserTOTPStmt != nil {
+		if cerr := q.enableUserTOTPStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing enableUserTOTPStmt: %w", cerr)
+		}
+	}
 	if q.getEmailTokenByHashStmt != nil {
 		if cerr := q.getEmailTokenByHashStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getEmailTokenByHashStmt: %w", cerr)
 		}
 	}
+	if q.getOAuthAccountByProviderIDStmt != nil {
+		if cerr := q.getOAuthAccountByProviderIDStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getOAuthAccountByProviderIDStmt: %w", cerr)
+		}
+	}
+	if q.getOAuthAccountByUserIDAndProviderStmt != nil {
+		if cerr := q.getOAuthAccountByUserIDAndProviderStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getOAuthAccountByUserIDAndProviderStmt: %w", cerr)
+		}
+	}
+	if q.getOneTimeCodeForUpdateStmt != nil {
+		if cerr := q.getOneTimeCodeForUpdateStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getOneTimeCodeForUpdateStmt: %w", cerr)
+		}
+	}
 	if q.getRefreshTokenByHashStmt != nil {
 		if cerr := q.getRefreshTokenByHashStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing getRefreshTokenByHashStmt: %w", cerr)
+		}
+	}
+	if q.getRefreshTokenByHashForUpdateStmt != nil {
+		if cerr := q.getRefreshTokenByHashForUpdateStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getRefreshTokenByHashForUpdateStmt: %w", cerr)
 		}
 	}
 	if q.getUserByEmailStmt != nil {
@@ -143,14 +289,59 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing getUserByIDWithRolesStmt: %w", cerr)
 		}
 	}
+	if q.getUserDisplayInfoStmt != nil {
+		if cerr := q.getUserDisplayInfoStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getUserDisplayInfoStmt: %w", cerr)
+		}
+	}
+	if q.getUserIDByEmailStmt != nil {
+		if cerr := q.getUserIDByEmailStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getUserIDByEmailStmt: %w", cerr)
+		}
+	}
+	if q.getUserMFAMethodStmt != nil {
+		if cerr := q.getUserMFAMethodStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getUserMFAMethodStmt: %w", cerr)
+		}
+	}
+	if q.getUserTOTPSecretEncryptedStmt != nil {
+		if cerr := q.getUserTOTPSecretEncryptedStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getUserTOTPSecretEncryptedStmt: %w", cerr)
+		}
+	}
 	if q.invalidateUserTokensByTypeStmt != nil {
 		if cerr := q.invalidateUserTokensByTypeStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing invalidateUserTokensByTypeStmt: %w", cerr)
 		}
 	}
+	if q.linkOAuthAccountToUserStmt != nil {
+		if cerr := q.linkOAuthAccountToUserStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing linkOAuthAccountToUserStmt: %w", cerr)
+		}
+	}
+	if q.listOAuthAccountsByUserIDStmt != nil {
+		if cerr := q.listOAuthAccountsByUserIDStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing listOAuthAccountsByUserIDStmt: %w", cerr)
+		}
+	}
 	if q.markEmailVerifiedStmt != nil {
 		if cerr := q.markEmailVerifiedStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing markEmailVerifiedStmt: %w", cerr)
+		}
+	}
+	if q.markOneTimeCodeUsedStmt != nil {
+		if cerr := q.markOneTimeCodeUsedStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing markOneTimeCodeUsedStmt: %w", cerr)
+		}
+	}
+	if q.purgeExpiredLinkingStatesStmt != nil {
+		if cerr := q.purgeExpiredLinkingStatesStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing purgeExpiredLinkingStatesStmt: %w", cerr)
+		}
+	}
+	if q.purgeExpiredOneTimeCodesStmt != nil {
+		if cerr := q.purgeExpiredOneTimeCodesStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing purgeExpiredOneTimeCodesStmt: %w", cerr)
 		}
 	}
 	if q.revokeRefreshTokenStmt != nil {
@@ -166,6 +357,31 @@ func (q *Queries) Close() error {
 	if q.revokeUserRefreshTokensStmt != nil {
 		if cerr := q.revokeUserRefreshTokensStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing revokeUserRefreshTokensStmt: %w", cerr)
+		}
+	}
+	if q.setUserTOTPSecretStmt != nil {
+		if cerr := q.setUserTOTPSecretStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing setUserTOTPSecretStmt: %w", cerr)
+		}
+	}
+	if q.storeLinkingStateStmt != nil {
+		if cerr := q.storeLinkingStateStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing storeLinkingStateStmt: %w", cerr)
+		}
+	}
+	if q.storeOneTimeCodeStmt != nil {
+		if cerr := q.storeOneTimeCodeStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing storeOneTimeCodeStmt: %w", cerr)
+		}
+	}
+	if q.unlinkOAuthAccountStmt != nil {
+		if cerr := q.unlinkOAuthAccountStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing unlinkOAuthAccountStmt: %w", cerr)
+		}
+	}
+	if q.updateOAuthTokensStmt != nil {
+		if cerr := q.updateOAuthTokensStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing updateOAuthTokensStmt: %w", cerr)
 		}
 	}
 	if q.updateUserPasswordHashStmt != nil {
@@ -210,49 +426,103 @@ func (q *Queries) queryRow(ctx context.Context, stmt *sql.Stmt, query string, ar
 }
 
 type Queries struct {
-	db                             DBTX
-	tx                             *sql.Tx
-	assignUserRoleByNameStmt       *sql.Stmt
-	consumeEmailTokenStmt          *sql.Stmt
-	consumeRefreshTokenStmt        *sql.Stmt
-	createEmailTokenStmt           *sql.Stmt
-	createRefreshTokenStmt         *sql.Stmt
-	createUserStmt                 *sql.Stmt
-	getEmailTokenByHashStmt        *sql.Stmt
-	getRefreshTokenByHashStmt      *sql.Stmt
-	getUserByEmailStmt             *sql.Stmt
-	getUserByEmailWithRolesStmt    *sql.Stmt
-	getUserByIDStmt                *sql.Stmt
-	getUserByIDWithRolesStmt       *sql.Stmt
-	invalidateUserTokensByTypeStmt *sql.Stmt
-	markEmailVerifiedStmt          *sql.Stmt
-	revokeRefreshTokenStmt         *sql.Stmt
-	revokeRefreshTokenFamilyStmt   *sql.Stmt
-	revokeUserRefreshTokensStmt    *sql.Stmt
-	updateUserPasswordHashStmt     *sql.Stmt
+	db                                     DBTX
+	tx                                     *sql.Tx
+	assignUserRoleByNameStmt               *sql.Stmt
+	clearEmailVerifiedStmt                 *sql.Stmt
+	consumeEmailTokenStmt                  *sql.Stmt
+	consumeLinkingStateStmt                *sql.Stmt
+	consumeRefreshTokenStmt                *sql.Stmt
+	countRoleByNameStmt                    *sql.Stmt
+	createEmailTokenStmt                   *sql.Stmt
+	createOAuthAccountStmt                 *sql.Stmt
+	createOAuthUserStmt                    *sql.Stmt
+	createOAuthUserUnverifiedStmt          *sql.Stmt
+	createRefreshTokenStmt                 *sql.Stmt
+	createUserStmt                         *sql.Stmt
+	deleteLinkingStateStmt                 *sql.Stmt
+	disableUserTOTPStmt                    *sql.Stmt
+	enableUserTOTPStmt                     *sql.Stmt
+	getEmailTokenByHashStmt                *sql.Stmt
+	getOAuthAccountByProviderIDStmt        *sql.Stmt
+	getOAuthAccountByUserIDAndProviderStmt *sql.Stmt
+	getOneTimeCodeForUpdateStmt            *sql.Stmt
+	getRefreshTokenByHashStmt              *sql.Stmt
+	getRefreshTokenByHashForUpdateStmt     *sql.Stmt
+	getUserByEmailStmt                     *sql.Stmt
+	getUserByEmailWithRolesStmt            *sql.Stmt
+	getUserByIDStmt                        *sql.Stmt
+	getUserByIDWithRolesStmt               *sql.Stmt
+	getUserDisplayInfoStmt                 *sql.Stmt
+	getUserIDByEmailStmt                   *sql.Stmt
+	getUserMFAMethodStmt                   *sql.Stmt
+	getUserTOTPSecretEncryptedStmt         *sql.Stmt
+	invalidateUserTokensByTypeStmt         *sql.Stmt
+	linkOAuthAccountToUserStmt             *sql.Stmt
+	listOAuthAccountsByUserIDStmt          *sql.Stmt
+	markEmailVerifiedStmt                  *sql.Stmt
+	markOneTimeCodeUsedStmt                *sql.Stmt
+	purgeExpiredLinkingStatesStmt          *sql.Stmt
+	purgeExpiredOneTimeCodesStmt           *sql.Stmt
+	revokeRefreshTokenStmt                 *sql.Stmt
+	revokeRefreshTokenFamilyStmt           *sql.Stmt
+	revokeUserRefreshTokensStmt            *sql.Stmt
+	setUserTOTPSecretStmt                  *sql.Stmt
+	storeLinkingStateStmt                  *sql.Stmt
+	storeOneTimeCodeStmt                   *sql.Stmt
+	unlinkOAuthAccountStmt                 *sql.Stmt
+	updateOAuthTokensStmt                  *sql.Stmt
+	updateUserPasswordHashStmt             *sql.Stmt
 }
 
 func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 	return &Queries{
-		db:                             tx,
-		tx:                             tx,
-		assignUserRoleByNameStmt:       q.assignUserRoleByNameStmt,
-		consumeEmailTokenStmt:          q.consumeEmailTokenStmt,
-		consumeRefreshTokenStmt:        q.consumeRefreshTokenStmt,
-		createEmailTokenStmt:           q.createEmailTokenStmt,
-		createRefreshTokenStmt:         q.createRefreshTokenStmt,
-		createUserStmt:                 q.createUserStmt,
-		getEmailTokenByHashStmt:        q.getEmailTokenByHashStmt,
-		getRefreshTokenByHashStmt:      q.getRefreshTokenByHashStmt,
-		getUserByEmailStmt:             q.getUserByEmailStmt,
-		getUserByEmailWithRolesStmt:    q.getUserByEmailWithRolesStmt,
-		getUserByIDStmt:                q.getUserByIDStmt,
-		getUserByIDWithRolesStmt:       q.getUserByIDWithRolesStmt,
-		invalidateUserTokensByTypeStmt: q.invalidateUserTokensByTypeStmt,
-		markEmailVerifiedStmt:          q.markEmailVerifiedStmt,
-		revokeRefreshTokenStmt:         q.revokeRefreshTokenStmt,
-		revokeRefreshTokenFamilyStmt:   q.revokeRefreshTokenFamilyStmt,
-		revokeUserRefreshTokensStmt:    q.revokeUserRefreshTokensStmt,
-		updateUserPasswordHashStmt:     q.updateUserPasswordHashStmt,
+		db:                                     tx,
+		tx:                                     tx,
+		assignUserRoleByNameStmt:               q.assignUserRoleByNameStmt,
+		clearEmailVerifiedStmt:                 q.clearEmailVerifiedStmt,
+		consumeEmailTokenStmt:                  q.consumeEmailTokenStmt,
+		consumeLinkingStateStmt:                q.consumeLinkingStateStmt,
+		consumeRefreshTokenStmt:                q.consumeRefreshTokenStmt,
+		countRoleByNameStmt:                    q.countRoleByNameStmt,
+		createEmailTokenStmt:                   q.createEmailTokenStmt,
+		createOAuthAccountStmt:                 q.createOAuthAccountStmt,
+		createOAuthUserStmt:                    q.createOAuthUserStmt,
+		createOAuthUserUnverifiedStmt:          q.createOAuthUserUnverifiedStmt,
+		createRefreshTokenStmt:                 q.createRefreshTokenStmt,
+		createUserStmt:                         q.createUserStmt,
+		deleteLinkingStateStmt:                 q.deleteLinkingStateStmt,
+		disableUserTOTPStmt:                    q.disableUserTOTPStmt,
+		enableUserTOTPStmt:                     q.enableUserTOTPStmt,
+		getEmailTokenByHashStmt:                q.getEmailTokenByHashStmt,
+		getOAuthAccountByProviderIDStmt:        q.getOAuthAccountByProviderIDStmt,
+		getOAuthAccountByUserIDAndProviderStmt: q.getOAuthAccountByUserIDAndProviderStmt,
+		getOneTimeCodeForUpdateStmt:            q.getOneTimeCodeForUpdateStmt,
+		getRefreshTokenByHashStmt:              q.getRefreshTokenByHashStmt,
+		getRefreshTokenByHashForUpdateStmt:     q.getRefreshTokenByHashForUpdateStmt,
+		getUserByEmailStmt:                     q.getUserByEmailStmt,
+		getUserByEmailWithRolesStmt:            q.getUserByEmailWithRolesStmt,
+		getUserByIDStmt:                        q.getUserByIDStmt,
+		getUserByIDWithRolesStmt:               q.getUserByIDWithRolesStmt,
+		getUserDisplayInfoStmt:                 q.getUserDisplayInfoStmt,
+		getUserIDByEmailStmt:                   q.getUserIDByEmailStmt,
+		getUserMFAMethodStmt:                   q.getUserMFAMethodStmt,
+		getUserTOTPSecretEncryptedStmt:         q.getUserTOTPSecretEncryptedStmt,
+		invalidateUserTokensByTypeStmt:         q.invalidateUserTokensByTypeStmt,
+		linkOAuthAccountToUserStmt:             q.linkOAuthAccountToUserStmt,
+		listOAuthAccountsByUserIDStmt:          q.listOAuthAccountsByUserIDStmt,
+		markEmailVerifiedStmt:                  q.markEmailVerifiedStmt,
+		markOneTimeCodeUsedStmt:                q.markOneTimeCodeUsedStmt,
+		purgeExpiredLinkingStatesStmt:          q.purgeExpiredLinkingStatesStmt,
+		purgeExpiredOneTimeCodesStmt:           q.purgeExpiredOneTimeCodesStmt,
+		revokeRefreshTokenStmt:                 q.revokeRefreshTokenStmt,
+		revokeRefreshTokenFamilyStmt:           q.revokeRefreshTokenFamilyStmt,
+		revokeUserRefreshTokensStmt:            q.revokeUserRefreshTokensStmt,
+		setUserTOTPSecretStmt:                  q.setUserTOTPSecretStmt,
+		storeLinkingStateStmt:                  q.storeLinkingStateStmt,
+		storeOneTimeCodeStmt:                   q.storeOneTimeCodeStmt,
+		unlinkOAuthAccountStmt:                 q.unlinkOAuthAccountStmt,
+		updateOAuthTokensStmt:                  q.updateOAuthTokensStmt,
+		updateUserPasswordHashStmt:             q.updateUserPasswordHashStmt,
 	}
 }

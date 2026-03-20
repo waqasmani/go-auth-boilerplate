@@ -21,8 +21,42 @@ const docTemplate = `{
     "host": "{{.Host}}",
     "basePath": "{{.BasePath}}",
     "paths": {
+        "/auth/forgot-password": {
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth-email"
+                ],
+                "summary": "Request a password-reset email",
+                "parameters": [
+                    {
+                        "description": "Email address",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/internal_modules_auth_email.ForgotPasswordRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    }
+                }
+            }
+        },
         "/auth/login": {
             "post": {
+                "description": "Returns TokenResponse for normal accounts. Returns MFAChallengeResponse\n(requires_mfa: true) when the account has 2FA enabled — the client must\nthen POST { code, mfa_token } to /auth/otp/verify to receive tokens.",
                 "consumes": [
                     "application/json"
                 ],
@@ -56,11 +90,23 @@ const docTemplate = `{
                                     "type": "object",
                                     "properties": {
                                         "data": {
-                                            "$ref": "#/definitions/internal_modules_auth.TokenResponse"
+                                            "$ref": "#/definitions/internal_modules_auth.MFAChallengeResponse"
                                         }
                                     }
                                 }
                             ]
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    },
+                    "403": {
+                        "description": "Email not verified or 2FA required",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
                         }
                     }
                 }
@@ -92,6 +138,201 @@ const docTemplate = `{
                 "responses": {
                     "204": {
                         "description": "No Content"
+                    }
+                }
+            }
+        },
+        "/auth/mfa/totp/disable": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Clears the stored TOTP secret and sets mfa_method='email'.\ntwo_fa_enabled is preserved; the account continues to use email OTP.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth-mfa"
+                ],
+                "summary": "Disable TOTP and revert to email OTP (authenticated)",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/mfa/totp/enable": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Verifies that the user possesses the secret from SetupTOTP,\nthen sets mfa_method='totp' and two_fa_enabled=true.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth-mfa"
+                ],
+                "summary": "Activate TOTP with a confirmation code (authenticated)",
+                "parameters": [
+                    {
+                        "description": "Confirmation code from authenticator app",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/internal_modules_auth_email.EnableTOTPRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    },
+                    "422": {
+                        "description": "Code incorrect or TOTP not set up",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/mfa/totp/setup": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "description": "Stores an encrypted pending TOTP secret for the account.\nThe secret is NOT activated until POST /auth/mfa/totp/enable confirms it.\nThe qr_base64 field is a PNG encoded as base64 — render it as:\n\u003cimg src=\"data:image/png;base64,{qr_base64}\"\u003e",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth-mfa"
+                ],
+                "summary": "Generate a TOTP secret and QR code (authenticated)",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "allOf": [
+                                {
+                                    "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                                },
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "data": {
+                                            "$ref": "#/definitions/internal_modules_auth_email.TOTPSetupResponse"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/otp/send": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth-email"
+                ],
+                "summary": "Send a 2FA one-time passcode (authenticated)",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/otp/verify": {
+            "post": {
+                "description": "When mfa_token is present: the server checks the user's mfa_method\nautomatically. For email-OTP users, validates the emailed code. For\nTOTP users, validates the time-based code from their authenticator app.\nOn success, returns a full token pair and sets the refresh-token cookie.\nWhen mfa_token is absent: validates and consumes an email OTP only.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth-email"
+                ],
+                "summary": "Verify OTP — standalone check or MFA login completion",
+                "parameters": [
+                    {
+                        "description": "OTP code and optional MFA challenge token",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/internal_modules_auth_email.VerifyOTPRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Standalone OTP verified",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
                     }
                 }
             }
@@ -143,6 +384,7 @@ const docTemplate = `{
         },
         "/auth/register": {
             "post": {
+                "description": "Creates the account and sends a verification email.\nNo session tokens are issued — the user must verify their inbox\nand then log in via POST /auth/login.",
                 "consumes": [
                     "application/json"
                 ],
@@ -165,22 +407,163 @@ const docTemplate = `{
                     }
                 ],
                 "responses": {
-                    "201": {
-                        "description": "Created",
+                    "202": {
+                        "description": "Accepted",
                         "schema": {
-                            "allOf": [
-                                {
-                                    "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
-                                },
-                                {
-                                    "type": "object",
-                                    "properties": {
-                                        "data": {
-                                            "$ref": "#/definitions/internal_modules_auth.TokenResponse"
-                                        }
-                                    }
-                                }
-                            ]
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    },
+                    "409": {
+                        "description": "Email already registered",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    },
+                    "422": {
+                        "description": "Validation error",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/resend-verification": {
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth-email"
+                ],
+                "summary": "Resend email-verification link (unauthenticated)",
+                "parameters": [
+                    {
+                        "description": "Email address",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/internal_modules_auth_email.ResendVerificationRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/reset-password": {
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth-email"
+                ],
+                "summary": "Reset password using a one-time token",
+                "parameters": [
+                    {
+                        "description": "Reset token and new password",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/internal_modules_auth_email.ResetPasswordRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/send-verification": {
+            "post": {
+                "security": [
+                    {
+                        "BearerAuth": []
+                    }
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth-email"
+                ],
+                "summary": "Send or resend the email-verification link (authenticated)",
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/verify-email": {
+            "post": {
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "auth-email"
+                ],
+                "summary": "Verify email address using a one-time token",
+                "parameters": [
+                    {
+                        "description": "Verification token",
+                        "name": "body",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/internal_modules_auth_email.VerifyEmailRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "OK",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized",
+                        "schema": {
+                            "$ref": "#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response"
                         }
                     }
                 }
@@ -283,6 +666,20 @@ const docTemplate = `{
                 }
             }
         },
+        "internal_modules_auth.MFAChallengeResponse": {
+            "type": "object",
+            "properties": {
+                "expires_at": {
+                    "type": "string"
+                },
+                "mfa_token": {
+                    "type": "string"
+                },
+                "requires_mfa": {
+                    "type": "boolean"
+                }
+            }
+        },
         "internal_modules_auth.RefreshRequest": {
             "type": "object",
             "required": [
@@ -312,7 +709,7 @@ const docTemplate = `{
                 },
                 "password": {
                     "type": "string",
-                    "maxLength": 72,
+                    "maxLength": 128,
                     "minLength": 12
                 }
             }
@@ -333,6 +730,115 @@ const docTemplate = `{
                     "type": "string"
                 },
                 "token_type": {
+                    "type": "string"
+                }
+            }
+        },
+        "internal_modules_auth_email.EnableTOTPRequest": {
+            "type": "object",
+            "required": [
+                "code"
+            ],
+            "properties": {
+                "code": {
+                    "type": "string"
+                }
+            }
+        },
+        "internal_modules_auth_email.ForgotPasswordRequest": {
+            "type": "object",
+            "required": [
+                "email"
+            ],
+            "properties": {
+                "email": {
+                    "type": "string"
+                }
+            }
+        },
+        "internal_modules_auth_email.OTPTokenResponse": {
+            "type": "object",
+            "properties": {
+                "access_token": {
+                    "type": "string"
+                },
+                "access_token_expires_at": {
+                    "type": "string"
+                },
+                "refresh_token": {
+                    "type": "string"
+                },
+                "refresh_token_expires_at": {
+                    "type": "string"
+                },
+                "token_type": {
+                    "type": "string"
+                }
+            }
+        },
+        "internal_modules_auth_email.ResendVerificationRequest": {
+            "type": "object",
+            "required": [
+                "email"
+            ],
+            "properties": {
+                "email": {
+                    "type": "string"
+                }
+            }
+        },
+        "internal_modules_auth_email.ResetPasswordRequest": {
+            "type": "object",
+            "required": [
+                "new_password",
+                "token"
+            ],
+            "properties": {
+                "new_password": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "minLength": 12
+                },
+                "token": {
+                    "type": "string"
+                }
+            }
+        },
+        "internal_modules_auth_email.TOTPSetupResponse": {
+            "type": "object",
+            "properties": {
+                "qr_base64": {
+                    "type": "string"
+                },
+                "secret": {
+                    "type": "string"
+                },
+                "uri": {
+                    "type": "string"
+                }
+            }
+        },
+        "internal_modules_auth_email.VerifyEmailRequest": {
+            "type": "object",
+            "required": [
+                "token"
+            ],
+            "properties": {
+                "token": {
+                    "type": "string"
+                }
+            }
+        },
+        "internal_modules_auth_email.VerifyOTPRequest": {
+            "type": "object",
+            "required": [
+                "code"
+            ],
+            "properties": {
+                "code": {
+                    "type": "string"
+                },
+                "mfa_token": {
                     "type": "string"
                 }
             }

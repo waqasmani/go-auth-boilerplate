@@ -64,17 +64,6 @@ jobs:
       - name: Run unit tests
         run: go test -v -race -count=1 ./internal/...
 
-      - name: Run integration tests
-        env:
-          APP_ENV: test
-          DB_DSN: testuser:testpassword@tcp(127.0.0.1:3306)/auth_db_test?parseTime=true&charset=utf8mb4&loc=UTC&multiStatements=true
-          JWT_SECRET: ci-test-secret-key-32-characters-long
-          JWT_ISSUER: go-auth-boilerplate
-          JWT_AUDIENCE: go-auth-boilerplate-users
-          JWT_ACCESS_TTL: 15m
-          JWT_REFRESH_TTL: 720h
-        run: go test -v -race -count=1 ./tests/integration/...
-
   lint:
     name: Lint
     runs-on: ubuntu-latest

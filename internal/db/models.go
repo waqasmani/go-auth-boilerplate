@@ -14,9 +14,10 @@ import (
 type EmailTokensTokenType string
 
 const (
-	EmailTokensTokenTypeVerify EmailTokensTokenType = "verify"
-	EmailTokensTokenTypeReset  EmailTokensTokenType = "reset"
-	EmailTokensTokenTypeOtp    EmailTokensTokenType = "otp"
+	EmailTokensTokenTypeVerify    EmailTokensTokenType = "verify"
+	EmailTokensTokenTypeReset     EmailTokensTokenType = "reset"
+	EmailTokensTokenTypeOtp       EmailTokensTokenType = "otp"
+	EmailTokensTokenTypeChallenge EmailTokensTokenType = "challenge"
 )
 
 func (e *EmailTokensTokenType) Scan(src interface{}) error {
@@ -54,6 +55,49 @@ func (ns NullEmailTokensTokenType) Value() (driver.Value, error) {
 	return string(ns.EmailTokensTokenType), nil
 }
 
+type UsersMfaMethod string
+
+const (
+	UsersMfaMethodEmail UsersMfaMethod = "email"
+	UsersMfaMethodTotp  UsersMfaMethod = "totp"
+	UsersMfaMethodNone  UsersMfaMethod = "none"
+)
+
+func (e *UsersMfaMethod) Scan(src interface{}) error {
+	switch s := src.(type) {
+	case []byte:
+		*e = UsersMfaMethod(s)
+	case string:
+		*e = UsersMfaMethod(s)
+	default:
+		return fmt.Errorf("unsupported scan type for UsersMfaMethod: %T", src)
+	}
+	return nil
+}
+
+type NullUsersMfaMethod struct {
+	UsersMfaMethod UsersMfaMethod `json:"users_mfa_method"`
+	Valid          bool           `json:"valid"` // Valid is true if UsersMfaMethod is not NULL
+}
+
+// Scan implements the Scanner interface.
+func (ns *NullUsersMfaMethod) Scan(value interface{}) error {
+	if value == nil {
+		ns.UsersMfaMethod, ns.Valid = "", false
+		return nil
+	}
+	ns.Valid = true
+	return ns.UsersMfaMethod.Scan(value)
+}
+
+// Value implements the driver Valuer interface.
+func (ns NullUsersMfaMethod) Value() (driver.Value, error) {
+	if !ns.Valid {
+		return nil, nil
+	}
+	return string(ns.UsersMfaMethod), nil
+}
+
 type EmailToken struct {
 	ID        string               `json:"id"`
 	UserID    string               `json:"user_id"`
@@ -62,6 +106,22 @@ type EmailToken struct {
 	UsedAt    sql.NullTime         `json:"used_at"`
 	ExpiresAt time.Time            `json:"expires_at"`
 	CreatedAt time.Time            `json:"created_at"`
+}
+
+type OauthLinkingState struct {
+	Nonce     string    `json:"nonce"`
+	Payload   []byte    `json:"payload"`
+	ExpiresAt time.Time `json:"expires_at"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type OauthOneTimeCode struct {
+	ID        string       `json:"id"`
+	UserID    string       `json:"user_id"`
+	CodeHash  string       `json:"code_hash"`
+	ExpiresAt time.Time    `json:"expires_at"`
+	UsedAt    sql.NullTime `json:"used_at"`
+	CreatedAt time.Time    `json:"created_at"`
 }
 
 type RefreshToken struct {
@@ -84,14 +144,32 @@ type Role struct {
 }
 
 type User struct {
-	ID              string       `json:"id"`
-	Email           string       `json:"email"`
-	PasswordHash    string       `json:"password_hash"`
-	Name            string       `json:"name"`
-	EmailVerifiedAt sql.NullTime `json:"email_verified_at"`
-	TwoFaEnabled    bool         `json:"two_fa_enabled"`
-	CreatedAt       time.Time    `json:"created_at"`
-	UpdatedAt       time.Time    `json:"updated_at"`
+	ID                  string         `json:"id"`
+	Email               string         `json:"email"`
+	PasswordHash        string         `json:"password_hash"`
+	Name                string         `json:"name"`
+	EmailVerifiedAt     sql.NullTime   `json:"email_verified_at"`
+	TwoFaEnabled        bool           `json:"two_fa_enabled"`
+	MfaMethod           UsersMfaMethod `json:"mfa_method"`
+	TotpSecretEncrypted sql.NullString `json:"totp_secret_encrypted"`
+	TotpEnabledAt       sql.NullTime   `json:"totp_enabled_at"`
+	CreatedAt           time.Time      `json:"created_at"`
+	UpdatedAt           time.Time      `json:"updated_at"`
+}
+
+type UserOauthAccount struct {
+	ID                    string         `json:"id"`
+	UserID                string         `json:"user_id"`
+	Provider              string         `json:"provider"`
+	ProviderID            string         `json:"provider_id"`
+	ProviderEmail         string         `json:"provider_email"`
+	ProviderName          string         `json:"provider_name"`
+	AccessTokenEncrypted  sql.NullString `json:"access_token_encrypted"`
+	RefreshTokenEncrypted sql.NullString `json:"refresh_token_encrypted"`
+	TokenExpiresAt        sql.NullTime   `json:"token_expires_at"`
+	EncKeyID              string         `json:"enc_key_id"`
+	CreatedAt             time.Time      `json:"created_at"`
+	UpdatedAt             time.Time      `json:"updated_at"`
 }
 
 type UserRole struct {
