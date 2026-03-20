@@ -26,18 +26,19 @@ import (
 	"github.com/waqasmani/go-auth-boilerplate/internal/router"
 )
 
-const tokenCleanupInterval = 1 * time.Hour
-const mailerDrainTimeout = 10 * time.Second
+const (
+	tokenCleanupInterval  = 1 * time.Hour
+	serverShutdownTimeout = 15 * time.Second
+	mailerDrainTimeout    = 10 * time.Second
+)
 
 // App encapsulates the entire application.
 type App struct {
-	cfg           *config.Config
-	log           *zap.Logger
-	server        *http.Server
-	shutdownCh    chan struct{}
-	container     *container.Container
-	startCleanup  func(ctx context.Context)
-	cleanupCancel context.CancelFunc
+	cfg        *config.Config
+	log        *zap.Logger
+	server     *http.Server
+	shutdownCh chan struct{}
+	container  *container.Container
 }
 
 // New builds and wires the application using the dependency container.
@@ -147,7 +148,7 @@ func New(migrationsFS fs.FS) (*App, error) {
 		),
 		SqlDB:             cont.DB,
 		TrustedProxyCIDRs: cont.Config.TrustedProxyCIDRs,
-		CookieCSRF:        router.CookieCSRFConfigFromValues(cont.Config.FrontEndDomain),
+		CookieCSRF:        router.CookieCSRFConfigFromValues(cont.Config.CSRFTrustedOrigins),
 		ShutdownCh:        cont.ShutdownCh,
 		RedisClient:       cont.Redis,
 		RDB:               cont.RawRedis,
@@ -170,20 +171,11 @@ func New(migrationsFS fs.FS) (*App, error) {
 		server:     server,
 		shutdownCh: cont.ShutdownCh,
 		container:  cont,
-		startCleanup: func(ctx context.Context) {
-			authMod.Service.StartTokenCleanup(ctx, tokenCleanupInterval)
-		},
 	}, nil
 }
 
 // Run starts the HTTP server and blocks until a shutdown signal is received.
 func (a *App) Run() error {
-	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
-	a.cleanupCancel = cleanupCancel
-	if a.startCleanup != nil {
-		a.startCleanup(cleanupCtx)
-	}
-
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
@@ -208,22 +200,25 @@ func (a *App) Run() error {
 
 // Shutdown gracefully stops the server.
 func (a *App) Shutdown() error {
-	if a.cleanupCancel != nil {
-		a.cleanupCancel()
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
 	var errs []error
-	if err := a.server.Shutdown(ctx); err != nil {
+
+	// Server drain — capped independently. Exhausting this budget must not
+	// steal time from the mailer drain: queued emails are real user-facing
+	// work that deserves its full window regardless of how long HTTP draining
+	// takes.
+	serverCtx, serverCancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
+	defer serverCancel()
+
+	if err := a.server.Shutdown(serverCtx); err != nil {
 		a.log.Error("server shutdown error", zap.Error(err))
 		errs = append(errs, err)
 	}
 
-	// Mailer is always present and always enabled — drain unconditionally.
+	// Mailer drain — derived from context.Background(), not from serverCtx.
+	// This guarantees the full mailerDrainTimeout budget even when server
+	// drain consumes its entire 15 s window before returning.
 	if a.container.Mailer != nil {
-		mailerCtx, mailerCancel := context.WithTimeout(ctx, mailerDrainTimeout)
+		mailerCtx, mailerCancel := context.WithTimeout(context.Background(), mailerDrainTimeout)
 		defer mailerCancel()
 		if err := a.container.Mailer.Shutdown(mailerCtx); err != nil {
 			a.log.Error("mailer shutdown error", zap.Error(err))

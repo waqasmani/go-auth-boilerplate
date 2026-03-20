@@ -89,6 +89,26 @@ func NewRepository(db *sql.DB, queries *dbpkg.Queries) Repository {
 
 // WithTx opens a transaction, binds a transaction-scoped *Queries via
 // queries.WithTx, runs fn, then commits or rolls back.
+//
+// Returning a value from the closure: because fn's signature is
+// func(tx Repository) error, callers that need to surface a result should
+// capture it through a local variable declared in the outer scope:
+//
+//	var result SomeType
+//	err := r.WithTx(ctx, func(tx Repository) error {
+//	    txRepo := tx.(*repository)          // safe: WithTx always passes *repository
+//	    val, err := txRepo.queries.SomeQuery(ctx, ...)
+//	    if err != nil { return err }
+//	    result = val
+//	    return nil
+//	})
+//	if err != nil { return nil, err }
+//	return result, nil
+//
+// The type assertion tx.(*repository) is the only way to reach txRepo.queries
+// from inside the closure without widening the Repository interface. It is safe
+// because WithTx always constructs and passes a *repository — never any other
+// implementation.
 func (r *repository) WithTx(ctx context.Context, fn func(tx Repository) error) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -182,39 +202,39 @@ func (r *repository) StoreLinkingState(ctx context.Context, nonce string, payloa
 }
 
 func (r *repository) ConsumeLinkingState(ctx context.Context, nonce string) ([]byte, error) {
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
 	var payload []byte
-	var expiresAt time.Time
-	err = tx.QueryRowContext(ctx,
-		`SELECT payload, expires_at FROM oauth_linking_states WHERE nonce = ? FOR UPDATE`,
-		nonce,
-	).Scan(&payload, &expiresAt)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrInvalidLinkingToken
+	err := r.WithTx(ctx, func(tx Repository) error {
+		txRepo := tx.(*repository)
+
+		// SELECT … FOR UPDATE via the sqlc-generated query so the row lock
+		// is held for the duration of this transaction. Raw tx.QueryRowContext
+		// was used previously; the generated query is identical in SQL but
+		// goes through the same prepared-statement path as every other query.
+		row, err := txRepo.queries.ConsumeLinkingState(ctx, nonce)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrInvalidLinkingToken
+			}
+			return apperrors.Wrap(apperrors.ErrInternalServer, err)
 		}
-		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
-	}
 
-	if time.Now().UTC().After(expiresAt.UTC()) {
-		return nil, ErrInvalidLinkingToken
-	}
+		if time.Now().UTC().After(row.ExpiresAt.UTC()) {
+			return ErrInvalidLinkingToken
+		}
 
-	if _, err = tx.ExecContext(ctx,
-		`DELETE FROM oauth_linking_states WHERE nonce = ?`, nonce,
-	); err != nil {
-		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
-	}
+		if err := txRepo.queries.DeleteLinkingState(ctx, nonce); err != nil {
+			return apperrors.Wrap(apperrors.ErrInternalServer, err)
+		}
 
-	_, _ = tx.ExecContext(ctx, `DELETE FROM oauth_linking_states WHERE expires_at < NOW() LIMIT 50`)
+		// Best-effort lazy expiry sweep; errors intentionally discarded.
+		// A failure here must not roll back a valid consume.
+		_ = txRepo.queries.PurgeExpiredLinkingStates(ctx)
 
-	if err = tx.Commit(); err != nil {
-		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
+		payload = row.Payload
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return payload, nil
 }
@@ -229,44 +249,44 @@ func (r *repository) StoreOneTimeCode(ctx context.Context, params dbpkg.StoreOne
 }
 
 func (r *repository) ConsumeOneTimeCode(ctx context.Context, codeHash string) (string, error) {
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", apperrors.Wrap(apperrors.ErrInternalServer, err)
-	}
-	defer func() { _ = tx.Rollback() }()
+	var userID string
+	err := r.WithTx(ctx, func(tx Repository) error {
+		txRepo := tx.(*repository)
 
-	txq := r.queries.WithTx(tx)
-
-	row, err := txq.GetOneTimeCodeForUpdate(ctx, codeHash)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", ErrInvalidOneTimeCode
+		row, err := txRepo.queries.GetOneTimeCodeForUpdate(ctx, codeHash)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrInvalidOneTimeCode
+			}
+			return apperrors.Wrap(apperrors.ErrInternalServer, err)
 		}
-		return "", apperrors.Wrap(apperrors.ErrInternalServer, err)
-	}
 
-	if time.Now().UTC().After(row.ExpiresAt.UTC()) {
-		return "", ErrInvalidOneTimeCode
-	}
+		if time.Now().UTC().After(row.ExpiresAt.UTC()) {
+			return ErrInvalidOneTimeCode
+		}
 
-	if row.UsedAt.Valid {
-		return "", ErrInvalidOneTimeCode
-	}
+		if row.UsedAt.Valid {
+			return ErrInvalidOneTimeCode
+		}
 
-	result, err := txq.MarkOneTimeCodeUsed(ctx, codeHash)
+		result, err := txRepo.queries.MarkOneTimeCodeUsed(ctx, codeHash)
+		if err != nil {
+			return apperrors.Wrap(apperrors.ErrInternalServer, err)
+		}
+		if n, _ := result.RowsAffected(); n == 0 {
+			return ErrInvalidOneTimeCode
+		}
+
+		// Best-effort lazy expiry sweep; errors intentionally discarded.
+		_ = txRepo.queries.PurgeExpiredOneTimeCodes(ctx)
+
+		userID = row.UserID
+		return nil
+	})
 	if err != nil {
-		return "", apperrors.Wrap(apperrors.ErrInternalServer, err)
+		return "", err
 	}
-	if n, _ := result.RowsAffected(); n == 0 {
-		return "", ErrInvalidOneTimeCode
-	}
-
-	_ = txq.PurgeExpiredOneTimeCodes(ctx)
-
-	if err = tx.Commit(); err != nil {
-		return "", apperrors.Wrap(apperrors.ErrInternalServer, err)
-	}
-	return row.UserID, nil
+	return userID, nil
 }
 
 // ── CreateOAuthOnlyUser ───────────────────────────────────────────────────────

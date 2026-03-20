@@ -51,6 +51,10 @@ type CallbackResponse struct {
 	// Internal routing — never serialised.
 	UserID      string `json:"-"` // used by handler to generate one-time code
 	RedirectURL string `json:"-"` // from verified OAuth state
+	// OneTimeCode is the pre-issued plaintext code for the mobile path.
+	// Non-empty only when RedirectURL has a custom scheme. The handler must
+	// use this value directly; it must NOT call IssueOneTimeCode separately.
+	OneTimeCode string `json:"-"`
 }
 
 // ExchangeRequest is the body for POST /oauth/exchange.

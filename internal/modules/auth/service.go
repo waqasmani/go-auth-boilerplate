@@ -17,11 +17,6 @@ import (
 
 //go:generate mockgen -source=service.go -destination=mocks/service_mock.go -package=mocks
 
-// tokenCleanupOpTimeout is the per-tick deadline for DeleteExpiredRefreshTokens.
-// It caps the time the cleanup goroutine will wait on a slow or locked table
-// without blocking the next tick or preventing graceful shutdown.
-const tokenCleanupOpTimeout = 30 * time.Second
-
 // MFAChallenger is implemented by authemail.Service.
 type MFAChallenger interface {
 	InitiateChallenge(ctx context.Context, userID, email, name string) (challengeToken string, expiresAt time.Time, err error)
@@ -53,11 +48,6 @@ type Service interface {
 	// creation are fully atomic. Use IssueTokensForUser when no surrounding
 	// transaction is needed.
 	PrepareTokensForUser(ctx context.Context, userID string) (*platformauth.TokenPair, error)
-	// StartTokenCleanup launches a background goroutine that purges expired
-	// refresh tokens on the given interval. Call exactly once from app.Run
-	// after the server starts listening. The goroutine exits when ctx is
-	// cancelled (typically at the start of graceful shutdown).
-	StartTokenCleanup(ctx context.Context, interval time.Duration)
 }
 
 type service struct {
@@ -83,67 +73,6 @@ func NewService(repo Repository, jwt *platformauth.JWT, log *zap.Logger, auditLo
 
 func (s *service) SetMFAChallenger(c MFAChallenger)           { s.mfaChallenger = c }
 func (s *service) SetVerificationSender(v VerificationSender) { s.verificationSender = v }
-
-// StartTokenCleanup launches a background goroutine that calls
-// DeleteExpiredRefreshTokens on the given interval. Call exactly once from
-// app.Run after the server starts listening. The goroutine exits when ctx is
-// cancelled (typically at the start of graceful shutdown).
-//
-// # Shutdown behaviour
-//
-// When ctx is cancelled the goroutine exits on whichever select branch fires
-// first — either the ctx.Done() case directly, or the ticker.C case where
-// ctx.Err() is detected. In the latter path we return immediately (not
-// continue) so the goroutine does not re-enter the select and log a spurious
-// "skipped" line on every subsequent tick before ctx.Done() is eventually
-// chosen by the scheduler.
-func (s *service) StartTokenCleanup(ctx context.Context, interval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		s.log.Info("token cleanup goroutine started", zap.Duration("interval", interval))
-
-		for {
-			select {
-			case <-ticker.C:
-				// If the context was already cancelled when this tick fired
-				// (e.g. shutdown signal raced with the ticker), exit immediately
-				// rather than continuing the loop. Using continue here would
-				// re-enter the select, log another "skipped" line on the next
-				// tick, and repeat until ctx.Done() happens to win the race —
-				// flooding logs during slow shutdowns.
-				if err := ctx.Err(); err != nil {
-					s.log.Info("token cleanup goroutine stopped", zap.Error(err))
-					return
-				}
-
-				opCtx, opCancel := context.WithTimeout(ctx, tokenCleanupOpTimeout)
-				n, err := s.repo.DeleteExpiredRefreshTokens(opCtx)
-				opCancel()
-
-				switch {
-				case err == nil && n > 0:
-					s.log.Info("token cleanup: expired tokens removed", zap.Int64("count", n))
-				case err == nil:
-					s.log.Debug("token cleanup: no expired tokens found")
-				default:
-					if opCtx.Err() != nil {
-						s.log.Warn("token cleanup: operation cancelled",
-							zap.Error(opCtx.Err()),
-							zap.NamedError("cause", err),
-						)
-					} else {
-						s.log.Error("token cleanup: delete failed", zap.Error(err))
-					}
-				}
-
-			case <-ctx.Done():
-				s.log.Info("token cleanup goroutine stopped", zap.Error(ctx.Err()))
-				return
-			}
-		}
-	}()
-}
 
 // ── Register ──────────────────────────────────────────────────────────────────
 
@@ -318,79 +247,160 @@ func (s *service) Login(ctx context.Context, req LoginRequest) (*LoginResult, er
 
 // ── Refresh ───────────────────────────────────────────────────────────────────
 
+// concurrentUseGrace is the window within which a second /refresh request
+// presenting an already-consumed token is treated as a benign concurrent
+// duplicate rather than a deliberate replay of a rotated-away token.
+//
+// Why this exists: two legitimate /refresh requests racing on the same token
+// (double-click, network retry, client-side race) are serialised by the FOR
+// UPDATE row lock. The first request wins and consumes the token; the second
+// acquires the lock and finds used_at IS NOT NULL. Without this grace window
+// the second request triggers family revocation, invalidating the new token
+// the first request just issued and silently logging the user out.
+//
+// Security trade-off: an attacker who steals token T and replays it within
+// 10 seconds of the legitimate use receives 401 (no access) but does NOT
+// trigger family revocation. Outside the window, replay correctly revokes the
+// entire family. Real-world token theft (cookie exfiltration, XSS, log
+// scraping) is almost never synchronised within a 10-second window of
+// legitimate use. TLS prevents the only synchronised-replay vector (active
+// MitM) before the token even reaches this code.
+const concurrentUseGrace = 10 * time.Second
+
 func (s *service) Refresh(ctx context.Context, req RefreshRequest) (*TokenResponse, error) {
 	tokenHash := platformauth.HashRefreshToken(req.RefreshToken)
 
-	token, err := s.repo.GetRefreshTokenByHash(ctx, tokenHash)
-	if err != nil {
-		return nil, err
-	}
-
-	if time.Now().UTC().After(token.ExpiresAt) {
-		return nil, apperrors.ErrTokenExpired
-	}
-
-	if token.RevokedAt.Valid {
-		return nil, apperrors.ErrTokenRevoked
-	}
-
-	if token.UsedAt.Valid {
-		s.log.Warn("used token presented — possible replay attack, revoking family",
-			zap.String("family", token.TokenFamily),
-			zap.String("user_id", token.UserID),
-		)
-		_ = s.repo.RevokeRefreshTokenFamily(ctx, token.TokenFamily)
-		s.auditLog.Log(ctx, audit.EventTokenReuseDetected, token.UserID,
-			zap.String("family", token.TokenFamily),
-		)
-		return nil, apperrors.ErrTokenReuse
-	}
-
-	user, err := s.repo.GetUserByIDWithRoles(ctx, token.UserID)
-	if err != nil {
-		return nil, err
-	}
+	// capturedFamily and capturedUserID are set inside the transaction closure
+	// so the post-transaction family-revocation path has the values it needs
+	// without a second database round-trip. ErrTokenReuse is only returned
+	// after the FOR UPDATE succeeds, so both variables are always populated
+	// when the revocation branch runs.
+	var capturedFamily string
+	var capturedUserID string
 
 	var tokenResp *TokenResponse
-	if err = s.repo.WithTx(ctx, func(tx Repository) error {
-		consumed, err := tx.ConsumeRefreshToken(ctx, token.ID)
+	txErr := s.repo.WithTx(ctx, func(tx Repository) error {
+		// Acquire an exclusive row lock as the very first operation.
+		//
+		// Previous design: a non-locking GetRefreshTokenByHash read outside the
+		// transaction served as a "fast-reject" for unknown tokens. That created
+		// a TOCTOU window: both requests in a concurrent pair could pass the
+		// fast-reject (token looks valid), the first would consume the token
+		// inside the transaction, and the second would acquire the FOR UPDATE
+		// lock, see used_at IS NOT NULL, and trigger a false-positive family
+		// revocation — invalidating the new token the first request had just
+		// issued and logging the user out.
+		//
+		// Current design: the FOR UPDATE is the single authoritative read.
+		// Unknown tokens are rejected here (repository maps sql.ErrNoRows →
+		// ErrTokenInvalid) with no preceding non-locking read, eliminating the
+		// TOCTOU window entirely.
+		locked, err := tx.GetRefreshTokenByHashForUpdate(ctx, tokenHash)
+		if err != nil {
+			return err
+		}
+
+		capturedFamily = locked.TokenFamily
+		capturedUserID = locked.UserID
+
+		// ── Authoritative state checks (race-free under FOR UPDATE lock) ─────
+
+		if time.Now().UTC().After(locked.ExpiresAt) {
+			return apperrors.ErrTokenExpired
+		}
+
+		// Token was revoked by a concurrent Logout, an admin action, or a
+		// previous replay detection. Return ErrTokenRevoked (not ErrTokenReuse)
+		// so the caller receives the correct error code and no spurious second
+		// family revocation is triggered.
+		if locked.RevokedAt.Valid {
+			return apperrors.ErrTokenRevoked
+		}
+
+		if locked.UsedAt.Valid {
+			// Distinguish between a concurrent duplicate request (benign race)
+			// and deliberate replay of a token that was rotated away some time ago.
+			//
+			// Concurrent duplicate: used_at was stamped moments ago by the
+			// winning sibling request. The legitimate client already received the
+			// new token from that sibling; this 401 is safely ignorable. Do NOT
+			// revoke the family — that would invalidate the sibling's new token.
+			//
+			// Deliberate replay: used_at is old. Revoke the entire family so any
+			// session the attacker may have established is terminated.
+			// ErrTokenReuse is handled in the outer scope.
+			if time.Since(locked.UsedAt.Time) <= concurrentUseGrace {
+				return apperrors.ErrTokenInvalid // 401, no family revocation
+			}
+			return apperrors.ErrTokenReuse // triggers family revocation below
+		}
+
+		// ── Fetch user data ───────────────────────────────────────────────────
+		// Uses the outer (non-transactional) repository so the user JOIN query
+		// does not extend the refresh_token row-lock duration. If the user is
+		// deleted between here and issueTokenPair's CreateRefreshToken, the FK
+		// constraint surfaces the error correctly.
+		user, err := s.repo.GetUserByIDWithRoles(ctx, locked.UserID)
+		if err != nil {
+			return err
+		}
+
+		// ── Consume ───────────────────────────────────────────────────────────
+
+		consumed, err := tx.ConsumeRefreshToken(ctx, locked.ID)
 		if err != nil {
 			return err
 		}
 		if !consumed {
+			// Should be unreachable: the FOR UPDATE lock guarantees used_at IS
+			// NULL and revoked_at IS NULL at this point. This branch fires only
+			// if ConsumeRefreshToken's WHERE clause diverges from the checks
+			// above (schema drift, manual DB edit, or query mismatch).
+			s.log.Error(
+				"refresh: ConsumeRefreshToken returned consumed=false after FOR UPDATE "+
+					"confirmed used_at IS NULL and revoked_at IS NULL — possible schema drift",
+				zap.String("token_id", locked.ID),
+				zap.String("user_id", locked.UserID),
+				zap.String("family", locked.TokenFamily),
+			)
 			return apperrors.ErrTokenReuse
 		}
-		tokenResp, err = s.issueTokenPair(ctx, tx, user.ID, user.Email, user.Roles, token.TokenFamily)
+
+		tokenResp, err = s.issueTokenPair(ctx, tx, user.ID, user.Email, user.Roles, locked.TokenFamily)
 		return err
-	}); err != nil {
-		if appErr, ok := apperrors.As(err); ok && appErr.Code == apperrors.ErrTokenReuse.Code {
-			s.log.Warn("refresh token reuse detected — revoking family",
-				zap.String("family", token.TokenFamily),
-				zap.String("user_id", token.UserID),
+	})
+
+	if txErr != nil {
+		if appErr, ok := apperrors.As(txErr); ok && appErr.Code == apperrors.ErrTokenReuse.Code {
+			s.log.Warn("refresh: token reuse detected — revoking family",
+				zap.String("family", capturedFamily),
+				zap.String("user_id", capturedUserID),
 			)
-			_ = s.repo.RevokeRefreshTokenFamily(ctx, token.TokenFamily)
-			s.auditLog.Log(ctx, audit.EventTokenReuseDetected, token.UserID,
-				zap.String("family", token.TokenFamily),
+			if revokeErr := s.repo.RevokeRefreshTokenFamily(ctx, capturedFamily); revokeErr != nil {
+				s.log.Error("refresh: family revocation failed after reuse detection — family may still be active",
+					zap.String("family", capturedFamily),
+					zap.String("user_id", capturedUserID),
+					zap.Error(revokeErr),
+				)
+				s.auditLog.Log(ctx, audit.EventTokenReuseDetected, capturedUserID,
+					zap.String("family", capturedFamily),
+				)
+				return nil, revokeErr
+			}
+			s.auditLog.Log(ctx, audit.EventTokenReuseDetected, capturedUserID,
+				zap.String("family", capturedFamily),
 			)
 		}
-		return nil, err
+		return nil, txErr
 	}
 
-	s.auditLog.Log(ctx, audit.EventTokenRefreshed, user.ID)
-	logger.FromContext(ctx).Info("token refreshed", zap.String("user_id", user.ID))
+	s.auditLog.Log(ctx, audit.EventTokenRefreshed, capturedUserID)
+	logger.FromContext(ctx).Info("token refreshed", zap.String("user_id", capturedUserID))
 	return tokenResp, nil
 }
 
 // ── Logout ────────────────────────────────────────────────────────────────────
 
-// Logout revokes the session family associated with the supplied refresh token.
-//
-// A used (spent) token at Logout signals either a client that rotated its
-// token and is calling logout with an old value, or an attacker probing
-// session state with a stolen spent token. In both cases the family is revoked:
-// the legitimate user re-authenticates, and the attacker's goal of leaving a
-// live family intact is thwarted. The handler clears the cookie before calling
-// this method, so there is no user-visible regression on the normal path.
 func (s *service) Logout(ctx context.Context, req LogoutRequest) error {
 	tokenHash := platformauth.HashRefreshToken(req.RefreshToken)
 
@@ -415,7 +425,19 @@ func (s *service) Logout(ctx context.Context, req LogoutRequest) error {
 			zap.String("family", token.TokenFamily),
 			zap.String("user_id", token.UserID),
 		)
-		_ = s.repo.RevokeRefreshTokenFamily(ctx, token.TokenFamily)
+		if err := s.repo.RevokeRefreshTokenFamily(ctx, token.TokenFamily); err != nil {
+			// A failure here leaves the token family live. Return the error so
+			// the client receives 500 and retries rather than a 204 that falsely
+			// implies all sessions were terminated. The audit event is
+			// intentionally withheld: logging "sessions revoked" when revocation
+			// failed would produce a misleading security record.
+			s.log.Error("logout: family revocation failed — sessions may still be active",
+				zap.String("family", token.TokenFamily),
+				zap.String("user_id", token.UserID),
+				zap.Error(err),
+			)
+			return err
+		}
 		s.auditLog.Log(ctx, audit.EventSessionsRevoked, token.UserID,
 			zap.String("trigger", "logout_used_token"),
 			zap.String("family", token.TokenFamily),

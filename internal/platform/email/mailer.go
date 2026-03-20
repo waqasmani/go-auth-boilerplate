@@ -459,7 +459,14 @@ func (m *Mailer) sendWithRetry(ctx context.Context, msg Message) error {
 	addr := fmt.Sprintf("%s:%d", m.cfg.Host, m.cfg.Port)
 
 	var lastErr error
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := range maxRetries {
+		// Check cancellation before any work on this attempt — including
+		// attempt 0. Without this, a cancelled context on the first attempt
+		// reaches sendTLS/sendSTARTTLS and produces an opaque TCP dial error
+		// instead of a clean context.Canceled / context.DeadlineExceeded.
+		if err := ctx.Err(); err != nil {
+			return mailerErr("send-ctx", err)
+		}
 		if attempt > 0 {
 			delay := m.retryBase * time.Duration(1<<(attempt-1))
 			select {

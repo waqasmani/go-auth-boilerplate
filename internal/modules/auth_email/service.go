@@ -817,7 +817,23 @@ func (s *service) DisableTOTP(ctx context.Context, userID, code string) error {
 			http.StatusUnprocessableEntity, nil)
 	}
 
-	if err := s.repo.DisableUserTOTP(ctx, userID); err != nil {
+	if err := s.repo.WithTx(ctx, func(tx Repository) error {
+		if err := tx.DisableUserTOTP(ctx, userID); err != nil {
+			return err
+		}
+		// Invalidate any in-flight MFA challenge tokens so a concurrent TOTP
+		// login that is mid-flow cannot complete after TOTP has been disabled.
+		// ResetPassword performs the same invalidation for the same reason:
+		// a credential change must atomically terminate all pending auth flows,
+		// not just established sessions.
+		if err := tx.InvalidateUserTokensByType(ctx, db.InvalidateUserTokensByTypeParams{
+			UserID:    userID,
+			TokenType: tokenTypeChallenge,
+		}); err != nil {
+			return err
+		}
+		return tx.RevokeUserRefreshTokens(ctx, userID)
+	}); err != nil {
 		return err
 	}
 

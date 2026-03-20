@@ -14,6 +14,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -86,7 +87,23 @@ func run() error {
 
 	job := cleanup.NewJob(sqlDB, log)
 	if err = job.Run(ctx); err != nil {
-		log.Error("cleanup: finished with errors", zap.Error(err))
+		// job.Run already emitted a structured log.Error for every individual
+		// pass failure (with table, deleted_before_error, and the underlying
+		// error). Log a concise summary here so the CronJob run record carries
+		// a single searchable event that shows how many passes failed — useful
+		// for alerting rules that fire on "any cleanup failure" without
+		// duplicating the per-pass detail already in the log stream.
+		var runErr *cleanup.RunError
+		if errors.As(err, &runErr) {
+			log.Error("cleanup: finished with errors",
+				zap.Int("failed_passes", len(runErr.Failures)),
+				zap.Int("total_passes", 3),
+			)
+		} else {
+			// Unexpected error shape (e.g. a future refactor broke the type
+			// contract). Fall back to the raw error so nothing is lost.
+			log.Error("cleanup: finished with unexpected error", zap.Error(err))
+		}
 		return err
 	}
 

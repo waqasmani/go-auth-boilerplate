@@ -21,6 +21,40 @@ import (
 const (
 	oauthStateCookie    = "_oauth_state"
 	oauthStateCookieTTL = 15 * 60
+
+	// maxStateParamBytes is the per-parameter cap on the OAuth `state` value.
+	//
+	// A legitimate signed state produced by SignOAuthState is:
+	//   base64url(JSON{nonce,provider,redirect_url,pkce_verifier,exp})
+	//   + "." + hex(SHA-256 HMAC)
+	//
+	// Measured maximum with the longest plausible redirect_url (~100 chars):
+	//   ~320 bytes total. 512 is ~1.6× that ceiling.
+	//
+	// This check is belt-and-suspenders behind the global QuerySizeLimit
+	// middleware. It catches the case where a future refactor routes the
+	// callback differently and the global middleware is inadvertently bypassed.
+	maxStateParamBytes = 512
+
+	// maxCodeParamBytes caps the OAuth authorisation code. Provider codes are
+	// typically 20–200 chars; 512 is generous for any legitimate provider.
+	maxCodeParamBytes = 512
+
+	// maxRedirectURLBytes caps the redirect_url query parameter on the login
+	// initiation endpoint. Standard URL length budget; well above any
+	// legitimate deep-link or HTTPS redirect destination in practice.
+	maxRedirectURLBytes = 2048
+)
+
+// errParamTooLong is returned when an individual query parameter exceeds its
+// per-parameter cap. Reuses ErrBadRequest so the response is 400 (not 414)
+// since the total URI was already within bounds — the issue is a single
+// oversized value, not the overall URI length.
+var errParamTooLong = apperrors.New(
+	"PARAM_TOO_LONG",
+	"one or more query parameters exceed the maximum allowed length",
+	http.StatusBadRequest,
+	nil,
 )
 
 // Handler exposes the OAuth HTTP endpoints.
@@ -55,6 +89,16 @@ func (h *Handler) Login(c *gin.Context) {
 	provider := strings.ToLower(c.Param("provider"))
 
 	redirectURL := strings.TrimSpace(c.Query("redirect_url"))
+
+	// Belt-and-suspenders per-parameter cap. The global QuerySizeLimit
+	// middleware already rejected requests whose entire query string exceeds
+	// 4 KiB, so this catches the edge case of a single parameter consuming
+	// most of that budget.
+	if len(redirectURL) > maxRedirectURLBytes {
+		response.Error(c, errParamTooLong)
+		return
+	}
+
 	if err := h.validateRedirectURL(provider, redirectURL); err != nil {
 		response.Error(c, err)
 		return
@@ -125,6 +169,21 @@ func (h *Handler) Callback(c *gin.Context) {
 		return
 	}
 
+	// Per-parameter length caps — defence-in-depth behind the global
+	// QuerySizeLimit middleware. ParseAndVerifyOAuthState performs base64
+	// decoding, JSON unmarshalling, and HMAC comparison; capping state here
+	// ensures none of those operations ever process an attacker-controlled
+	// megabyte-scale input regardless of how the route is mounted in future.
+	if len(stateParam) > maxStateParamBytes || len(code) > maxCodeParamBytes {
+		log.Warn("oauth: oversized query parameter rejected",
+			zap.String("provider", provider),
+			zap.Int("state_len", len(stateParam)),
+			zap.Int("code_len", len(code)),
+		)
+		response.Error(c, errParamTooLong)
+		return
+	}
+
 	// CSRF gate: the cookie's mere existence proves this request originated
 	// from a tab that went through Login on the same origin. An attacker on a
 	// foreign origin cannot read or set our cookies, so absence is a hard CSRF
@@ -179,12 +238,13 @@ func (h *Handler) Callback(c *gin.Context) {
 		c.Redirect(http.StatusSeeOther, resp.RedirectURL)
 
 	case redirectKindMobile:
-		otCode, codeErr := h.svc.IssueOneTimeCode(c.Request.Context(), resp.UserID)
-		if codeErr != nil {
-			response.Error(c, codeErr)
+		// The code was pre-issued inside HandleCallback, atomically with account
+		// creation for new users. Never call IssueOneTimeCode separately here.
+		if resp.OneTimeCode == "" {
+			response.Error(c, apperrors.ErrInternalServer)
 			return
 		}
-		c.Redirect(http.StatusFound, appendQueryParam(resp.RedirectURL, "code", otCode))
+		c.Redirect(http.StatusFound, appendQueryParam(resp.RedirectURL, "code", resp.OneTimeCode))
 
 	default:
 		h.setRefreshCookie(c, resp.Tokens.RefreshToken)

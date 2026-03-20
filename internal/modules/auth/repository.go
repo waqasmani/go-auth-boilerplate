@@ -36,11 +36,6 @@ type Repository interface {
 	AssignUserRole(ctx context.Context, userID, roleName string) error
 	ConsumeRefreshToken(ctx context.Context, id string) (bool, error)
 	RevokeRefreshTokenFamily(ctx context.Context, family string) error
-	// DeleteExpiredRefreshTokens purges rows whose expires_at is in the past.
-	// Called periodically by the background cleanup goroutine started in
-	// app.Run to prevent unbounded table growth. Returns the number of deleted
-	// rows for logging.
-	DeleteExpiredRefreshTokens(ctx context.Context) (int64, error)
 	WithTx(ctx context.Context, fn func(tx Repository) error) error
 }
 
@@ -77,44 +72,6 @@ func (r *repository) WithTx(ctx context.Context, fn func(tx Repository) error) e
 		return apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
 	return nil
-}
-
-// DeleteExpiredRefreshTokens removes all refresh_tokens rows whose expires_at
-// is before the current UTC time.
-func (r *repository) DeleteExpiredRefreshTokens(ctx context.Context) (int64, error) {
-	const batchSize = 10_000
-	var total int64
-
-	for {
-		// Check context before each batch so a shutdown signal or per-tick
-		// timeout aborts cleanly without leaving a multi-batch delete partially
-		// complete (partial completion is safe — the next tick picks up where
-		// this one left off).
-		if err := ctx.Err(); err != nil {
-			return total, apperrors.Wrap(apperrors.ErrInternalServer, err)
-		}
-
-		result, err := r.sqlDB.ExecContext(ctx,
-			`DELETE FROM refresh_tokens
-			  WHERE expires_at < UTC_TIMESTAMP()
-			  LIMIT ?`,
-			batchSize,
-		)
-		if err != nil {
-			return total, apperrors.Wrap(apperrors.ErrInternalServer, err)
-		}
-
-		n, _ := result.RowsAffected()
-		total += n
-
-		// When a batch deletes fewer rows than the limit, all expired rows have
-		// been removed. Exiting here also prevents an extra no-op round-trip.
-		if n < batchSize {
-			break
-		}
-	}
-
-	return total, nil
 }
 
 func (r *repository) GetUserByEmail(ctx context.Context, email string) (*db.User, error) {

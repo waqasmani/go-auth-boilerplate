@@ -43,9 +43,6 @@ type Options struct {
 	RedisClient *redispkg.Client
 
 	// RDB is the raw go-redis client passed to per-route rate-limit middleware.
-	// When non-nil, all rate limiters (global, per-endpoint, auth, email, oauth)
-	// use Redis so that token-bucket state is shared across pods. When nil the
-	// middleware falls back transparently to per-instance in-memory stores.
 	RDB *goredis.Client
 
 	// Log is forwarded to all middleware constructors that emit structured logs.
@@ -100,10 +97,23 @@ func New(
 	}
 
 	// ─── Global Middleware ─────────────────────────────────────────────────────
+	//
+	// Size guards must be registered first so that oversized input is rejected
+	// before any other middleware — logging, rate limiting, CSRF — processes it.
+	//
+	// Order matters:
+	//   1. Body cap     — MaxBytesReader on the request body (POST/PUT/PATCH).
+	//   2. Query cap    — QuerySizeLimit on the raw URL query string (GET params).
+	//
+	// Without (2), an attacker could supply an arbitrarily-long `state=` or
+	// `code=` query parameter on the OAuth callback endpoint and bypass the body
+	// cap entirely, because query strings are never read through the body reader.
 	r.Use(func(c *gin.Context) {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64*1024)
 		c.Next()
 	})
+	r.Use(middleware.QuerySizeLimit(middleware.DefaultQuerySizeLimit))
+
 	r.Use(middleware.CORS(opts.CORS))
 
 	if opts.ShutdownCh != nil {
@@ -127,14 +137,6 @@ func New(
 	r.GET("/health", buildHealthHandler(opts))
 
 	// ─── Swagger UI (non-production only) ─────────────────────────────────────
-	//
-	// CSP scope: only index.html requires 'unsafe-inline' (Swagger UI injects
-	// inline scripts and styles at runtime). All other assets served under
-	// /swagger/* (JS bundles, CSS, PNG favicon, openapi.json) are static files
-	// that carry no executable content; they inherit the global
-	// "default-src 'none'" header set by SecureHeaders and do not need the
-	// relaxed policy. Applying 'unsafe-inline' to the entire group would widen
-	// the XSS attack surface to every response served by this router group.
 	if env != "production" {
 		r.GET("/swagger", func(c *gin.Context) {
 			c.Redirect(http.StatusMovedPermanently, "/swagger/index.html")
@@ -142,14 +144,6 @@ func New(
 		swaggerGroup := r.Group("/swagger")
 		swaggerGroup.GET("/*any",
 			func(c *gin.Context) {
-				// The permissive policy is needed only for the HTML document
-				// that bootstraps Swagger UI. Static assets (JS, CSS, images,
-				// the OpenAPI JSON) do not execute scripts or apply styles
-				// themselves, so "default-src 'none'" (from SecureHeaders) is
-				// correct and safe for them.
-				//
-				// c.Param("any") always starts with "/" (e.g. "/index.html"),
-				// so the comparison is exact with no path-traversal ambiguity.
 				if c.Param("any") == "/index.html" {
 					c.Header("Content-Security-Policy",
 						"default-src 'self'; "+
@@ -170,8 +164,6 @@ func New(
 
 	// ── Auth ───────────────────────────────────────────────────────────────────
 	authGroup := v1.Group("/auth")
-	// All per-route limiters receive opts.RDB so they use Redis when available.
-	// When RDB is nil the middleware falls back transparently to in-memory state.
 	emailmodule.RegisterRoutes(authGroup, emailMod.Handler, jwtHelper, log, opts.EmailRateLimit, opts.RDB)
 	authmodule.RegisterRoutes(authGroup, authMod.Handler, opts.RateLimit, opts.RefreshRateLimit, opts.CookieCSRF, opts.RDB, log)
 
@@ -266,8 +258,12 @@ func SecureHeadersConfigFromValues(hstsEnabled bool, hstsMaxAge int) middleware.
 	}
 }
 
-func CookieCSRFConfigFromValues(frontEndDomain string) middleware.CookieCSRFConfig {
+// CookieCSRFConfigFromValues builds a CookieCSRFConfig from the explicit
+// trusted-origin list. trustedOrigins should come from cfg.CSRFTrustedOrigins,
+// which already falls back to []string{cfg.FrontEndDomain} when
+// CSRF_TRUSTED_ORIGINS is not set — no further defaulting is needed here.
+func CookieCSRFConfigFromValues(trustedOrigins []string) middleware.CookieCSRFConfig {
 	return middleware.CookieCSRFConfig{
-		TrustedOrigins: []string{frontEndDomain},
+		TrustedOrigins: trustedOrigins,
 	}
 }

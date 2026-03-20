@@ -18,12 +18,31 @@ import (
 
 // ResolveCookieDomain returns the Domain attribute value to set on a cookie.
 //
-// Resolution priority:
+// # Resolution priority
+//
 //  1. cfg.CookieDomain (COOKIE_DOMAIN env var) — explicit operator override.
-//     Use a leading-dot value (e.g. ".example.com") when the SPA and API live
-//     on different subdomains and must share the same refresh-token cookie.
 //  2. Hostname of cfg.FrontEndDomain — derived automatically when COOKIE_DOMAIN
 //     is not set. Restricts the cookie to the exact SPA host.
+//
+// # Security note on wildcard (leading-dot) values
+//
+// A COOKIE_DOMAIN that begins with "." (e.g. ".example.com") instructs the
+// browser to send the cookie to every subdomain of that domain. This is the
+// correct setting for multi-subdomain deployments where the SPA and the API
+// live on different subdomains (e.g. app.example.com and api.example.com),
+// but it means that ANY subdomain — including ones you do not control or that
+// serve third-party content — will receive the refresh_token cookie.
+//
+// The startup validator (config.validateCookieDomainPolicy) enforces that a
+// leading-dot COOKIE_DOMAIN is only accepted when both COOKIE_SECURE=true and
+// COOKIE_SAMESITE=strict are set. Without those safeguards the token is
+// reachable over plain HTTP (Secure=false) or via cross-site top-level
+// navigations (SameSite=Lax), which widens the blast radius of any compromised
+// sibling subdomain.
+//
+// If you cannot guarantee that all subdomains of your domain are HTTPS-only and
+// under the same trust boundary, leave COOKIE_DOMAIN unset and accept that the
+// SPA and API must share the same exact hostname.
 func ResolveCookieDomain(cfg *config.Config) string {
 	if cfg.CookieDomain != "" {
 		return cfg.CookieDomain

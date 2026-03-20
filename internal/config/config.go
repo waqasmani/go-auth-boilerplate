@@ -18,11 +18,6 @@ type Config struct {
 	AppPort        string
 	DBDSN          string
 	SkipMigrations bool
-	// CleanupInProcess starts an in-process goroutine that purges expired
-	// refresh tokens on a fixed interval. Default false — use the dedicated
-	// cmd/cleanup CronJob instead. Setting both true causes harmless
-	// double-deletes but wastes DB write throughput.
-	CleanupInProcess bool
 
 	// JWT
 	JWTKeys     []JWTKeyConfig
@@ -71,6 +66,10 @@ type Config struct {
 	CookieDomain   string
 	CookieSameSite string
 	CookieSecure   bool
+
+	// CookieCSRF
+	CookieCSRF         string   // primary origin (FrontEndDomain)
+	CSRFTrustedOrigins []string // CSRF_TRUSTED_ORIGINS — overrides FrontEndDomain when set
 
 	// Secure Headers
 	SecHSTSEnabled    bool
@@ -211,8 +210,18 @@ func Load() (*Config, error) {
 		TOTPIssuer:             getEnv("TOTP_ISSUER", "go-auth-boilerplate"),
 		OAuthTokenKeys:         oauthTokenKeys,
 		SkipMigrations:         parseBool("SKIP_MIGRATIONS", false),
-		CleanupInProcess:       parseBool("CLEANUP_IN_PROCESS", false),
 	}
+
+	// ── CSRF trusted origins ───────────────────────────────────────────────────
+	// CSRF_TRUSTED_ORIGINS is an explicit override for multi-subdomain deployments.
+	// When absent, the single FrontEndDomain is used as the only trusted origin.
+	// When present it completely replaces the default — include FrontEndDomain
+	// explicitly in the list if it must also be trusted.
+	csrfOrigins := parseStringSlice("CSRF_TRUSTED_ORIGINS", nil)
+	if len(csrfOrigins) == 0 {
+		csrfOrigins = []string{cfg.FrontEndDomain}
+	}
+	cfg.CSRFTrustedOrigins = csrfOrigins
 
 	cfg.EmailSMTPPort, err = parseInt("EMAIL_SMTP_PORT", 587)
 	if err != nil {
@@ -272,13 +281,6 @@ func Load() (*Config, error) {
 	cfg.RateLimitTTL, err = parseDuration("RATE_LIMIT_TTL", "10m")
 	if err != nil {
 		return nil, fmt.Errorf("config: %w", err)
-	}
-
-	// ── Production CORS guard ──────────────────────────────────────────────────
-	if appEnv == "production" {
-		if err := validateProductionCORSOrigins(cfg.CORSAllowedOrigins); err != nil {
-			return nil, fmt.Errorf("config: %w", err)
-		}
 	}
 
 	// ── Cookie policy ──────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@
 //
 // # Tables purged
 //
-//   - refresh_tokens      — rows whose expires_at is in the past.
+//   - refresh_tokens       — rows whose expires_at is in the past.
 //   - oauth_linking_states — rows whose expires_at is in the past.
 //   - oauth_one_time_codes — rows whose expires_at is in the past AND whose
 //     used_at is NOT NULL (unused-but-expired codes are also purged since they
@@ -23,10 +23,16 @@
 //
 // A context cancellation or deadline in one pass aborts that pass and the
 // entire job (a cancelled context means the CronJob's deadline has expired —
-// continuing is pointless). All other errors are collected; the job continues
-// with remaining passes and returns a combined error at the end so that a
-// transient failure on one table does not prevent cleanup of the others. The
-// caller (cmd/cleanup/main.go) converts a non-nil error into exit code 1.
+// continuing is pointless). All other errors are collected as structured
+// PassError values; the job continues with remaining passes and returns a
+// *RunError at the end so that a transient failure on one table does not
+// prevent cleanup of the others.
+//
+// Each PassError carries the table name and the number of rows deleted before
+// the failure occurred, so log aggregators (Datadog, Loki, CloudWatch Insights)
+// can index them as discrete structured events rather than parsing a flat
+// joined string. The caller (cmd/cleanup/main.go) converts a non-nil error
+// into exit code 1.
 package cleanup
 
 import (
@@ -36,11 +42,68 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"go.uber.org/zap"
 )
 
 const defaultBatchSize = 10_000
+
+// ── Structured error types ────────────────────────────────────────────────────
+
+// PassError records the outcome of a single cleanup pass that encountered an
+// error. It carries the table name and the row count deleted before failure so
+// callers can log discrete structured events without parsing a joined string.
+type PassError struct {
+	// Table is the database table the pass was targeting.
+	Table string
+	// Deleted is the number of rows successfully removed before the error
+	// occurred. Zero when the very first batch failed before deleting anything.
+	// Non-zero on a partial run — useful for diagnosing whether a table is
+	// growing faster than cleanup can keep up.
+	Deleted int64
+	// Err is the underlying cause, preserved for errors.Is / errors.As.
+	Err error
+}
+
+func (e *PassError) Error() string {
+	return fmt.Sprintf("cleanup: %s (deleted %d before error): %v", e.Table, e.Deleted, e.Err)
+}
+
+// Unwrap lets errors.Is and errors.As traverse into the underlying cause.
+func (e *PassError) Unwrap() error { return e.Err }
+
+// RunError is returned by Job.Run when one or more passes fail. It holds the
+// full slice of PassError values so callers can log each failure as a separate
+// structured event and aggregators can index them individually.
+//
+// It implements the multi-error Unwrap protocol introduced in Go 1.20 so
+// errors.Is / errors.As can traverse all underlying causes.
+type RunError struct {
+	// Failures contains one PassError per failed pass, in execution order.
+	// Passes that completed successfully are not included.
+	Failures []*PassError
+}
+
+func (e *RunError) Error() string {
+	msgs := make([]string, len(e.Failures))
+	for i, f := range e.Failures {
+		msgs[i] = f.Error()
+	}
+	return strings.Join(msgs, "; ")
+}
+
+// Unwrap returns the slice of underlying errors, satisfying the multi-error
+// interface so errors.Is / errors.As traverse every PassError in Failures.
+func (e *RunError) Unwrap() []error {
+	errs := make([]error, len(e.Failures))
+	for i, f := range e.Failures {
+		errs[i] = f
+	}
+	return errs
+}
+
+// ── Job ───────────────────────────────────────────────────────────────────────
 
 // Job purges expired rows from token tables. Construct via NewJob.
 type Job struct {
@@ -67,16 +130,22 @@ func NewJob(db *sql.DB, log *zap.Logger) *Job {
 }
 
 // pass groups a table name with its delete function so Run can iterate
-// uniformly. A context error aborts the whole job; any other error is
-// accumulated so remaining passes still execute.
+// uniformly.
 type pass struct {
 	name string
 	fn   func(context.Context) (int64, error)
 }
 
-// Run executes all cleanup passes in order. Context cancellation stops the
-// entire job immediately; other pass errors are accumulated. Returns a non-nil
-// error when any pass fails.
+// Run executes all cleanup passes in order.
+//
+// Each pass failure is logged immediately as a structured event with
+// zap.String("table") and zap.Int64("deleted_before_error") so log
+// aggregators can index and alert on individual tables without parsing a
+// joined error string.
+//
+// Context cancellation aborts the job immediately; all other errors are
+// collected and the remaining passes still execute. Returns *RunError when any
+// pass failed, nil when all passes completed successfully.
 func (j *Job) Run(ctx context.Context) error {
 	passes := []pass{
 		{"refresh_tokens", j.purgeRefreshTokens},
@@ -84,33 +153,47 @@ func (j *Job) Run(ctx context.Context) error {
 		{"oauth_one_time_codes", j.purgeOneTimeCodes},
 	}
 
-	var errs []error
+	var failures []*PassError
+
 	for _, p := range passes {
 		n, err := p.fn(ctx)
 		if err != nil {
+			pe := &PassError{Table: p.name, Deleted: n, Err: err}
+
 			// Context errors mean the overall deadline has expired — abort now
 			// rather than attempting further passes that will also fail.
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				j.log.Error("cleanup: context expired — aborting remaining passes",
 					zap.String("table", p.name),
+					zap.Int64("deleted_before_abort", n),
 					zap.Error(err),
 				)
-				errs = append(errs, fmt.Errorf("%s: %w", p.name, err))
+				failures = append(failures, pe)
 				break
 			}
+
+			// Non-context error: log a discrete structured event per table so
+			// Datadog / Loki can index table and deleted_before_error as
+			// individual fields rather than parsing a flat joined string.
 			j.log.Error("cleanup: pass failed — continuing with remaining passes",
 				zap.String("table", p.name),
+				zap.Int64("deleted_before_error", n),
 				zap.Error(err),
 			)
-			errs = append(errs, fmt.Errorf("%s: %w", p.name, err))
+			failures = append(failures, pe)
 			continue
 		}
+
 		j.log.Info("cleanup: pass complete",
 			zap.String("table", p.name),
 			zap.Int64("deleted", n),
 		)
 	}
-	return errors.Join(errs...)
+
+	if len(failures) == 0 {
+		return nil
+	}
+	return &RunError{Failures: failures}
 }
 
 // ── Per-table passes ──────────────────────────────────────────────────────────
@@ -157,7 +240,9 @@ func (j *Job) purgeOneTimeCodes(ctx context.Context) (int64, error) {
 
 // deleteBatched executes query in a loop, passing j.batchSize as the LIMIT
 // argument, until fewer rows than batchSize are deleted in a single batch
-// (which means the table is clean). Returns the total number of deleted rows.
+// (which means the table is clean). Returns the total number of deleted rows
+// and the first error encountered; the total is accurate up to the point of
+// failure so PassError can report partial progress.
 //
 // Context is checked before each batch: a cancelled or timed-out context
 // causes an immediate return so the caller can abort cleanly.

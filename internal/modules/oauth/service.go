@@ -131,33 +131,6 @@ func (s *service) BuildAuthURL(ctx context.Context, provider, redirectURL string
 }
 
 // ── HandleCallback ─────────────────────────────────────────────────────────────
-//
-// Gate order (must not be changed):
-//
-//  1. Validate state signature and expiry  — reject CSRF first, cheaply.
-//  2. Exchange code for tokens             — only after state is valid.
-//  3. Fetch user info                      — only after tokens are valid.
-//  4. Verify email is confirmed            — for providers that guarantee it.
-//  5. Look up existing OAuth account       — fast path (returning user).
-//  6. Email-collision detection            — only for email-verifying providers.
-//  7. Create new user + OAuth account      — atomically in a transaction.
-//
-// Step 7 — email verification flag:
-//
-//	emailVerified = p.VerifiesEmail() && userInfo.Verified
-//
-// This flag is passed to CreateOAuthOnlyUser, which selects between two SQL
-// queries:
-//
-//   - true  → CreateOAuthUser:           stores the real email,
-//     sets email_verified_at = NOW().
-//   - false → CreateOAuthUserUnverified: stores a UUID placeholder
-//     ("<newUserID>@oauth.invalid") as the email,
-//     leaves email_verified_at = NULL.
-//
-// Without this distinction a Facebook user whose unverified email is not
-// already in the database receives a pre-verified local account backed by an
-// address they may not own.
 func (s *service) HandleCallback(ctx context.Context, provider, code, rawState string) (*CallbackResponse, error) {
 	s.auditLog.Log(ctx, eventLoginAttempt, "", zap.String("provider", provider))
 
@@ -182,6 +155,18 @@ func (s *service) HandleCallback(ctx context.Context, provider, code, rawState s
 
 	redirectURL := oauthState.RedirectURL
 	isMobile := isCustomScheme(redirectURL)
+
+	// ── Pre-generate the one-time code for mobile paths ────────────────────────
+	// Generated here, before any DB writes, so the hash can be committed
+	// atomically with account creation. The plaintext is returned to the caller
+	// only after all DB writes succeed.
+	var mobileCodePlain, mobileCodeHash string
+	if isMobile {
+		mobileCodePlain, mobileCodeHash, err = generateOneTimeCode()
+		if err != nil {
+			return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
+		}
+	}
 
 	// ── 2. Exchange code for tokens ────────────────────────────────────────────
 	tok, err := p.Config().Exchange(ctx, code,
@@ -208,9 +193,6 @@ func (s *service) HandleCallback(ctx context.Context, provider, code, rawState s
 	}
 
 	// ── 4. Email verification gate ─────────────────────────────────────────────
-	// Only enforced when the provider guarantees email ownership (e.g. Google).
-	// Facebook returns Verified=false for public apps and VerifiesEmail()=false,
-	// so we skip both the gate and email-based identity matching for Facebook.
 	if p.VerifiesEmail() && !userInfo.Verified {
 		s.log.Info("oauth: provider returned unverified email",
 			zap.String("provider", provider),
@@ -254,11 +236,30 @@ func (s *service) HandleCallback(ctx context.Context, provider, code, rawState s
 		}
 
 		if isMobile {
+			// Store the pre-generated code in a standalone insert.
+			// This is not inside the UpdateOAuthTokens path (that update is
+			// non-critical / best-effort). A failure here is returned to the
+			// caller so the handler does not redirect without a valid code.
+			if err := s.repo.StoreOneTimeCode(ctx, dbpkg.StoreOneTimeCodeParams{
+				ID:        uuid.NewString(),
+				UserID:    existing.UserID,
+				CodeHash:  mobileCodeHash,
+				ExpiresAt: time.Now().UTC().Add(oneTimeCodeTTL),
+			}); err != nil {
+				s.auditLog.Log(ctx, eventLoginFailed, existing.UserID,
+					zap.String("reason", "store_one_time_code_failed"),
+				)
+				return nil, err
+			}
 			s.auditLog.Log(ctx, eventLoginSuccess, existing.UserID,
 				zap.String("provider", provider),
 				zap.String("platform", "mobile"),
 			)
-			return &CallbackResponse{UserID: existing.UserID, RedirectURL: redirectURL}, nil
+			return &CallbackResponse{
+				UserID:      existing.UserID,
+				RedirectURL: redirectURL,
+				OneTimeCode: mobileCodePlain,
+			}, nil
 		}
 
 		session, err := s.tokenIssuer.IssueTokensForUser(ctx, existing.UserID)
@@ -279,11 +280,6 @@ func (s *service) HandleCallback(ctx context.Context, provider, code, rawState s
 	}
 
 	// ── 6. Email-collision detection ───────────────────────────────────────────
-	// Only attempted for providers that verify email (VerifiesEmail()=true).
-	// For Facebook (VerifiesEmail()=false) the email is not verified, so we
-	// must not use it for identity matching — an attacker could register a
-	// Facebook account with a victim's email to trigger a collision path and
-	// probe account existence.
 	if p.VerifiesEmail() && userInfo.Email != "" {
 		existingUserID, emailExists, err := s.repo.GetUserByEmail(ctx, userInfo.Email)
 		if err != nil {
@@ -310,39 +306,39 @@ func (s *service) HandleCallback(ctx context.Context, provider, code, rawState s
 		}
 	}
 
-	// ── 7. New user — create account + OAuth identity atomically ──────────────
-	//
-	// emailVerified is the single boolean that drives which SQL query is used
-	// inside CreateOAuthOnlyUser:
-	//
-	//   true  → CreateOAuthUser (stores real email, stamps email_verified_at).
-	//   false → CreateOAuthUserUnverified (stores UUID placeholder as email,
-	//           leaves email_verified_at NULL).
-	//
-	// For Facebook (VerifiesEmail()=false), userInfo.Verified is always false,
-	// so emailVerified is always false regardless of what the API returned.
-	// For Google (VerifiesEmail()=true), we additionally check userInfo.Verified
-	// — gate 4 above already rejected profiles where this is false, but we
-	// evaluate it here defensively to make the invariant explicit.
+	// ── 7. New user — create account + OAuth identity + optional code atomically
 	emailVerified := p.VerifiesEmail() && userInfo.Verified
-
 	newUserID := uuid.NewString()
+
 	err = s.repo.WithTx(ctx, func(tx Repository) error {
 		if err := tx.CreateOAuthOnlyUser(ctx, newUserID, userInfo.Email, userInfo.Name, emailVerified); err != nil {
 			return err
 		}
-		return tx.CreateOAuthAccount(ctx, CreateOAuthAccountParams{
+		if err := tx.CreateOAuthAccount(ctx, CreateOAuthAccountParams{
 			ID:                    uuid.NewString(),
 			UserID:                newUserID,
 			Provider:              provider,
 			ProviderID:            userInfo.ProviderID,
-			ProviderEmail:         userInfo.Email, // display only; not used for identity
+			ProviderEmail:         userInfo.Email,
 			ProviderName:          userInfo.Name,
 			AccessTokenEncrypted:  encAccess,
 			RefreshTokenEncrypted: encRefresh,
 			TokenExpiresAt:        tokenExpiry,
 			EncKeyID:              s.tokenKeySet.ActiveKeyID(),
-		})
+		}); err != nil {
+			return err
+		}
+		// For new mobile users, commit the one-time code in the same transaction.
+		// If this rolls back, the user is not created either — no orphaned account.
+		if isMobile {
+			return tx.StoreOneTimeCode(ctx, dbpkg.StoreOneTimeCodeParams{
+				ID:        uuid.NewString(),
+				UserID:    newUserID,
+				CodeHash:  mobileCodeHash,
+				ExpiresAt: time.Now().UTC().Add(oneTimeCodeTTL),
+			})
+		}
+		return nil
 	})
 	if err != nil {
 		if isEmailConflict(err) {
@@ -367,16 +363,13 @@ func (s *service) HandleCallback(ctx context.Context, provider, code, rawState s
 			zap.String("provider", provider),
 			zap.String("flow", "new_user_mobile"),
 		)
-		return &CallbackResponse{UserID: newUserID, RedirectURL: redirectURL}, nil
+		return &CallbackResponse{
+			UserID:      newUserID,
+			RedirectURL: redirectURL,
+			OneTimeCode: mobileCodePlain,
+		}, nil
 	}
 
-	// For email-verified users (e.g. Google), IssueTokensForUser will find
-	// email_verified_at = NOW() and grant a session immediately.
-	//
-	// For unverified users (e.g. Facebook), IssueTokensForUser will find
-	// email_verified_at = NULL and return ErrEmailNotVerified. The handler
-	// surfaces this as HTTP 403 with code EMAIL_NOT_VERIFIED, prompting the
-	// client to guide the user to their inbox.
 	session, err := s.tokenIssuer.IssueTokensForUser(ctx, newUserID)
 	if err != nil {
 		s.auditLog.Log(ctx, eventLoginFailed, newUserID,
@@ -395,30 +388,37 @@ func (s *service) HandleCallback(ctx context.Context, provider, code, rawState s
 	}, nil
 }
 
-// ── IssueOneTimeCode ───────────────────────────────────────────────────────────
-
-func (s *service) IssueOneTimeCode(ctx context.Context, userID string) (string, error) {
+// generateOneTimeCode returns a cryptographically random plaintext code and
+// its SHA-256 hex hash. Extracted so it can be called before DB writes, letting
+// the hash be committed atomically with account creation.
+func generateOneTimeCode() (plaintext, codeHash string, err error) {
 	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		return "", apperrors.Wrap(apperrors.ErrInternalServer,
-			fmt.Errorf("oauth: generate one-time code: %w", err))
+	if _, err = rand.Read(raw); err != nil {
+		return "", "", fmt.Errorf("oauth: generate one-time code: %w", err)
 	}
-	plaintext := hex.EncodeToString(raw)
-
+	plaintext = hex.EncodeToString(raw)
 	sum := sha256.Sum256([]byte(plaintext))
-	codeHash := hex.EncodeToString(sum[:])
+	codeHash = hex.EncodeToString(sum[:])
+	return plaintext, codeHash, nil
+}
 
+// IssueOneTimeCode remains available for non-callback callers.
+// The Callback handler uses HandleCallback's pre-generated code instead.
+func (s *service) IssueOneTimeCode(ctx context.Context, userID string) (string, error) {
+	plain, hash, err := generateOneTimeCode()
+	if err != nil {
+		return "", apperrors.Wrap(apperrors.ErrInternalServer, err)
+	}
 	if err := s.repo.StoreOneTimeCode(ctx, dbpkg.StoreOneTimeCodeParams{
 		ID:        uuid.NewString(),
 		UserID:    userID,
-		CodeHash:  codeHash,
+		CodeHash:  hash,
 		ExpiresAt: time.Now().UTC().Add(oneTimeCodeTTL),
 	}); err != nil {
 		return "", err
 	}
-
 	s.log.Debug("oauth: one-time code issued", zap.String("user_id", userID))
-	return plaintext, nil
+	return plain, nil
 }
 
 // ── ExchangeOneTimeCode ────────────────────────────────────────────────────────

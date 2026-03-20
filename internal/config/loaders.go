@@ -321,26 +321,3 @@ func validateCookieDomain(cookieDomain, frontendHostname string) error {
 		cookieDomain, frontendHostname,
 	)
 }
-
-// ── Production CORS validation ───────────────────────────────────────────────
-func validateProductionCORSOrigins(origins []string) error {
-	forbiddenPrefixes := []string{
-		"http://localhost",
-		"https://localhost",
-		"http://127.0.0.1",
-		"https://127.0.0.1",
-	}
-	for _, origin := range origins {
-		for _, prefix := range forbiddenPrefixes {
-			if strings.HasPrefix(strings.ToLower(origin), prefix) {
-				return fmt.Errorf(
-					"CORS_ALLOWED_ORIGINS contains a localhost/loopback origin (%q) in production — "+
-						"set CORS_ALLOWED_ORIGINS to your real frontend domain(s) "+
-						"(e.g. https://app.example.com)",
-					origin,
-				)
-			}
-		}
-	}
-	return nil
-}
