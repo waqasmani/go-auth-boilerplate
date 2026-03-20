@@ -1,0 +1,1 @@
+DROP TABLE IF EXISTS oauth_one_time_codes;

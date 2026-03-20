@@ -225,6 +225,29 @@ type Mailer struct {
 	stopped bool
 	onErr   func(Message, error)
 
+	// finished is closed by the single drain goroutine that Shutdown starts
+	// exactly once (inside once.Do). Every Shutdown caller — including
+	// concurrent or repeated callers — selects on this shared channel rather
+	// than constructing a new one per call.
+	//
+	// Why a struct field instead of a local variable:
+	//
+	// If Shutdown is called twice and the first caller times out, it spawns a
+	// goroutine (wg.Wait → close(localFinished)) that outlives the first call.
+	// The second caller constructs its own goroutine and its own local channel.
+	// Now two goroutines race on wg.Wait; when workers finish, both goroutines
+	// unblock and each closes its own local channel — the second caller waits
+	// on the correct channel, but the first caller's goroutine leaks until
+	// wg.Wait returns and then closes a channel no one reads. With more
+	// Shutdown calls (e.g. repeated deferred cleanup), goroutines accumulate.
+	//
+	// With a struct-field channel started once inside once.Do, there is
+	// exactly one drain goroutine for the lifetime of the Mailer. A caller
+	// whose ctx expires returns an error but does not leak a goroutine.
+	// The next Shutdown call selects on the same m.finished and honours its
+	// own ctx deadline correctly.
+	finished chan struct{}
+
 	// retryBase is the initial back-off delay before the first retry.
 	// It defaults to defaultRetryBase and may be set to zero in tests to
 	// make retry loops instant without changing any observable behaviour.
@@ -260,6 +283,7 @@ func New(cfg Config, opts ...Option) (*Mailer, error) {
 		cfg:       cfg,
 		queue:     make(chan msgWithContext, o.queueSize),
 		done:      make(chan struct{}),
+		finished:  make(chan struct{}),
 		onErr:     o.onErr,
 		retryBase: defaultRetryBase,
 		dialSMTP:  defaultDialSMTP,
@@ -317,26 +341,47 @@ func (m *Mailer) Enqueue(ctx context.Context, msg Message) error {
 }
 
 // Shutdown signals workers to stop accepting new messages and waits until all
-// in-flight and queued sends are complete. It returns an error if ctx expires
-// before the drain finishes.
+// in-flight and queued sends are complete, or until ctx is cancelled.
+//
+// It is safe to call Shutdown concurrently or repeatedly. The first call
+// closes m.done (signalling all workers) and starts a single drain goroutine
+// that closes m.finished when all workers have exited. Every call — including
+// the first — then selects on that shared channel:
+//
+//   - If drain completes before ctx expires → return nil.
+//   - If ctx expires first → return a timeout error.
+//
+// Importantly, a timed-out first caller does not spawn any lingering goroutine.
+// The drain goroutine started inside once.Do runs to completion regardless of
+// how many Shutdown callers have already returned, so the next caller that
+// provides a sufficient deadline will see the correct outcome.
 func (m *Mailer) Shutdown(ctx context.Context) error {
 	m.once.Do(func() {
-		// The write lock must span both mutations. Releasing early would reopen
-		// the TOCTOU window that the RLock in Enqueue is designed to close.
+		// Phase 1: prevent new Enqueue calls and signal workers to drain.
+		// The write lock must span both mutations. Releasing it early would
+		// reopen the TOCTOU window that the RLock in Enqueue is designed to
+		// close.
 		m.mu.Lock()
 		m.stopped = true
 		close(m.done)
 		m.mu.Unlock()
+
+		// Phase 2: start exactly one drain goroutine. It waits for all workers
+		// to finish their current send and the drain loop, then closes
+		// m.finished so every Shutdown caller — present and future — unblocks.
+		//
+		// This goroutine is started inside once.Do so it runs exactly once per
+		// Mailer lifetime. Subsequent Shutdown calls skip this block entirely
+		// and proceed directly to the select below, where they wait on the same
+		// m.finished channel.
+		go func() {
+			m.wg.Wait()
+			close(m.finished)
+		}()
 	})
 
-	finished := make(chan struct{})
-	go func() {
-		m.wg.Wait()
-		close(finished)
-	}()
-
 	select {
-	case <-finished:
+	case <-m.finished:
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("mailer: shutdown timed out: %w", ctx.Err())

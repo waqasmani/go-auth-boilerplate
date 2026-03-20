@@ -11,6 +11,25 @@ import (
 	"time"
 )
 
+const clearEmailVerified = `-- name: ClearEmailVerified :exec
+UPDATE users
+SET
+    email_verified_at = NULL,
+    updated_at        = NOW()
+WHERE
+    id = ?
+`
+
+// Clears email_verified_at after a password reset so the account must
+// re-confirm inbox ownership before logging in again. This closes the
+// window where an attacker who hijacked the victim's inbox resets the
+// password and immediately inherits a verified, session-capable account.
+// Idempotent: safe to call when the column is already NULL.
+func (q *Queries) ClearEmailVerified(ctx context.Context, id string) error {
+	_, err := q.exec(ctx, q.clearEmailVerifiedStmt, clearEmailVerified, id)
+	return err
+}
+
 const consumeEmailToken = `-- name: ConsumeEmailToken :execresult
 UPDATE email_tokens
 SET

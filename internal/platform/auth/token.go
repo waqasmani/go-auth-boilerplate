@@ -1,6 +1,8 @@
 package auth
 
-import "time"
+import (
+	"time"
+)
 
 // SessionTokens is the token-pair shape shared between the auth and auth_email
 // modules. Defined here — the one package both modules already import — so

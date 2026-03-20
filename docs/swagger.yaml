@@ -39,6 +39,15 @@ definitions:
     required:
     - refresh_token
     type: object
+  internal_modules_auth.MFAChallengeResponse:
+    properties:
+      expires_at:
+        type: string
+      mfa_token:
+        type: string
+      requires_mfa:
+        type: boolean
+    type: object
   internal_modules_auth.RefreshRequest:
     properties:
       refresh_token:
@@ -55,7 +64,7 @@ definitions:
         minLength: 2
         type: string
       password:
-        maxLength: 72
+        maxLength: 128
         minLength: 12
         type: string
     required:
@@ -75,6 +84,77 @@ definitions:
         type: string
       token_type:
         type: string
+    type: object
+  internal_modules_auth_email.EnableTOTPRequest:
+    properties:
+      code:
+        type: string
+    required:
+    - code
+    type: object
+  internal_modules_auth_email.ForgotPasswordRequest:
+    properties:
+      email:
+        type: string
+    required:
+    - email
+    type: object
+  internal_modules_auth_email.OTPTokenResponse:
+    properties:
+      access_token:
+        type: string
+      access_token_expires_at:
+        type: string
+      refresh_token:
+        type: string
+      refresh_token_expires_at:
+        type: string
+      token_type:
+        type: string
+    type: object
+  internal_modules_auth_email.ResendVerificationRequest:
+    properties:
+      email:
+        type: string
+    required:
+    - email
+    type: object
+  internal_modules_auth_email.ResetPasswordRequest:
+    properties:
+      new_password:
+        maxLength: 128
+        minLength: 12
+        type: string
+      token:
+        type: string
+    required:
+    - new_password
+    - token
+    type: object
+  internal_modules_auth_email.TOTPSetupResponse:
+    properties:
+      qr_base64:
+        type: string
+      secret:
+        type: string
+      uri:
+        type: string
+    type: object
+  internal_modules_auth_email.VerifyEmailRequest:
+    properties:
+      token:
+        type: string
+    required:
+    - token
+    type: object
+  internal_modules_auth_email.VerifyOTPRequest:
+    properties:
+      code:
+        type: string
+      mfa_token:
+        type: string
+    required:
+    - code
     type: object
   internal_modules_users.UserResponse:
     properties:
@@ -104,10 +184,35 @@ info:
   title: Go Auth Boilerplate API
   version: "1.0"
 paths:
+  /auth/forgot-password:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Email address
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_modules_auth_email.ForgotPasswordRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+      summary: Request a password-reset email
+      tags:
+      - auth-email
   /auth/login:
     post:
       consumes:
       - application/json
+      description: |-
+        Returns TokenResponse for normal accounts. Returns MFAChallengeResponse
+        (requires_mfa: true) when the account has 2FA enabled — the client must
+        then POST { code, mfa_token } to /auth/otp/verify to receive tokens.
       parameters:
       - description: Login payload
         in: body
@@ -125,8 +230,16 @@ paths:
             - $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
             - properties:
                 data:
-                  $ref: '#/definitions/internal_modules_auth.TokenResponse'
+                  $ref: '#/definitions/internal_modules_auth.MFAChallengeResponse'
               type: object
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+        "403":
+          description: Email not verified or 2FA required
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
       summary: Login
       tags:
       - auth
@@ -149,6 +262,138 @@ paths:
       summary: Logout (revoke refresh token family)
       tags:
       - auth
+  /auth/mfa/totp/disable:
+    post:
+      description: |-
+        Clears the stored TOTP secret and sets mfa_method='email'.
+        two_fa_enabled is preserved; the account continues to use email OTP.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+      security:
+      - BearerAuth: []
+      summary: Disable TOTP and revert to email OTP (authenticated)
+      tags:
+      - auth-mfa
+  /auth/mfa/totp/enable:
+    post:
+      consumes:
+      - application/json
+      description: |-
+        Verifies that the user possesses the secret from SetupTOTP,
+        then sets mfa_method='totp' and two_fa_enabled=true.
+      parameters:
+      - description: Confirmation code from authenticator app
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_modules_auth_email.EnableTOTPRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+        "422":
+          description: Code incorrect or TOTP not set up
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+      security:
+      - BearerAuth: []
+      summary: Activate TOTP with a confirmation code (authenticated)
+      tags:
+      - auth-mfa
+  /auth/mfa/totp/setup:
+    post:
+      description: |-
+        Stores an encrypted pending TOTP secret for the account.
+        The secret is NOT activated until POST /auth/mfa/totp/enable confirms it.
+        The qr_base64 field is a PNG encoded as base64 — render it as:
+        <img src="data:image/png;base64,{qr_base64}">
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            allOf:
+            - $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+            - properties:
+                data:
+                  $ref: '#/definitions/internal_modules_auth_email.TOTPSetupResponse'
+              type: object
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+      security:
+      - BearerAuth: []
+      summary: Generate a TOTP secret and QR code (authenticated)
+      tags:
+      - auth-mfa
+  /auth/otp/send:
+    post:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+      security:
+      - BearerAuth: []
+      summary: Send a 2FA one-time passcode (authenticated)
+      tags:
+      - auth-email
+  /auth/otp/verify:
+    post:
+      consumes:
+      - application/json
+      description: |-
+        When mfa_token is present: the server checks the user's mfa_method
+        automatically. For email-OTP users, validates the emailed code. For
+        TOTP users, validates the time-based code from their authenticator app.
+        On success, returns a full token pair and sets the refresh-token cookie.
+        When mfa_token is absent: validates and consumes an email OTP only.
+      parameters:
+      - description: OTP code and optional MFA challenge token
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_modules_auth_email.VerifyOTPRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Standalone OTP verified
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+      summary: Verify OTP — standalone check or MFA login completion
+      tags:
+      - auth-email
   /auth/refresh:
     post:
       consumes:
@@ -179,6 +424,10 @@ paths:
     post:
       consumes:
       - application/json
+      description: |-
+        Creates the account and sends a verification email.
+        No session tokens are issued — the user must verify their inbox
+        and then log in via POST /auth/login.
       parameters:
       - description: Registration payload
         in: body
@@ -189,18 +438,110 @@ paths:
       produces:
       - application/json
       responses:
-        "201":
-          description: Created
+        "202":
+          description: Accepted
           schema:
-            allOf:
-            - $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
-            - properties:
-                data:
-                  $ref: '#/definitions/internal_modules_auth.TokenResponse'
-              type: object
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+        "409":
+          description: Email already registered
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+        "422":
+          description: Validation error
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
       summary: Register a new user
       tags:
       - auth
+  /auth/resend-verification:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Email address
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_modules_auth_email.ResendVerificationRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+      summary: Resend email-verification link (unauthenticated)
+      tags:
+      - auth-email
+  /auth/reset-password:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Reset token and new password
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_modules_auth_email.ResetPasswordRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+      summary: Reset password using a one-time token
+      tags:
+      - auth-email
+  /auth/send-verification:
+    post:
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+      security:
+      - BearerAuth: []
+      summary: Send or resend the email-verification link (authenticated)
+      tags:
+      - auth-email
+  /auth/verify-email:
+    post:
+      consumes:
+      - application/json
+      parameters:
+      - description: Verification token
+        in: body
+        name: body
+        required: true
+        schema:
+          $ref: '#/definitions/internal_modules_auth_email.VerifyEmailRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OK
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+        "401":
+          description: Unauthorized
+          schema:
+            $ref: '#/definitions/github_com_waqasmani_go-auth-boilerplate_internal_response.Response'
+      summary: Verify email address using a one-time token
+      tags:
+      - auth-email
   /users/me:
     get:
       produces:

@@ -14,49 +14,185 @@ type Querier interface {
 	// The LIMIT 1 is defensive — role names are UNIQUE but this makes the intent
 	// explicit and prevents a runaway insert if that constraint were ever dropped.
 	AssignUserRoleByName(ctx context.Context, arg AssignUserRoleByNameParams) (sql.Result, error)
+	// Clears email_verified_at after a password reset so the account must
+	// re-confirm inbox ownership before logging in again. This closes the
+	// window where an attacker who hijacked the victim's inbox resets the
+	// password and immediately inherits a verified, session-capable account.
+	// Idempotent: safe to call when the column is already NULL.
+	ClearEmailVerified(ctx context.Context, id string) error
 	// Atomically marks a token as used. The WHERE guard ensures exactly
 	// one concurrent caller gets RowsAffected = 1; any racing caller gets
 	// 0, which the service treats as a replay attempt.
 	ConsumeEmailToken(ctx context.Context, id string) (sql.Result, error)
+	// Atomically reads and deletes a linking state row. The FOR UPDATE lock
+	// serialises concurrent requests on the same nonce; only the first caller
+	// gets a row — all others get sql.ErrNoRows (→ ErrInvalidLinkingToken).
+	// This query must be executed inside a transaction by the caller.
+	ConsumeLinkingState(ctx context.Context, nonce string) (ConsumeLinkingStateRow, error)
 	// Atomically marks a refresh token as used in a single UPDATE.
 	// The WHERE used_at IS NULL guard means exactly one concurrent caller
 	// will get RowsAffected = 1; every other caller racing on the same token
 	// gets RowsAffected = 0, which the service layer treats as token reuse.
 	ConsumeRefreshToken(ctx context.Context, id string) (sql.Result, error)
+	// Used by the startup health-check in app.go to verify that required roles
+	// have been seeded before the server begins accepting traffic.
+	// Returns 0 when the role is absent, 1 when it exists.
+	CountRoleByName(ctx context.Context, name string) (int64, error)
 	// Inserts a new email token record. The raw token is never stored;
 	// only the SHA-256 hex hash (CHAR(64)) is persisted, matching the
 	// same pattern as refresh_tokens.
 	CreateEmailToken(ctx context.Context, arg CreateEmailTokenParams) error
+	// OAuth queries for user_oauth_accounts and oauth_linking_states.
+	//
+	// After any change to this file, regenerate the Go data-access layer with:
+	//
+	//   sqlc generate
+	//
+	// from the repository root (requires sqlc ≥ 1.25 and a running MySQL instance
+	// or the mysql8 engine in sqlc Cloud).
+	CreateOAuthAccount(ctx context.Context, arg CreateOAuthAccountParams) error
+	// Creates a new OAuth-only user whose email address has been confirmed by the
+	// provider (e.g. Google with email_verified=true). email_verified_at is
+	// stamped NOW() so the Login gate allows this user without a verification step.
+	// password_hash is empty because OAuth users never authenticate with a password.
+	CreateOAuthUser(ctx context.Context, arg CreateOAuthUserParams) error
+	// Creates a new OAuth-only user for providers that do NOT guarantee email
+	// ownership (e.g. Facebook public-app tier, where VerifiesEmail()=false).
+	//
+	// Security design:
+	//   - email stores a UUID-based placeholder ("<userID>@oauth.invalid") rather
+	//     than the provider's unverified address. The .invalid TLD is reserved by
+	//     RFC 2606 and can never resolve or collide with a real address. This
+	//     satisfies the NOT NULL + UNIQUE constraint on users.email without
+	//     implying the address was confirmed.
+	//   - email_verified_at is omitted (defaults to NULL) so the Login gate
+	//     (service.Login checks user.EmailVerified) routes this user through the
+	//     email-verification flow before granting a session. Without this, an
+	//     attacker who creates a Facebook account with an email they do not own
+	//     would receive a pre-verified local account.
+	//   - The actual provider email, if any, is stored in
+	//     user_oauth_accounts.provider_email for display purposes only. It must
+	//     never be used for identity matching or treated as verified.
+	CreateOAuthUserUnverified(ctx context.Context, arg CreateOAuthUserUnverifiedParams) error
 	CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) error
 	CreateUser(ctx context.Context, arg CreateUserParams) error
+	// Deletes the consumed nonce. Must be called in the same transaction as
+	// ConsumeLinkingState immediately after a successful SELECT … FOR UPDATE.
+	DeleteLinkingState(ctx context.Context, nonce string) error
+	// Reverts the user to email OTP and clears the stored secret.
+	// two_fa_enabled is set to 0 so the Login gate (which checks two_fa_enabled)
+	// no longer routes this user through the MFA challenge path. Without this,
+	// mfa_method and two_fa_enabled would desync: mfa_method='email' but
+	// two_fa_enabled=1 causes Login to issue an MFA challenge, InitiateChallenge
+	// dispatches to the email-OTP branch, but no OTP token was ever created for
+	// this login attempt — producing an infinite challenge loop with no valid
+	// redemption path until the challenge token expires (5 minutes).
+	DisableUserTOTP(ctx context.Context, id string) error
+	// Activates TOTP after the user confirms possession of the secret.
+	EnableUserTOTP(ctx context.Context, id string) error
 	// Retrieves the full token record by its SHA-256 hex hash so the
 	// service layer can inspect used_at / expires_at before consuming it.
 	// No WHERE used_at IS NULL filter — the service layer decides which
 	// state transitions are valid for each token_type.
 	GetEmailTokenByHash(ctx context.Context, tokenHash string) (EmailToken, error)
-	// BUG FIX: removed `AND revoked_at IS NULL` — the previous filter made the
-	// token.RevokedAt.Valid checks in auth/service.go unreachable dead code.
-	// The application layer now receives the full record and returns the correct
-	// typed error (ErrTokenRevoked vs ErrTokenInvalid) for each case.
+	GetOAuthAccountByProviderID(ctx context.Context, arg GetOAuthAccountByProviderIDParams) (UserOauthAccount, error)
+	GetOAuthAccountByUserIDAndProvider(ctx context.Context, arg GetOAuthAccountByUserIDAndProviderParams) (UserOauthAccount, error)
+	// Retrieves and row-locks the code record for the duration of the surrounding
+	// transaction. Must be called from within an explicit BEGIN transaction.
+	// Returns sql.ErrNoRows when no matching code exists, which the repository
+	// maps to ErrInvalidOneTimeCode (unknown / expired / already used are all
+	// collapsed into one error to prevent oracle attacks).
+	GetOneTimeCodeForUpdate(ctx context.Context, codeHash string) (OauthOneTimeCode, error)
 	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (RefreshToken, error)
+	// Retrieves the token row and acquires an InnoDB row-level write lock (FOR
+	// UPDATE) for the duration of the calling transaction. The lock prevents any
+	// concurrent transaction from modifying used_at or revoked_at between this
+	// SELECT and the subsequent ConsumeRefreshToken UPDATE, closing the TOCTOU
+	// window that existed when state checks happened on the pre-transaction
+	// non-locking read.
+	//
+	// MUST be called inside an explicit transaction (i.e. on a *Queries value
+	// returned by Queries.WithTx). Calling outside a transaction acquires a lock
+	// that is released immediately, providing no serialisation guarantee.
+	GetRefreshTokenByHashForUpdate(ctx context.Context, tokenHash string) (RefreshToken, error)
 	GetUserByEmail(ctx context.Context, email string) (User, error)
 	GetUserByEmailWithRoles(ctx context.Context, email string) ([]GetUserByEmailWithRolesRow, error)
 	GetUserByID(ctx context.Context, id string) (User, error)
 	GetUserByIDWithRoles(ctx context.Context, id string) ([]GetUserByIDWithRolesRow, error)
+	// Fetches the display name and email for a user by ID.
+	// Used for audit logging during OAuth account linking.
+	GetUserDisplayInfo(ctx context.Context, id string) (GetUserDisplayInfoRow, error)
+	// Looks up a user ID by email address. Returns sql.ErrNoRows when not found.
+	GetUserIDByEmail(ctx context.Context, email string) (string, error)
+	GetUserMFAMethod(ctx context.Context, id string) (UsersMfaMethod, error)
+	// Returns NULL when the column is NULL (TOTP not yet set up).
+	GetUserTOTPSecretEncrypted(ctx context.Context, id string) (sql.NullString, error)
 	// Soft-deletes (marks used) all live tokens of a given type for a
 	// user before issuing a new one. Prevents a user from holding multiple
 	// valid reset/verify tokens simultaneously.
 	InvalidateUserTokensByType(ctx context.Context, arg InvalidateUserTokensByTypeParams) error
+	// Called during the explicit linking flow when an authenticated user
+	// intentionally connects a provider identity to their existing local account.
+	LinkOAuthAccountToUser(ctx context.Context, arg LinkOAuthAccountToUserParams) error
+	ListOAuthAccountsByUserID(ctx context.Context, userID string) ([]ListOAuthAccountsByUserIDRow, error)
 	// Stamps email_verified_at once the user clicks the verification link.
 	// Idempotent: calling it on an already-verified user is a safe no-op
 	// (the column will simply be updated to NOW() again).
 	MarkEmailVerified(ctx context.Context, id string) error
+	// Atomically stamps used_at on the locked row.
+	// The WHERE used_at IS NULL guard is belt-and-suspenders after the FOR UPDATE
+	// lock: exactly one concurrent caller gets RowsAffected = 1; any racing caller
+	// (possible on DBs without strict row-level locking) gets 0 and is rejected.
+	// Must be called inside the same transaction as GetOneTimeCodeForUpdate.
+	MarkOneTimeCodeUsed(ctx context.Context, codeHash string) (sql.Result, error)
+	// Lazy cleanup of abandoned linking states (user closed the tab, etc.).
+	// Called opportunistically inside ConsumeLinkingState; also suitable for a
+	// scheduled maintenance job in high-traffic deployments.
+	PurgeExpiredLinkingStates(ctx context.Context) error
+	// Lazy cleanup of rows whose TTL has passed and have already been consumed.
+	// Called opportunistically inside ConsumeOneTimeCode (best-effort; errors ignored).
+	// For high-traffic deployments supplement with a scheduled job:
+	//   DELETE FROM oauth_one_time_codes
+	//   WHERE expires_at < NOW() AND used_at IS NOT NULL LIMIT 500;
+	PurgeExpiredOneTimeCodes(ctx context.Context) error
 	RevokeRefreshToken(ctx context.Context, id string) error
 	RevokeRefreshTokenFamily(ctx context.Context, tokenFamily string) error
 	// Called after a successful password reset to invalidate every active
 	// session for the user. Any attacker holding a stolen refresh token
 	// will get ErrTokenRevoked on their next /refresh call.
 	RevokeUserRefreshTokens(ctx context.Context, userID string) error
+	// Stores the encrypted TOTP secret (pending; not yet active).
+	SetUserTOTPSecret(ctx context.Context, arg SetUserTOTPSecretParams) error
+	// ── oauth_linking_states ───────────────────────────────────────────────────────
+	// Server-side storage for the email-collision linking flow.
+	// The nonce (HMAC-signed) travels to the client; the payload stays on the server.
+	// These queries replace the previous approach of embedding encrypted token blobs
+	// in the client-visible linking_token. Run `sqlc generate` after adding these.
+	// Persists a linking payload keyed by a 32-byte random nonce (hex-encoded).
+	// Called when an OAuth callback detects an email collision with an existing
+	// local account. expiresAt mirrors the 15-minute linkingTokenTTL.
+	StoreLinkingState(ctx context.Context, arg StoreLinkingStateParams) error
+	// oauth_one_time_codes queries — mobile OAuth exchange flow.
+	//
+	// Table added in migration 0008. Run `sqlc generate` after editing this file.
+	//
+	// Naming conventions mirror oauth.sql patterns:
+	//   :exec        — INSERT / DELETE with no return value
+	//   :execresult  — UPDATE where RowsAffected is checked (single-use guard)
+	//   :one         — SELECT returning a single row (used inside a transaction)
+	//
+	// Query naming rationale:
+	//   StoreOneTimeCode        — symmetric with StoreLinkingState in oauth.sql
+	//   GetOneTimeCodeForUpdate — explicit "ForUpdate" suffix signals the caller
+	//                             MUST wrap this in a transaction; see ConsumeOneTimeCode
+	//   MarkOneTimeCodeUsed     — mirrors ConsumeEmailToken / ConsumeRefreshToken patterns
+	//   PurgeExpiredOneTimeCodes— mirrors PurgeExpiredLinkingStates in oauth.sql
+	// Persists the SHA-256 hex hash of the 64-char random plaintext code.
+	// The plaintext is never written to any store — only SHA-256(plaintext) is here.
+	// Called immediately after code generation in service.IssueOneTimeCode.
+	StoreOneTimeCode(ctx context.Context, arg StoreOneTimeCodeParams) error
+	UnlinkOAuthAccount(ctx context.Context, arg UnlinkOAuthAccountParams) error
+	UpdateOAuthTokens(ctx context.Context, arg UpdateOAuthTokensParams) error
 	// Replaces the bcrypt hash after a successful password reset.
 	// updated_at is refreshed so cache-busting strategies based on that
 	// column work correctly.

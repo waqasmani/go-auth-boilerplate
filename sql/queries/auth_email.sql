@@ -69,6 +69,19 @@ SET
 WHERE
     id = ?;
 
+-- name: ClearEmailVerified :exec
+-- Clears email_verified_at after a password reset so the account must
+-- re-confirm inbox ownership before logging in again. This closes the
+-- window where an attacker who hijacked the victim's inbox resets the
+-- password and immediately inherits a verified, session-capable account.
+-- Idempotent: safe to call when the column is already NULL.
+UPDATE users
+SET
+    email_verified_at = NULL,
+    updated_at        = NOW()
+WHERE
+    id = ?;
+
 -- name: RevokeUserRefreshTokens :exec
 -- Called after a successful password reset to invalidate every active
 -- session for the user. Any attacker holding a stolen refresh token

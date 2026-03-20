@@ -1,9 +1,12 @@
+// auth/handler.go — cookie domain uses cfg.CookieDomain with FrontEndDomain fallback
+
 package auth
 
 import (
+	"errors"
 	"net/http"
-	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -11,23 +14,24 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/waqasmani/go-auth-boilerplate/internal/config"
+	apperrors "github.com/waqasmani/go-auth-boilerplate/internal/errors"
+	"github.com/waqasmani/go-auth-boilerplate/internal/middleware"
+	"github.com/waqasmani/go-auth-boilerplate/internal/platform/cookieutil"
 	"github.com/waqasmani/go-auth-boilerplate/internal/platform/logger"
 	"github.com/waqasmani/go-auth-boilerplate/internal/response"
 )
 
 // Handler exposes auth HTTP endpoints.
 type Handler struct {
-	svc      Service
-	validate *validator.Validate
-	cfg      *config.Config
+	svc          Service
+	validate     *validator.Validate
+	cfg          *config.Config
+	emailLimiter *middleware.Limiter
 }
 
 // NewHandler constructs an auth handler.
-func NewHandler(svc Service, cfg *config.Config) *Handler {
+func NewHandler(svc Service, cfg *config.Config, emailLimiter *middleware.Limiter) *Handler {
 	v := validator.New()
-
-	// Register json tag names so validation errors report "password" not "Password".
-	// This closes the struct naming leak and aligns error keys with request fields.
 	v.RegisterTagNameFunc(func(fld reflect.StructField) string {
 		name := strings.SplitN(fld.Tag.Get("json"), ",", 2)[0]
 		if name == "-" || name == "" {
@@ -35,8 +39,7 @@ func NewHandler(svc Service, cfg *config.Config) *Handler {
 		}
 		return name
 	})
-
-	return &Handler{svc: svc, validate: v, cfg: cfg}
+	return &Handler{svc: svc, validate: v, cfg: cfg, emailLimiter: emailLimiter}
 }
 
 // Register godoc
@@ -45,7 +48,9 @@ func NewHandler(svc Service, cfg *config.Config) *Handler {
 // @Accept       json
 // @Produce      json
 // @Param        body body RegisterRequest true "Registration payload"
-// @Success      201 {object} response.Response{data=TokenResponse}
+// @Success      202 {object} response.Response
+// @Failure      409 {object} response.Response "Email already registered"
+// @Failure      422 {object} response.Response "Validation error"
 // @Router       /auth/register [post]
 func (h *Handler) Register(c *gin.Context) {
 	var req RegisterRequest
@@ -56,20 +61,19 @@ func (h *Handler) Register(c *gin.Context) {
 	log := logger.FromContext(c.Request.Context())
 	log.Debug("register request", zap.String("email", req.Email))
 
-	tokenResp, err := h.svc.Register(c.Request.Context(), req)
-	if err != nil {
+	if err := h.svc.Register(c.Request.Context(), req); err != nil {
 		response.Error(c, err)
 		return
 	}
-	h.setCookie(c, tokenResp.RefreshToken)
-	response.Created(c, tokenResp)
+
+	c.JSON(http.StatusAccepted, response.Response{
+		Success: true,
+		Data:    gin.H{"message": "registration successful — please check your inbox to verify your email address"},
+	})
 }
 
 // Login godoc
 // @Summary      Login
-// @Description  Returns TokenResponse for normal accounts. Returns MFAChallengeResponse
-// @Description  (requires_mfa: true) when the account has 2FA enabled — the client must
-// @Description  then POST { code, mfa_token } to /auth/otp/verify to receive tokens.
 // @Tags         auth
 // @Accept       json
 // @Produce      json
@@ -77,7 +81,8 @@ func (h *Handler) Register(c *gin.Context) {
 // @Success      200 {object} response.Response{data=TokenResponse}
 // @Success      200 {object} response.Response{data=MFAChallengeResponse}
 // @Failure      401 {object} response.Response
-// @Failure      403 {object} response.Response "Email not verified or 2FA required"
+// @Failure      403 {object} response.Response
+// @Failure      429 {object} response.Response "Account locked or rate limit exceeded"
 // @Router       /auth/login [post]
 func (h *Handler) Login(c *gin.Context) {
 	var req LoginRequest
@@ -85,16 +90,34 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
+	email := strings.ToLower(strings.TrimSpace(req.Email))
+	if allowed, retryAfter := h.emailLimiter.Allow("login:email:" + email); !allowed {
+		seconds := max(int(retryAfter.Seconds())+1, 1)
+		c.Header("Retry-After", strconv.Itoa(seconds))
+		response.Error(c, apperrors.ErrRateLimitExceeded)
+		return
+	}
+
 	result, err := h.svc.Login(c.Request.Context(), req)
 	if err != nil {
+		// Account lockout: service returns *apperrors.LockoutError which embeds
+		// *AppError (HTTP 429, code ACCOUNT_LOCKED). Extract the remaining lock
+		// duration and emit a standard Retry-After header so well-behaved clients
+		// and API gateways can back off without polling.
+		//
+		// errors.As traverses the error chain — LockoutError.Unwrap returns the
+		// embedded *AppError, so response.Error below still uses the correct
+		// HTTP status and error code from the AppError.
+		var lockErr *apperrors.LockoutError
+		if errors.As(err, &lockErr) {
+			seconds := max(int(lockErr.RetryAfter.Seconds())+1, 1)
+			c.Header("Retry-After", strconv.Itoa(seconds))
+		}
 		response.Error(c, err)
 		return
 	}
 
-	// Exactly one branch fires — the discriminated union guarantees this.
 	if result.Challenge != nil {
-		// Do NOT set a cookie — no refresh token exists yet.
-		// The client must complete the OTP step first.
 		response.OK(c, result.Challenge)
 		return
 	}
@@ -114,7 +137,6 @@ func (h *Handler) Login(c *gin.Context) {
 func (h *Handler) Refresh(c *gin.Context) {
 	var req RefreshRequest
 
-	// Try cookie first (web)
 	refreshToken, err := c.Cookie("refresh_token")
 	if err == nil {
 		req.RefreshToken = refreshToken
@@ -128,9 +150,7 @@ func (h *Handler) Refresh(c *gin.Context) {
 		return
 	}
 
-	// Set cookie for web clients
 	h.setCookie(c, tokenResp.RefreshToken)
-
 	response.OK(c, tokenResp)
 }
 
@@ -145,7 +165,6 @@ func (h *Handler) Refresh(c *gin.Context) {
 func (h *Handler) Logout(c *gin.Context) {
 	var req LogoutRequest
 
-	// Try cookie first (web)
 	refreshToken, err := c.Cookie("refresh_token")
 	if err == nil {
 		req.RefreshToken = refreshToken
@@ -153,53 +172,46 @@ func (h *Handler) Logout(c *gin.Context) {
 		return
 	}
 
+	h.clearCookie(c)
+
 	if err := h.svc.Logout(c.Request.Context(), req); err != nil {
 		response.Error(c, err)
 		return
 	}
 
-	c.SetSameSite(http.SameSiteLaxMode)
-	h.clearCookie(c)
 	response.NoContent(c)
 }
 
-// Cookie helper func
+// ── Cookie helpers ────────────────────────────────────────────────────────────
+
+// setCookie writes the HttpOnly refresh-token cookie.
+//
+// Domain resolution and SameSite parsing are handled by cookieutil so the
+// behaviour is identical to auth_email/handler.go and oauth/handler.go.
+// See cookieutil.ResolveCookieDomain and cookieutil.ParseSameSite for the
+// full resolution rules.
 func (h *Handler) setCookie(c *gin.Context, token string) {
-	u, err := url.Parse(h.cfg.FrontEndDomain)
-	domain := ""
-	if err == nil {
-		domain = u.Hostname()
-	}
-
-	secure := h.cfg.AppEnv == "production"
-
-	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetSameSite(cookieutil.ParseSameSite(h.cfg.CookieSameSite))
 	c.SetCookie(
 		"refresh_token",
 		token,
 		int(h.cfg.RefreshTTL.Seconds()),
 		"/",
-		domain,
-		secure, // Secure only in production
-		true,   // HttpOnly ALWAYS true
+		cookieutil.ResolveCookieDomain(h.cfg),
+		h.cfg.CookieSecure,
+		true, // HttpOnly — always
 	)
 }
 
 func (h *Handler) clearCookie(c *gin.Context) {
-	u, err := url.Parse(h.cfg.FrontEndDomain)
-	domain := ""
-	if err == nil {
-		domain = u.Hostname()
-	}
-
-	secure := h.cfg.AppEnv == "production"
+	c.SetSameSite(cookieutil.ParseSameSite(h.cfg.CookieSameSite))
 	c.SetCookie(
 		"refresh_token",
 		"",
 		-1,
 		"/",
-		domain,
-		secure, // Secure only in production
-		true,   // HttpOnly ALWAYS true
+		cookieutil.ResolveCookieDomain(h.cfg),
+		h.cfg.CookieSecure,
+		true,
 	)
 }

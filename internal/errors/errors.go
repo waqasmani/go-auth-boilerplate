@@ -1,10 +1,12 @@
-// Package errors is the central error type for the application
+// Package errors is the central error type for the application.
 package errors
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 // AppError is the central error type for the application.
@@ -56,126 +58,173 @@ func As(err error) (*AppError, bool) {
 	return nil, false
 }
 
-// ─── Common Application Error Instances ───────────────────────────────────────
+// WrapDatabase wraps database errors with consistent context.
+func WrapDatabase(err error, operation string) *AppError {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	// Add specific MySQL error handling here if needed (e.g. duplicate key)
+	return Wrap(ErrInternalServer, fmt.Errorf("db.%s: %w", operation, err))
+}
 
-// ErrInternalServer is returned when an unexpected internal server error occurs.
+// ─── Common Application Error Instances ───────────────────────────────────────
 var ErrInternalServer = &AppError{
 	Code:       "INTERNAL_SERVER_ERROR",
 	Message:    "an unexpected error occurred",
 	HTTPStatus: http.StatusInternalServerError,
 }
 
-// ErrNotFound is returned when a requested resource does not exist.
 var ErrNotFound = &AppError{
 	Code:       "NOT_FOUND",
 	Message:    "resource not found",
 	HTTPStatus: http.StatusNotFound,
 }
 
-// ErrUnauthorized is returned when authentication is required but missing or invalid.
 var ErrUnauthorized = &AppError{
 	Code:       "UNAUTHORIZED",
 	Message:    "authentication required",
 	HTTPStatus: http.StatusUnauthorized,
 }
 
-// ErrForbidden is returned when the user lacks permission for the requested action.
 var ErrForbidden = &AppError{
 	Code:       "FORBIDDEN",
 	Message:    "you do not have permission to perform this action",
 	HTTPStatus: http.StatusForbidden,
 }
 
-// ErrBadRequest is returned when the request payload is malformed or invalid.
 var ErrBadRequest = &AppError{
 	Code:       "BAD_REQUEST",
 	Message:    "invalid request",
 	HTTPStatus: http.StatusBadRequest,
 }
 
-// ErrConflict is returned when a request conflicts with the current state of the server.
 var ErrConflict = &AppError{
 	Code:       "CONFLICT",
 	Message:    "resource already exists",
 	HTTPStatus: http.StatusConflict,
 }
 
-// Auth-specific errors
-
-// ErrInvalidCredentials is returned when login credentials fail verification.
 var ErrInvalidCredentials = &AppError{
 	Code:       "INVALID_CREDENTIALS",
 	Message:    "invalid email or password",
 	HTTPStatus: http.StatusUnauthorized,
 }
 
-// ErrTokenExpired is returned when a presented token has passed its expiration time.
 var ErrTokenExpired = &AppError{
 	Code:       "TOKEN_EXPIRED",
 	Message:    "token has expired",
 	HTTPStatus: http.StatusUnauthorized,
 }
 
-// ErrTokenInvalid is returned when a token fails signature or format validation.
 var ErrTokenInvalid = &AppError{
 	Code:       "TOKEN_INVALID",
 	Message:    "token is invalid",
 	HTTPStatus: http.StatusUnauthorized,
 }
 
-// ErrTokenRevoked is returned when a token has been explicitly revoked before expiry.
 var ErrTokenRevoked = &AppError{
 	Code:       "TOKEN_REVOKED",
 	Message:    "token has been revoked",
 	HTTPStatus: http.StatusUnauthorized,
 }
 
-// ErrTokenReuse is returned when token reuse is detected, triggering cascade revocation.
 var ErrTokenReuse = &AppError{
 	Code:       "TOKEN_REUSE_DETECTED",
 	Message:    "token reuse detected — all sessions have been revoked",
 	HTTPStatus: http.StatusUnauthorized,
 }
 
-// ErrEmailAlreadyExists is returned when attempting to register with a duplicate email.
 var ErrEmailAlreadyExists = &AppError{
 	Code:       "EMAIL_ALREADY_EXISTS",
 	Message:    "an account with this email already exists",
 	HTTPStatus: http.StatusConflict,
 }
 
-// Validation errors
-
-// ErrValidation is returned when request data fails schema or business rule validation.
 var ErrValidation = &AppError{
 	Code:       "VALIDATION_ERROR",
 	Message:    "request validation failed",
 	HTTPStatus: http.StatusUnprocessableEntity,
 }
 
-// ErrRateLimitExceeded returns the JSON body for a 429 response.
 var ErrRateLimitExceeded = &AppError{
 	Code:       "RATE_LIMIT_EXCEEDED",
 	Message:    "too many requests — slow down and try again",
 	HTTPStatus: http.StatusTooManyRequests,
 }
 
-// ErrCSRFRejected is returned when a cookie-bearing request fails the
-// Origin / Referer validation check in the CookieCSRF middleware.
-// The message is deliberately generic to avoid leaking which header was
-// missing or mismatched.
 var ErrCSRFRejected = &AppError{
 	Code:       "CSRF_REJECTED",
 	Message:    "request origin could not be verified",
 	HTTPStatus: http.StatusForbidden,
 }
 
-// ErrEmailNotVerified is returned when login is attempted on an account whose
-// email address has not yet been confirmed. The client should redirect to a
-// "check your inbox" screen and offer to resend the verification link via
-// POST /auth/resend-verification.
 var ErrEmailNotVerified = &AppError{
 	Code:       "EMAIL_NOT_VERIFIED",
 	Message:    "please verify your email address before signing in",
 	HTTPStatus: http.StatusForbidden,
+}
+
+// ErrAccountLocked is the sentinel AppError embedded inside LockoutError.
+// Use NewLockoutError to attach a Retry-After duration; do not return this
+// sentinel directly from the service layer.
+var ErrAccountLocked = &AppError{
+	Code:       "ACCOUNT_LOCKED",
+	Message:    "account temporarily locked due to too many failed login attempts — check the Retry-After header",
+	HTTPStatus: http.StatusTooManyRequests,
+}
+
+// LockoutError wraps ErrAccountLocked and carries the remaining lock duration
+// so the handler can emit an accurate Retry-After response header without
+// needing access to application configuration.
+//
+// response.Error correctly uses the embedded *AppError's HTTP 429 status and
+// ACCOUNT_LOCKED code because errors.As traverses Unwrap and finds *AppError.
+//
+// Handler pattern:
+//
+//	result, err := h.svc.Login(c.Request.Context(), req)
+//	if err != nil {
+//	    var lockErr *apperrors.LockoutError
+//	    if errors.As(err, &lockErr) {
+//	        seconds := max(int(lockErr.RetryAfter.Seconds())+1, 1)
+//	        c.Header("Retry-After", strconv.Itoa(seconds))
+//	    }
+//	    response.Error(c, err)
+//	    return
+//	}
+type LockoutError struct {
+	*AppError
+	// RetryAfter is the remaining lock duration as reported by Redis TTL.
+	// Always positive when a LockoutError is returned from the service layer.
+	RetryAfter time.Duration
+}
+
+func (e *LockoutError) Error() string { return e.AppError.Error() }
+func (e *LockoutError) Unwrap() error { return e.AppError }
+
+// NewLockoutError constructs a LockoutError with the given remaining lock duration.
+// retryAfter is sourced from AccountLocker.IsLocked and reflects the real
+// Redis TTL — it is never a hardcoded configuration value.
+func NewLockoutError(retryAfter time.Duration) *LockoutError {
+	return &LockoutError{
+		AppError:   ErrAccountLocked,
+		RetryAfter: retryAfter,
+	}
+}
+
+// ErrRequestTooLarge is returned by BindAndValidate when the request body
+// exceeds the 64 KiB limit enforced by the MaxBytesReader wrapper in router.go.
+//
+// HTTP 413 Content Too Large (RFC 9110 §15.5.14) is the correct status: the
+// server is refusing to process the request because the body is larger than it
+// is willing to handle. The issue description suggests 400, but 413 is the
+// semantically accurate code and is what well-behaved clients use to detect
+// this condition without ambiguity.
+var ErrRequestTooLarge = &AppError{
+	Code:       "REQUEST_TOO_LARGE",
+	Message:    "request body exceeds the maximum allowed size",
+	HTTPStatus: http.StatusRequestEntityTooLarge, // 413
 }

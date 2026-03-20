@@ -40,3 +40,15 @@ func FromContext(ctx context.Context) *zap.Logger {
 	}
 	return zap.NewNop()
 }
+
+// FromContextOrFallback returns the request-scoped logger stored in ctx when
+// present, and fallback otherwise. Use this instead of FromContext when a
+// non-discarding fallback is required — for example in background goroutines
+// or paths that must guarantee event delivery regardless of whether an HTTP
+// request context is in scope.
+func FromContextOrFallback(ctx context.Context, fallback *zap.Logger) *zap.Logger {
+	if l, ok := ctx.Value(loggerKey).(*zap.Logger); ok && l != nil {
+		return l
+	}
+	return fallback
+}

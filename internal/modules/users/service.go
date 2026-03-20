@@ -26,7 +26,6 @@ func NewService(repo Repository, log *zap.Logger) Service {
 	return &service{repo: repo, log: log}
 }
 
-// AFTER
 func (s *service) GetMe(ctx context.Context, userID string) (*UserResponse, error) {
 	if userID == "" {
 		return nil, apperrors.ErrUnauthorized

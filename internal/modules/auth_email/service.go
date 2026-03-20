@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -11,10 +12,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pquerna/otp"
 	"go.uber.org/zap"
 
 	"github.com/waqasmani/go-auth-boilerplate/internal/db"
 	apperrors "github.com/waqasmani/go-auth-boilerplate/internal/errors"
+	"github.com/waqasmani/go-auth-boilerplate/internal/platform/audit"
 	platformauth "github.com/waqasmani/go-auth-boilerplate/internal/platform/auth"
 	mailer "github.com/waqasmani/go-auth-boilerplate/internal/platform/email"
 	"github.com/waqasmani/go-auth-boilerplate/internal/platform/logger"
@@ -26,8 +29,14 @@ const (
 	tokenTypeVerify    = "verify"
 	tokenTypeReset     = "reset"
 	tokenTypeOTP       = "otp"
-	tokenTypeChallenge = "challenge" // pre-auth MFA challenge; consumed at /otp/verify
+	tokenTypeChallenge = "challenge"
 )
+
+// ResetPasswordResult carries the outcome of a password reset so the handler
+// can inform the client whether a verification email was dispatched.
+type ResetPasswordResult struct {
+	EmailVerificationSent bool
+}
 
 // ── Token TTLs ────────────────────────────────────────────────────────────────
 
@@ -35,13 +44,12 @@ const (
 	verifyTokenTTL    = 24 * time.Hour
 	resetTokenTTL     = 1 * time.Hour
 	otpTokenTTL       = 10 * time.Minute
-	challengeTokenTTL = 5 * time.Minute // short — credentials were just verified
+	challengeTokenTTL = 5 * time.Minute
 )
 
-// TokenIssuer is satisfied by auth.Service. Defined here to avoid an import
-// cycle — auth_email never imports auth.
+// TokenIssuer is satisfied by auth.Service.
 type TokenIssuer interface {
-	IssueTokensForUser(ctx context.Context, userID string) (*platformauth.SessionTokens, error)
+	PrepareTokensForUser(ctx context.Context, userID string) (*platformauth.TokenPair, error)
 }
 
 //go:generate mockgen -source=service.go -destination=mocks/service_mock.go -package=mocks
@@ -49,19 +57,16 @@ type TokenIssuer interface {
 // Service defines the email-auth business-logic contract.
 type Service interface {
 	ForgotPassword(ctx context.Context, req ForgotPasswordRequest) error
-	ResetPassword(ctx context.Context, req ResetPasswordRequest) error
+	ResetPassword(ctx context.Context, req ResetPasswordRequest) (*ResetPasswordResult, error)
 	VerifyEmail(ctx context.Context, req VerifyEmailRequest) error
-	// VerifyOTP returns a *SessionTokens when completing an MFA login
-	// (mfa_token present in the request) and nil for standalone OTP checks.
 	VerifyOTP(ctx context.Context, req VerifyOTPRequest) (*platformauth.SessionTokens, error)
 	SendVerification(ctx context.Context, userID string) error
 	SendOTP(ctx context.Context, userID string) error
-	// ResendVerification is the unauthenticated equivalent of SendVerification.
-	// Takes an email address; always returns nil (anti-enumeration guarantee).
 	ResendVerification(ctx context.Context, req ResendVerificationRequest) error
-	// InitiateChallenge satisfies auth.MFAChallenger. Invalidates live OTPs,
-	// generates a new OTP + challenge token pair, and sends the OTP by email.
 	InitiateChallenge(ctx context.Context, userID, email, name string) (string, time.Time, error)
+	SetupTOTP(ctx context.Context, userID string) (secret, uri, qrBase64 string, err error)
+	EnableTOTP(ctx context.Context, userID, code string) error
+	DisableTOTP(ctx context.Context, userID, code string) error
 }
 
 type service struct {
@@ -69,18 +74,65 @@ type service struct {
 	mailer         *mailer.Mailer
 	log            *zap.Logger
 	frontEndDomain string
-	tokenIssuer    TokenIssuer // auth.Service — injected via ModuleConfig
+	tokenIssuer    TokenIssuer
+	auditLog       *audit.Logger
+	otpSecret      string
+
+	totpKeySet  *platformauth.TOTPKeySet
+	totpIssuer  string
+	totpPeriod  uint
+	totpDigits  otp.Digits
+	replayCache *platformauth.TOTPReplayCache
 }
 
-// NewService constructs the email-auth service.
-func NewService(repo Repository, m *mailer.Mailer, log *zap.Logger, frontEndDomain string, tokenIssuer TokenIssuer) Service {
+// NewService constructs the email-auth service. Returns an error when
+// replayCache is nil so that NewModule can propagate a structured startup
+// message rather than crashing with a raw stack trace. The replayCache is
+// always required — omitting it would leave the TOTP replay window open,
+// violating RFC 6238 §5.2.
+func NewService(
+	repo Repository,
+	m *mailer.Mailer,
+	log *zap.Logger,
+	frontEndDomain string,
+	tokenIssuer TokenIssuer,
+	otpSecret string,
+	auditLog *audit.Logger,
+	totpKeySet *platformauth.TOTPKeySet,
+	totpIssuer string,
+	totpPeriod int,
+	totpDigits int,
+	replayCache *platformauth.TOTPReplayCache,
+) (Service, error) {
+	if replayCache == nil {
+		return nil, fmt.Errorf(
+			"authemail: NewService: replayCache must not be nil — " +
+				"pass platformauth.NewTOTPReplayCache(); " +
+				"omitting it leaves the TOTP replay window open (RFC 6238 §5.2 violation)",
+		)
+	}
+	digits := otp.DigitsSix
+	if totpDigits == 8 {
+		digits = otp.DigitsEight
+	}
+	period := uint(30)
+	if totpPeriod > 0 {
+		period = uint(totpPeriod)
+	}
 	return &service{
 		repo:           repo,
 		mailer:         m,
 		log:            log,
 		frontEndDomain: frontEndDomain,
 		tokenIssuer:    tokenIssuer,
-	}
+		otpSecret:      otpSecret,
+		auditLog:       auditLog,
+		totpKeySet:     totpKeySet,
+		totpIssuer:     totpIssuer,
+		totpPeriod:     period,
+		totpDigits:     digits,
+		replayCache:    replayCache,
+	}, nil
 }
 
 // ── ForgotPassword ────────────────────────────────────────────────────────────
@@ -91,7 +143,7 @@ func (s *service) ForgotPassword(ctx context.Context, req ForgotPasswordRequest)
 
 	user, err := s.repo.GetUserByEmail(ctx, email)
 	if err != nil {
-		log.Debug("forgot-password: user not found, returning early", zap.String("email", email))
+		log.Debug("forgot-password: user not found, returning early", zap.String("email", audit.MaskEmail(email)))
 		return nil
 	}
 
@@ -121,60 +173,80 @@ func (s *service) ForgotPassword(ctx context.Context, req ForgotPasswordRequest)
 	}
 
 	link := fmt.Sprintf("%s/auth/reset-password?token=%s", s.frontEndDomain, raw)
-	s.sendEmail(ctx, user.Email, "Reset your password", func() (string, error) {
+	s.sendEmailSync(ctx, user.Email, "Reset your password", func() (string, error) {
 		return mailer.ResetPassword(user.Name, link)
 	}, "forgot-password", user.ID)
 
+	s.auditLog.Log(ctx, audit.EventPasswordResetRequested, user.ID)
 	log.Info("forgot-password: reset token issued", zap.String("user_id", user.ID))
 	return nil
 }
 
 // ── ResetPassword ─────────────────────────────────────────────────────────────
 
-func (s *service) ResetPassword(ctx context.Context, req ResetPasswordRequest) error {
+func (s *service) ResetPassword(ctx context.Context, req ResetPasswordRequest) (*ResetPasswordResult, error) {
 	log := logger.FromContext(ctx)
 
 	hash := platformauth.HashRefreshToken(req.Token)
 	token, err := s.repo.GetEmailTokenByHash(ctx, hash)
 	if err != nil {
-		return apperrors.ErrTokenInvalid
+		return nil, apperrors.ErrTokenInvalid
 	}
-
 	if token.TokenType != tokenTypeReset || token.UsedAt.Valid || time.Now().UTC().After(token.ExpiresAt) {
-		return apperrors.ErrTokenInvalid
-	}
-
-	consumed, err := s.repo.ConsumeEmailToken(ctx, token.ID)
-	if err != nil {
-		return err
-	}
-	if !consumed {
-		return apperrors.ErrTokenInvalid
+		return nil, apperrors.ErrTokenInvalid
 	}
 
 	newHash, err := platformauth.HashPassword(req.NewPassword)
 	if err != nil {
-		return apperrors.Wrap(apperrors.ErrInternalServer, err)
+		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
 
-	if err = s.repo.UpdateUserPasswordHash(ctx, db.UpdateUserPasswordHashParams{
-		PasswordHash: newHash,
-		ID:           token.UserID,
+	userID := token.UserID
+	if err = s.repo.WithTx(ctx, func(tx Repository) error {
+		consumed, err := tx.ConsumeEmailToken(ctx, token.ID)
+		if err != nil {
+			return err
+		}
+		if !consumed {
+			return apperrors.ErrTokenInvalid
+		}
+		if err = tx.UpdateUserPasswordHash(ctx, db.UpdateUserPasswordHashParams{
+			PasswordHash: newHash,
+			ID:           userID,
+		}); err != nil {
+			return err
+		}
+		if err = tx.ClearEmailVerified(ctx, userID); err != nil {
+			return err
+		}
+		if err = tx.InvalidateUserTokensByType(ctx, db.InvalidateUserTokensByTypeParams{
+			UserID:    userID,
+			TokenType: tokenTypeChallenge,
+		}); err != nil {
+			return err
+		}
+		return tx.RevokeUserRefreshTokens(ctx, userID)
 	}); err != nil {
-		return err
+		return nil, err
 	}
 
-	// Revoke all active sessions — an attacker holding a stolen refresh token
-	// must not survive the credential change. Best-effort: a failure here is
-	// logged but does not roll back the password update.
-	if rErr := s.repo.RevokeUserRefreshTokens(ctx, token.UserID); rErr != nil {
-		log.Error("reset-password: revoke sessions failed — sessions may survive credential change",
-			zap.Error(rErr), zap.String("user_id", token.UserID),
+	s.auditLog.Log(ctx, audit.EventPasswordReset, userID)
+	log.Info("reset-password: password updated, all sessions and challenges revoked",
+		zap.String("user_id", userID),
+	)
+
+	result := &ResetPasswordResult{}
+	if vErr := s.SendVerification(ctx, userID); vErr != nil {
+		s.log.Warn("reset-password: re-verification email failed — user must resend manually",
+			zap.Error(vErr),
+			zap.String("user_id", userID),
 		)
+		result.EmailVerificationSent = false
+	} else {
+		result.EmailVerificationSent = true
 	}
 
-	log.Info("reset-password: password updated and sessions revoked", zap.String("user_id", token.UserID))
-	return nil
+	return result, nil
 }
 
 // ── VerifyEmail ───────────────────────────────────────────────────────────────
@@ -187,161 +259,282 @@ func (s *service) VerifyEmail(ctx context.Context, req VerifyEmailRequest) error
 	if err != nil {
 		return apperrors.ErrTokenInvalid
 	}
-
 	if token.TokenType != tokenTypeVerify || token.UsedAt.Valid || time.Now().UTC().After(token.ExpiresAt) {
 		return apperrors.ErrTokenInvalid
 	}
 
-	consumed, err := s.repo.ConsumeEmailToken(ctx, token.ID)
-	if err != nil {
+	if err = s.repo.WithTx(ctx, func(tx Repository) error {
+		consumed, err := tx.ConsumeEmailToken(ctx, token.ID)
+		if err != nil {
+			return err
+		}
+		if !consumed {
+			return apperrors.ErrTokenInvalid
+		}
+		return tx.MarkEmailVerified(ctx, token.UserID)
+	}); err != nil {
 		return err
 	}
-	if !consumed {
-		return apperrors.ErrTokenInvalid
-	}
 
-	if err = s.repo.MarkEmailVerified(ctx, token.UserID); err != nil {
-		return err
-	}
-
+	s.auditLog.Log(ctx, audit.EventEmailVerified, token.UserID)
 	log.Info("verify-email: address verified", zap.String("user_id", token.UserID))
 	return nil
 }
 
 // ── VerifyOTP ─────────────────────────────────────────────────────────────────
 
-// VerifyOTP handles two distinct paths:
-//
-//  1. MFA login completion (mfa_token present): validates both the challenge
-//     token and the OTP, consumes both atomically, and issues a token pair.
-//
-//  2. Standalone OTP check (mfa_token absent): validates and consumes the OTP
-//     only. Returns nil tokens. Used for step-up auth flows.
 func (s *service) VerifyOTP(ctx context.Context, req VerifyOTPRequest) (*platformauth.SessionTokens, error) {
-	log := logger.FromContext(ctx)
-
-	otpHash := platformauth.HashRefreshToken(req.Code)
-	otpToken, err := s.repo.GetEmailTokenByHash(ctx, otpHash)
-	if err != nil {
-		return nil, apperrors.ErrTokenInvalid
-	}
-
-	if otpToken.TokenType != tokenTypeOTP || otpToken.UsedAt.Valid || time.Now().UTC().After(otpToken.ExpiresAt) {
-		return nil, apperrors.ErrTokenInvalid
-	}
-
-	// ── MFA login completion ──────────────────────────────────────────────────
 	if req.MFAToken != "" {
-		return s.completeMFALogin(ctx, req.MFAToken, otpToken)
+		return s.completeMFALoginDispatch(ctx, req.MFAToken, req.Code)
 	}
-
-	// ── Standalone OTP verification ───────────────────────────────────────────
-	consumed, err := s.repo.ConsumeEmailToken(ctx, otpToken.ID)
-	if err != nil {
+	if err := s.consumeStandaloneEmailOTP(ctx, req.Code); err != nil {
 		return nil, err
 	}
-	if !consumed {
-		return nil, apperrors.ErrTokenInvalid
-	}
-
-	log.Info("verify-otp: OTP consumed (standalone)", zap.String("user_id", otpToken.UserID))
 	return nil, nil
 }
 
-// completeMFALogin validates the challenge token, cross-checks user ownership,
-// consumes both tokens, and issues a full session via the TokenIssuer.
-//
-// Consumption order: challenge first, OTP second. If OTP consumption fails the
-// challenge is already spent, forcing the user to re-authenticate — the safe
-// failure mode (no partial login state).
-func (s *service) completeMFALogin(ctx context.Context, rawChallenge string, otpToken *db.EmailToken) (*platformauth.SessionTokens, error) {
+func (s *service) consumeStandaloneEmailOTP(ctx context.Context, code string) error {
 	log := logger.FromContext(ctx)
 
+	otpHash := platformauth.HMACToken(code, s.otpSecret)
+	otpToken, err := s.repo.GetEmailTokenByHash(ctx, otpHash)
+	if err != nil {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, "", zap.String("reason", "invalid_code"))
+		return apperrors.ErrTokenInvalid
+	}
+	if otpToken.TokenType != tokenTypeOTP {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, otpToken.UserID, zap.String("reason", "wrong_token_type"))
+		return apperrors.ErrTokenInvalid
+	}
+	if otpToken.UsedAt.Valid {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, otpToken.UserID, zap.String("reason", "replay_attempt"))
+		return apperrors.ErrTokenInvalid
+	}
+	if time.Now().UTC().After(otpToken.ExpiresAt) {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, otpToken.UserID, zap.String("reason", "expired"))
+		return apperrors.ErrTokenInvalid
+	}
+
+	consumed, err := s.repo.ConsumeEmailToken(ctx, otpToken.ID)
+	if err != nil {
+		return err
+	}
+	if !consumed {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, otpToken.UserID, zap.String("reason", "replay_attempt"))
+		return apperrors.ErrTokenInvalid
+	}
+
+	log.Info("verify-otp: OTP consumed (standalone)", zap.String("user_id", otpToken.UserID))
+	return nil
+}
+
+func (s *service) completeMFALoginDispatch(ctx context.Context, rawChallenge, code string) (*platformauth.SessionTokens, error) {
 	challengeHash := platformauth.HashRefreshToken(rawChallenge)
 	challengeToken, err := s.repo.GetEmailTokenByHash(ctx, challengeHash)
 	if err != nil {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, "", zap.String("reason", "invalid_challenge_token"))
 		return nil, apperrors.ErrTokenInvalid
 	}
 
-	// Validate challenge state.
-	if challengeToken.TokenType != tokenTypeChallenge ||
-		challengeToken.UsedAt.Valid ||
-		time.Now().UTC().After(challengeToken.ExpiresAt) {
+	if challengeToken.TokenType != tokenTypeChallenge {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID,
+			zap.String("reason", "wrong_challenge_token_type"))
+		return nil, apperrors.ErrTokenInvalid
+	}
+	if challengeToken.UsedAt.Valid {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID,
+			zap.String("reason", "challenge_replay_attempt"))
+		return nil, apperrors.ErrTokenInvalid
+	}
+	if time.Now().UTC().After(challengeToken.ExpiresAt) {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID,
+			zap.String("reason", "challenge_expired"))
 		return nil, apperrors.ErrTokenInvalid
 	}
 
-	// Cross-check: challenge and OTP must belong to the same user.
-	// Prevents one user from using another's OTP against their own challenge.
-	if challengeToken.UserID != otpToken.UserID {
-		log.Warn("completeMFALogin: challenge/OTP user mismatch — possible cross-user attack",
-			zap.String("challenge_user", challengeToken.UserID),
-			zap.String("otp_user", otpToken.UserID),
-		)
-		return nil, apperrors.ErrTokenInvalid
-	}
-
-	// Consume challenge first.
-	consumed, err := s.repo.ConsumeEmailToken(ctx, challengeToken.ID)
+	mfaMethod, err := s.repo.GetUserMFAMethod(ctx, challengeToken.UserID)
 	if err != nil {
-		return nil, err
-	}
-	if !consumed {
-		// Concurrent request already consumed — this is a replay attempt.
-		return nil, apperrors.ErrTokenInvalid
+		s.log.Error("completeMFALoginDispatch: GetUserMFAMethod failed, falling back to email",
+			zap.Error(err), zap.String("user_id", challengeToken.UserID))
+		mfaMethod = "email"
 	}
 
-	// Consume OTP second.
-	consumed, err = s.repo.ConsumeEmailToken(ctx, otpToken.ID)
-	if err != nil {
-		return nil, err
+	if mfaMethod == "totp" {
+		return s.completeMFALoginTOTP(ctx, challengeToken, code)
 	}
-	if !consumed {
-		return nil, apperrors.ErrTokenInvalid
-	}
+	return s.completeMFALoginEmail(ctx, challengeToken, code)
+}
+
+func (s *service) completeMFALoginEmail(ctx context.Context, challengeToken *db.EmailToken, code string) (*platformauth.SessionTokens, error) {
+	log := logger.FromContext(ctx)
 
 	if s.tokenIssuer == nil {
-		log.Error("MFA login: TokenIssuer not configured — check app.go wiring",
-			zap.String("user_id", challengeToken.UserID),
-		)
-		return nil, apperrors.New(
-			"MFA_MISCONFIGURED",
-			"an unexpected error occurred",
-			http.StatusInternalServerError,
-			nil,
-		)
+		s.log.Error("MFA email login: TokenIssuer not configured — check app.go wiring",
+			zap.String("user_id", challengeToken.UserID))
+		return nil, apperrors.ErrInternalServer
 	}
 
-	tokens, err := s.tokenIssuer.IssueTokensForUser(ctx, challengeToken.UserID)
+	otpHash := platformauth.HMACToken(code, s.otpSecret)
+	otpToken, err := s.repo.GetEmailTokenByHash(ctx, otpHash)
+	if err != nil {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID, zap.String("reason", "invalid_code"))
+		return nil, apperrors.ErrTokenInvalid
+	}
+	if otpToken.TokenType != tokenTypeOTP {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID, zap.String("reason", "wrong_token_type"))
+		return nil, apperrors.ErrTokenInvalid
+	}
+	if otpToken.UsedAt.Valid {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID, zap.String("reason", "replay_attempt"))
+		return nil, apperrors.ErrTokenInvalid
+	}
+	if time.Now().UTC().After(otpToken.ExpiresAt) {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID, zap.String("reason", "expired"))
+		return nil, apperrors.ErrTokenInvalid
+	}
+
+	if challengeToken.UserID != otpToken.UserID {
+		log.Warn("completeMFALoginEmail: challenge/OTP user mismatch",
+			zap.String("challenge_user", challengeToken.UserID),
+			zap.String("otp_user", otpToken.UserID))
+		s.auditLog.Log(ctx, audit.EventMFACompleted, challengeToken.UserID,
+			zap.String("result", "rejected_user_mismatch"))
+		return nil, apperrors.ErrTokenInvalid
+	}
+
+	userID := challengeToken.UserID
+	pair, err := s.tokenIssuer.PrepareTokensForUser(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
 
-	log.Info("mfa login completed", zap.String("user_id", challengeToken.UserID))
+	if err = s.repo.WithTx(ctx, func(tx Repository) error {
+		consumed, err := tx.ConsumeEmailToken(ctx, challengeToken.ID)
+		if err != nil {
+			return err
+		}
+		if !consumed {
+			s.auditLog.Log(ctx, audit.EventOTPFailed, userID, zap.String("reason", "challenge_replay_attempt"))
+			return apperrors.ErrTokenInvalid
+		}
+		consumed, err = tx.ConsumeEmailToken(ctx, otpToken.ID)
+		if err != nil {
+			return err
+		}
+		if !consumed {
+			s.auditLog.Log(ctx, audit.EventOTPFailed, userID, zap.String("reason", "replay_attempt"))
+			return apperrors.ErrTokenInvalid
+		}
+		return tx.CreateRefreshToken(ctx, db.CreateRefreshTokenParams{
+			ID:          uuid.NewString(),
+			UserID:      userID,
+			TokenHash:   pair.RefreshTokenHashed,
+			TokenFamily: pair.RefreshTokenFamily,
+			ExpiresAt:   pair.RefreshExpiresAt,
+		})
+	}); err != nil {
+		return nil, err
+	}
+
+	tokens := &platformauth.SessionTokens{
+		AccessToken:           pair.AccessToken,
+		RefreshToken:          pair.RefreshToken,
+		TokenType:             "Bearer",
+		AccessTokenExpiresAt:  pair.AccessExpiresAt,
+		RefreshTokenExpiresAt: pair.RefreshExpiresAt,
+	}
+	s.auditLog.Log(ctx, audit.EventMFACompleted, userID,
+		zap.String("method", "email"), zap.String("result", "success"))
+	log.Info("mfa email login completed", zap.String("user_id", userID))
+	return tokens, nil
+}
+
+func (s *service) completeMFALoginTOTP(ctx context.Context, challengeToken *db.EmailToken, code string) (*platformauth.SessionTokens, error) {
+	log := logger.FromContext(ctx)
+
+	if s.tokenIssuer == nil {
+		s.log.Error("MFA TOTP login: TokenIssuer not configured — check app.go wiring",
+			zap.String("user_id", challengeToken.UserID))
+		return nil, apperrors.ErrInternalServer
+	}
+
+	userID := challengeToken.UserID
+
+	encrypted, err := s.repo.GetUserTOTPSecretEncrypted(ctx, userID)
+	if err != nil {
+		s.log.Error("completeMFALoginTOTP: fetch encrypted secret",
+			zap.Error(err), zap.String("user_id", userID))
+		return nil, apperrors.ErrInternalServer
+	}
+	plainSecret, err := s.totpKeySet.Decrypt(encrypted)
+	if err != nil {
+		s.log.Error("completeMFALoginTOTP: decrypt secret",
+			zap.Error(err), zap.String("user_id", userID))
+		return nil, apperrors.ErrInternalServer
+	}
+
+	valid, err := platformauth.ValidateTOTP(code, plainSecret, s.totpPeriod, s.totpDigits)
+	if err != nil || !valid {
+		s.auditLog.Log(ctx, audit.EventTOTPFailed, userID, zap.String("reason", "invalid_code"))
+		return nil, apperrors.ErrTokenInvalid
+	}
+
+	if !s.replayCache.CheckAndRecord(userID, code) {
+		s.auditLog.Log(ctx, audit.EventTOTPFailed, userID, zap.String("reason", "replay_detected"))
+		return nil, apperrors.ErrTokenInvalid
+	}
+
+	pair, err := s.tokenIssuer.PrepareTokensForUser(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = s.repo.WithTx(ctx, func(tx Repository) error {
+		consumed, err := tx.ConsumeEmailToken(ctx, challengeToken.ID)
+		if err != nil {
+			return err
+		}
+		if !consumed {
+			s.auditLog.Log(ctx, audit.EventTOTPFailed, userID, zap.String("reason", "challenge_replay_attempt"))
+			return apperrors.ErrTokenInvalid
+		}
+		return tx.CreateRefreshToken(ctx, db.CreateRefreshTokenParams{
+			ID:          uuid.NewString(),
+			UserID:      userID,
+			TokenHash:   pair.RefreshTokenHashed,
+			TokenFamily: pair.RefreshTokenFamily,
+			ExpiresAt:   pair.RefreshExpiresAt,
+		})
+	}); err != nil {
+		return nil, err
+	}
+
+	tokens := &platformauth.SessionTokens{
+		AccessToken:           pair.AccessToken,
+		RefreshToken:          pair.RefreshToken,
+		TokenType:             "Bearer",
+		AccessTokenExpiresAt:  pair.AccessExpiresAt,
+		RefreshTokenExpiresAt: pair.RefreshExpiresAt,
+	}
+	s.auditLog.Log(ctx, audit.EventMFACompleted, userID,
+		zap.String("method", "totp"), zap.String("result", "success"))
+	log.Info("mfa totp login completed", zap.String("user_id", userID))
 	return tokens, nil
 }
 
 // ── ResendVerification ────────────────────────────────────────────────────────
 
-// ResendVerification is the unauthenticated equivalent of SendVerification.
-// It accepts an email address, looks up the user, and (if the address is
-// unverified) issues a new verification token and sends the link.
-//
-// Always returns nil — callers must not reveal whether the address is
-// registered or already verified.
 func (s *service) ResendVerification(ctx context.Context, req ResendVerificationRequest) error {
 	log := logger.FromContext(ctx)
 	email := strings.ToLower(strings.TrimSpace(req.Email))
 
 	user, err := s.repo.GetUserByEmail(ctx, email)
 	if err != nil {
-		log.Debug("resend-verification: user not found, returning early", zap.String("email", email))
+		log.Debug("resend-verification: user not found", zap.String("email", audit.MaskEmail(email)))
 		return nil
 	}
-
 	if user.EmailVerifiedAt.Valid {
-		log.Debug("resend-verification: address already verified, skipping",
-			zap.String("user_id", user.ID),
-		)
+		log.Debug("resend-verification: already verified", zap.String("user_id", user.ID))
 		return nil
 	}
 
@@ -350,15 +543,13 @@ func (s *service) ResendVerification(ctx context.Context, req ResendVerification
 		log.Error("resend-verification: generate token", zap.Error(err), zap.String("user_id", user.ID))
 		return nil
 	}
-
 	if err = s.repo.InvalidateUserTokensByType(ctx, db.InvalidateUserTokensByTypeParams{
 		UserID:    user.ID,
 		TokenType: tokenTypeVerify,
 	}); err != nil {
-		log.Error("resend-verification: invalidate old tokens", zap.Error(err), zap.String("user_id", user.ID))
+		log.Error("resend-verification: invalidate old tokens", zap.Error(err))
 		return nil
 	}
-
 	if err = s.repo.CreateEmailToken(ctx, db.CreateEmailTokenParams{
 		ID:        uuid.NewString(),
 		UserID:    user.ID,
@@ -366,60 +557,56 @@ func (s *service) ResendVerification(ctx context.Context, req ResendVerification
 		TokenType: tokenTypeVerify,
 		ExpiresAt: time.Now().UTC().Add(verifyTokenTTL),
 	}); err != nil {
-		log.Error("resend-verification: persist token", zap.Error(err), zap.String("user_id", user.ID))
+		log.Error("resend-verification: persist token", zap.Error(err))
 		return nil
 	}
 
 	link := fmt.Sprintf("%s/auth/verify-email?token=%s", s.frontEndDomain, raw)
-	s.sendEmail(ctx, user.Email, "Verify your email address", func() (string, error) {
+	s.sendEmailSync(ctx, user.Email, "Verify your email address", func() (string, error) {
 		return mailer.VerifyEmail(user.Name, link)
 	}, "resend-verification", user.ID)
 
+	s.auditLog.Log(ctx, audit.EventVerificationSent, user.ID, zap.String("trigger", "resend_unauthenticated"))
 	log.Info("resend-verification: token issued", zap.String("user_id", user.ID))
 	return nil
 }
 
-// ── InitiateChallenge (satisfies auth.MFAChallenger) ─────────────────────────
+// ── InitiateChallenge ─────────────────────────────────────────────────────────
 
-// InitiateChallenge is the MFA login entry point. It:
-//  1. Invalidates any live OTPs for the user.
-//  2. Generates a fresh OTP, stores its hash, and emails the code.
-//  3. Generates an opaque challenge token, stores its hash, and returns
-//     the raw token to auth.Service.Login, which passes it to the client.
-//
-// The client holds the challenge token and OTP code. It must present both at
-// POST /auth/otp/verify to receive a session token pair. The challenge proves
-// credentials were verified; the OTP proves inbox access.
 func (s *service) InitiateChallenge(ctx context.Context, userID, email, name string) (string, time.Time, error) {
-	// Step 1: invalidate live OTPs.
-	if err := s.repo.InvalidateUserTokensByType(ctx, db.InvalidateUserTokensByTypeParams{
-		UserID:    userID,
-		TokenType: tokenTypeOTP,
-	}); err != nil {
-		return "", time.Time{}, err
-	}
-
-	// Step 2: generate OTP, store hash, email code.
-	code, otpHash, err := generateOTP()
+	mfaMethod, err := s.repo.GetUserMFAMethod(ctx, userID)
 	if err != nil {
-		return "", time.Time{}, apperrors.Wrap(apperrors.ErrInternalServer, err)
-	}
-	if err = s.repo.CreateEmailToken(ctx, db.CreateEmailTokenParams{
-		ID:        uuid.NewString(),
-		UserID:    userID,
-		TokenHash: otpHash,
-		TokenType: tokenTypeOTP,
-		ExpiresAt: time.Now().UTC().Add(otpTokenTTL),
-	}); err != nil {
-		return "", time.Time{}, err
+		s.log.Warn("InitiateChallenge: GetUserMFAMethod failed, using email OTP",
+			zap.Error(err), zap.String("user_id", userID))
+		mfaMethod = "email"
 	}
 
-	secureURL := fmt.Sprintf("%s/account/security", s.frontEndDomain)
-	s.sendEmail(ctx, email, "Your login code", func() (string, error) {
-		return mailer.TwoFactorOTP(name, code, secureURL)
-	}, "initiate-challenge", userID)
+	if mfaMethod != "totp" {
+		if err = s.repo.InvalidateUserTokensByType(ctx, db.InvalidateUserTokensByTypeParams{
+			UserID:    userID,
+			TokenType: tokenTypeOTP,
+		}); err != nil {
+			return "", time.Time{}, err
+		}
+		code, otpHash, err := generateOTP(s.otpSecret)
+		if err != nil {
+			return "", time.Time{}, apperrors.Wrap(apperrors.ErrInternalServer, err)
+		}
+		if err = s.repo.CreateEmailToken(ctx, db.CreateEmailTokenParams{
+			ID:        uuid.NewString(),
+			UserID:    userID,
+			TokenHash: otpHash,
+			TokenType: tokenTypeOTP,
+			ExpiresAt: time.Now().UTC().Add(otpTokenTTL),
+		}); err != nil {
+			return "", time.Time{}, err
+		}
+		secureURL := fmt.Sprintf("%s/account/security", s.frontEndDomain)
+		s.sendEmail(ctx, email, "Your login code", func() (string, error) {
+			return mailer.TwoFactorOTP(name, code, secureURL)
+		}, "initiate-challenge", userID)
+	}
 
-	// Step 3: generate challenge token, store hash.
 	raw, challengeHash, err := generateURLToken()
 	if err != nil {
 		return "", time.Time{}, apperrors.Wrap(apperrors.ErrInternalServer, err)
@@ -435,11 +622,12 @@ func (s *service) InitiateChallenge(ctx context.Context, userID, email, name str
 		return "", time.Time{}, err
 	}
 
-	s.log.Info("mfa challenge initiated", zap.String("user_id", userID))
+	s.auditLog.Log(ctx, audit.EventMFAChallenged, userID, zap.String("method", mfaMethod))
+	s.log.Info("mfa challenge initiated", zap.String("user_id", userID), zap.String("method", mfaMethod))
 	return raw, expiresAt, nil
 }
 
-// ── SendVerification (JWT-protected) ─────────────────────────────────────────
+// ── SendVerification ──────────────────────────────────────────────────────────
 
 func (s *service) SendVerification(ctx context.Context, userID string) error {
 	log := logger.FromContext(ctx)
@@ -448,9 +636,8 @@ func (s *service) SendVerification(ctx context.Context, userID string) error {
 	if err != nil {
 		return err
 	}
-
 	if user.EmailVerifiedAt.Valid {
-		log.Debug("send-verification: address already verified, skipping", zap.String("user_id", userID))
+		log.Debug("send-verification: already verified", zap.String("user_id", userID))
 		return nil
 	}
 
@@ -458,14 +645,12 @@ func (s *service) SendVerification(ctx context.Context, userID string) error {
 	if err != nil {
 		return apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
-
 	if err = s.repo.InvalidateUserTokensByType(ctx, db.InvalidateUserTokensByTypeParams{
 		UserID:    userID,
 		TokenType: tokenTypeVerify,
 	}); err != nil {
 		return err
 	}
-
 	if err = s.repo.CreateEmailToken(ctx, db.CreateEmailTokenParams{
 		ID:        uuid.NewString(),
 		UserID:    userID,
@@ -477,15 +662,16 @@ func (s *service) SendVerification(ctx context.Context, userID string) error {
 	}
 
 	link := fmt.Sprintf("%s/auth/verify-email?token=%s", s.frontEndDomain, raw)
-	s.sendEmail(ctx, user.Email, "Verify your email address", func() (string, error) {
+	s.sendEmailSync(ctx, user.Email, "Verify your email address", func() (string, error) {
 		return mailer.VerifyEmail(user.Name, link)
 	}, "send-verification", userID)
 
-	log.Info("send-verification: verification email queued", zap.String("user_id", userID))
+	s.auditLog.Log(ctx, audit.EventVerificationSent, userID, zap.String("trigger", "authenticated"))
+	log.Info("send-verification: email sent", zap.String("user_id", userID))
 	return nil
 }
 
-// ── SendOTP (JWT-protected) ───────────────────────────────────────────────────
+// ── SendOTP ───────────────────────────────────────────────────────────────────
 
 func (s *service) SendOTP(ctx context.Context, userID string) error {
 	log := logger.FromContext(ctx)
@@ -494,19 +680,24 @@ func (s *service) SendOTP(ctx context.Context, userID string) error {
 	if err != nil {
 		return err
 	}
+	if !user.TwoFaEnabled {
+		return apperrors.New(
+			"TWO_FA_NOT_ENABLED",
+			"two-factor authentication is not enabled on this account",
+			http.StatusForbidden, nil,
+		)
+	}
 
-	code, hash, err := generateOTP()
+	code, hash, err := generateOTP(s.otpSecret)
 	if err != nil {
 		return apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
-
 	if err = s.repo.InvalidateUserTokensByType(ctx, db.InvalidateUserTokensByTypeParams{
 		UserID:    userID,
 		TokenType: tokenTypeOTP,
 	}); err != nil {
 		return err
 	}
-
 	if err = s.repo.CreateEmailToken(ctx, db.CreateEmailTokenParams{
 		ID:        uuid.NewString(),
 		UserID:    userID,
@@ -522,11 +713,134 @@ func (s *service) SendOTP(ctx context.Context, userID string) error {
 		return mailer.TwoFactorOTP(user.Name, code, secureURL)
 	}, "send-otp", userID)
 
+	s.auditLog.Log(ctx, audit.EventOTPSent, userID)
 	log.Info("send-otp: OTP queued", zap.String("user_id", userID))
 	return nil
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
+// ── TOTP lifecycle ────────────────────────────────────────────────────────────
+
+func (s *service) SetupTOTP(ctx context.Context, userID string) (secret, uri, qrBase64 string, err error) {
+	log := logger.FromContext(ctx)
+
+	user, err := s.repo.GetUserByID(ctx, userID)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	result, err := platformauth.GenerateTOTPSecret(platformauth.TOTPGenerateConfig{
+		Issuer: s.totpIssuer,
+		Period: s.totpPeriod,
+		Digits: s.totpDigits,
+		KeySet: s.totpKeySet,
+	}, user.Email)
+	if err != nil {
+		return "", "", "", apperrors.Wrap(apperrors.ErrInternalServer, err)
+	}
+
+	if err = s.repo.SetUserTOTPSecret(ctx, userID, result.EncryptedSecret); err != nil {
+		return "", "", "", err
+	}
+
+	s.auditLog.Log(ctx, audit.EventTOTPSetup, userID)
+	log.Info("totp-setup: pending secret stored", zap.String("user_id", userID))
+	return result.Secret, result.URI, result.QRCodeBase64, nil
+}
+
+func (s *service) EnableTOTP(ctx context.Context, userID, code string) error {
+	log := logger.FromContext(ctx)
+
+	encrypted, err := s.repo.GetUserTOTPSecretEncrypted(ctx, userID)
+	if err != nil {
+		return err
+	}
+	plainSecret, err := s.totpKeySet.Decrypt(encrypted)
+	if err != nil {
+		s.log.Error("enable-totp: decrypt secret", zap.Error(err), zap.String("user_id", userID))
+		return apperrors.ErrInternalServer
+	}
+
+	valid, err := platformauth.ValidateTOTP(code, plainSecret, s.totpPeriod, s.totpDigits)
+	if err != nil || !valid {
+		s.auditLog.Log(ctx, audit.EventTOTPFailed, userID, zap.String("reason", "invalid_code_during_enable"))
+		return apperrors.New("TOTP_CODE_INVALID",
+			"the provided TOTP code is incorrect — confirm your authenticator app is synced",
+			http.StatusUnprocessableEntity, nil)
+	}
+
+	if !s.replayCache.CheckAndRecord(userID, code) {
+		s.auditLog.Log(ctx, audit.EventTOTPFailed, userID, zap.String("reason", "replay_during_enable"))
+		return apperrors.New("TOTP_CODE_INVALID",
+			"the provided TOTP code is incorrect — confirm your authenticator app is synced",
+			http.StatusUnprocessableEntity, nil)
+	}
+
+	if err = s.repo.EnableUserTOTP(ctx, userID); err != nil {
+		return err
+	}
+
+	s.auditLog.Log(ctx, audit.EventTOTPEnabled, userID)
+	log.Info("totp-enable: TOTP activated", zap.String("user_id", userID))
+	return nil
+}
+
+func (s *service) DisableTOTP(ctx context.Context, userID, code string) error {
+	log := logger.FromContext(ctx)
+
+	encrypted, err := s.repo.GetUserTOTPSecretEncrypted(ctx, userID)
+	if err != nil {
+		if errors.Is(err, ErrTOTPNotSetup) {
+			return ErrTOTPNotSetup
+		}
+		s.log.Error("disable-totp: missing secret", zap.Error(err), zap.String("user_id", userID))
+		return apperrors.ErrInternalServer
+	}
+
+	plainSecret, err := s.totpKeySet.Decrypt(encrypted)
+	if err != nil {
+		s.log.Error("disable-totp: decrypt secret", zap.Error(err), zap.String("user_id", userID))
+		return apperrors.ErrInternalServer
+	}
+
+	valid, err := platformauth.ValidateTOTP(code, plainSecret, s.totpPeriod, s.totpDigits)
+	if err != nil || !valid {
+		s.auditLog.Log(ctx, audit.EventTOTPFailed, userID, zap.String("reason", "invalid_code_during_disable"))
+		return apperrors.New("TOTP_CODE_INVALID",
+			"the provided TOTP code is incorrect — confirm your authenticator app is synced",
+			http.StatusUnprocessableEntity, nil)
+	}
+
+	if !s.replayCache.CheckAndRecord(userID, code) {
+		s.auditLog.Log(ctx, audit.EventTOTPFailed, userID, zap.String("reason", "replay_during_disable"))
+		return apperrors.New("TOTP_CODE_INVALID",
+			"the provided TOTP code is incorrect — confirm your authenticator app is synced",
+			http.StatusUnprocessableEntity, nil)
+	}
+
+	if err := s.repo.DisableUserTOTP(ctx, userID); err != nil {
+		return err
+	}
+
+	s.auditLog.Log(ctx, audit.EventTOTPDisabled, userID)
+	log.Info("totp-disable: reverted to email OTP", zap.String("user_id", userID))
+	return nil
+}
+
+// ── Email dispatch helpers ────────────────────────────────────────────────────
+
+func (s *service) sendEmailSync(ctx context.Context, to, subject string, renderFn func() (string, error), op, userID string) {
+	if s.mailer == nil || !s.mailer.Enabled() {
+		return
+	}
+	html, err := renderFn()
+	if err != nil {
+		s.log.Error(op+": render email template", zap.Error(err), zap.String("user_id", userID))
+		return
+	}
+	if err = s.mailer.Send(ctx, mailer.Message{To: to, Subject: subject, HTML: html}); err != nil {
+		s.log.Error(op+": send email (sync)", zap.Error(err), zap.String("user_id", userID))
+	}
+}
 
 func (s *service) sendEmail(ctx context.Context, to, subject string, renderFn func() (string, error), op, userID string) {
 	if s.mailer == nil || !s.mailer.Enabled() {
@@ -537,10 +851,12 @@ func (s *service) sendEmail(ctx context.Context, to, subject string, renderFn fu
 		s.log.Error(op+": render email template", zap.Error(err), zap.String("user_id", userID))
 		return
 	}
-	if err = s.mailer.Send(ctx, mailer.Message{To: to, Subject: subject, HTML: html}); err != nil {
-		s.log.Error(op+": send email", zap.Error(err), zap.String("user_id", userID))
+	if err = s.mailer.Enqueue(ctx, mailer.Message{To: to, Subject: subject, HTML: html}); err != nil {
+		s.log.Warn(op+": enqueue email failed", zap.Error(err), zap.String("user_id", userID))
 	}
 }
+
+// ── Token generation helpers ──────────────────────────────────────────────────
 
 func generateURLToken() (raw, hash string, err error) {
 	b := make([]byte, 32)
@@ -552,13 +868,13 @@ func generateURLToken() (raw, hash string, err error) {
 	return raw, hash, nil
 }
 
-func generateOTP() (code, hash string, err error) {
+func generateOTP(secret string) (code, hash string, err error) {
 	max := big.NewInt(1_000_000)
 	n, err := rand.Int(rand.Reader, max)
 	if err != nil {
 		return "", "", fmt.Errorf("authemail: generate otp: %w", err)
 	}
 	code = fmt.Sprintf("%06d", n.Int64())
-	hash = platformauth.HashRefreshToken(code)
+	hash = platformauth.HMACToken(code, secret)
 	return code, hash, nil
 }

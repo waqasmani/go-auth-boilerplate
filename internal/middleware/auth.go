@@ -52,19 +52,25 @@ func Auth(jwtHelper *platformauth.JWT, log *zap.Logger) gin.HandlerFunc {
 	}
 }
 
-// MustGetClaims extracts JWT claims from the gin context.
-// It panics when claims are absent, which means the Auth middleware was not
-// applied before this handler. Use only on routes that are protected by Auth.
-func MustGetClaims(c *gin.Context) *platformauth.Claims {
+// GetClaims extracts JWT claims from the gin context. The second return value
+// reports whether claims were present and well-typed. Returns false when the
+// Auth middleware was not applied before the calling handler, surfacing
+// route mis-wiring as a 401 at test time rather than a panic in production.
+//
+//	claims, ok := middleware.GetClaims(c)
+//	if !ok {
+//	    response.Error(c, apperrors.ErrUnauthorized)
+//	    c.Abort()
+//	    return
+//	}
+func GetClaims(c *gin.Context) (*platformauth.Claims, bool) {
 	val, exists := c.Get(ClaimsKey)
 	if !exists {
-		panic("middleware: MustGetClaims called on a route without Auth middleware — " +
-			"add middleware.Auth to the route group")
+		return nil, false
 	}
 	claims, ok := val.(*platformauth.Claims)
 	if !ok || claims == nil {
-		panic("middleware: ClaimsKey is set but does not contain *platformauth.Claims — " +
-			"this is a bug in the Auth middleware")
+		return nil, false
 	}
-	return claims
+	return claims, true
 }

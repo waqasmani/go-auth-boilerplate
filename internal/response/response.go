@@ -2,8 +2,8 @@ package response
 
 import (
 	"errors"
+	"mime"
 	"net/http"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-playground/validator/v10"
@@ -59,7 +59,6 @@ func Error(c *gin.Context, err error) {
 		})
 		return
 	}
-	// Fallback for non-app errors
 	c.JSON(http.StatusInternalServerError, Response{
 		Success: false,
 		Error: &ErrorBody{
@@ -83,21 +82,27 @@ func ValidationError(c *gin.Context, details map[string]string) {
 
 // BindAndValidate binds the request body as JSON and validates the resulting
 // struct against business rules. It returns a typed AppError on failure.
+//
+// Content-Type validation uses mime.ParseMediaType for strict RFC 7231
+// compliance — only "application/json" is accepted regardless of charset or
+// other parameters. This prevents mis-typed media types such as
+// "application/jsonp" from bypassing the check, which strings.HasPrefix
+// would have allowed.
+//
+// Body-size handling: the router wraps every request body in a
+// MaxBytesReader(64 KiB) before routing. When the client sends more than
+// 64 KiB, the underlying Read call returns *http.MaxBytesError, which
+// json.Decoder propagates unwrapped. We detect it here with errors.As —
+// available since Go 1.19, which is the minimum version implied by the
+// dependencies in this module — and return 413 Content Too Large rather than
+// the generic 422 that the catch-all ShouldBindJSON branch would produce.
+// The check must come before the generic branch because *http.MaxBytesError
+// is not a JSON syntax error and should not be reported as one.
 func BindAndValidate(c *gin.Context, req any, v *validator.Validate) bool {
-	// Reject requests whose Content-Type is not application/json before
-	// attempting to decode the body.
-	//
-	// HasPrefix rather than exact equality tolerates legitimate variations
-	// such as "application/json; charset=utf-8" that some clients send.
-	//
-	// This check runs before ShouldBindJSON for two reasons:
-	//   1. ShouldBindJSON will happily decode any body regardless of the
-	//      declared media type, so a text/plain body containing valid JSON
-	//      would otherwise succeed silently.
-	//   2. When Content-Type is correct but the body is absent, the error
-	//      from ShouldBindJSON ("EOF") is unambiguous and the existing
-	//      "malformed or invalid JSON body" message is accurate.
-	if ct := c.GetHeader("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+	// Reject requests whose Content-Type is not application/json.
+	ct := c.GetHeader("Content-Type")
+	mediaType, _, err := mime.ParseMediaType(ct)
+	if err != nil || mediaType != "application/json" {
 		c.JSON(http.StatusUnsupportedMediaType, Response{
 			Success: false,
 			Error: &ErrorBody{
@@ -109,6 +114,23 @@ func BindAndValidate(c *gin.Context, req any, v *validator.Validate) bool {
 	}
 
 	if err := c.ShouldBindJSON(req); err != nil {
+		// ── Body-size guard ──────────────────────────────────────────────────
+		// *http.MaxBytesError is returned when the MaxBytesReader installed by
+		// the router middleware fires. It must be checked before the generic
+		// branch below so that oversized bodies produce 413 Content Too Large
+		// (RFC 9110 §15.5.14) rather than 422 Unprocessable Entity.
+		//
+		// errors.As traverses the full error chain, which is necessary because
+		// json.Decoder may wrap the read error in a *json.SyntaxError or
+		// return it directly depending on where in the stream the limit fires.
+		// Using errors.As handles both cases without brittle string matching.
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			Error(c, apperrors.ErrRequestTooLarge)
+			return false
+		}
+
+		// ── Generic JSON decode failure ───────────────────────────────────────
 		ValidationError(c, map[string]string{"body": "malformed or invalid JSON body"})
 		return false
 	}
@@ -122,7 +144,6 @@ func BindAndValidate(c *gin.Context, req any, v *validator.Validate) bool {
 			}
 			ValidationError(c, fields)
 		} else {
-			// Catch-all: still must write a response.
 			ValidationError(c, map[string]string{"body": "invalid request format"})
 		}
 		return false
@@ -133,15 +154,13 @@ func BindAndValidate(c *gin.Context, req any, v *validator.Validate) bool {
 
 // fieldName extracts the JSON tag name from the validator FieldError so the
 // response key matches what the client sent, not the Go struct field name.
-// "Password" (struct) → "password" (json tag) closes a secondary leak where
-// internal naming conventions are visible to API consumers.
 func fieldName(fe validator.FieldError) string {
 	return fe.Field()
 }
 
 // humanMessage converts a validator tag into a generic, non-revealing message.
-// It deliberately omits parameter values (fe.Param()) to avoid leaking schema
-// constraints such as minimum password length or maximum field sizes.
+// Parameter values (fe.Param()) are intentionally omitted to avoid leaking
+// schema constraints such as minimum password length or maximum field sizes.
 func humanMessage(tag string) string {
 	switch tag {
 	case "required":
@@ -160,6 +179,10 @@ func humanMessage(tag string) string {
 		return "value is not one of the accepted options"
 	case "alphanum":
 		return "only alphanumeric characters are allowed"
+	case "len":
+		return "value does not match the required length"
+	case "numeric":
+		return "only numeric characters are allowed"
 	default:
 		return "invalid field format"
 	}

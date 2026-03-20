@@ -23,26 +23,34 @@ type Repository interface {
 	CreateUser(ctx context.Context, params db.CreateUserParams) error
 	CreateRefreshToken(ctx context.Context, params db.CreateRefreshTokenParams) error
 	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (*db.RefreshToken, error)
+	// GetRefreshTokenByHashForUpdate is the FOR UPDATE variant of
+	// GetRefreshTokenByHash. It must only be called inside a WithTx closure
+	// so that the InnoDB row lock is held for the duration of the transaction.
+	// Calling it outside a transaction acquires a lock that is released
+	// immediately, which provides no serialisation guarantee.
+	//
+	// The lock serialises the state checks and the subsequent
+	// ConsumeRefreshToken UPDATE, eliminating the TOCTOU window that existed
+	// when those checks happened on the pre-transaction non-locking read.
+	GetRefreshTokenByHashForUpdate(ctx context.Context, tokenHash string) (*db.RefreshToken, error)
 	AssignUserRole(ctx context.Context, userID, roleName string) error
 	ConsumeRefreshToken(ctx context.Context, id string) (bool, error)
 	RevokeRefreshTokenFamily(ctx context.Context, family string) error
+	// DeleteExpiredRefreshTokens purges rows whose expires_at is in the past.
+	// Called periodically by the background cleanup goroutine started in
+	// app.Run to prevent unbounded table growth. Returns the number of deleted
+	// rows for logging.
+	DeleteExpiredRefreshTokens(ctx context.Context) (int64, error)
 	WithTx(ctx context.Context, fn func(tx Repository) error) error
 }
 
 // repository is the concrete implementation backed by sqlc Queries.
-//
-// Both sqlDB and queries are stored so WithTx can open a real *sql.Tx
-// and wrap the existing prepared statements via queries.WithTx(tx).
-// Ownership of both belongs to the caller (app.go); this type never closes them.
 type repository struct {
 	sqlDB   *sql.DB
 	queries *db.Queries
 }
 
 // NewRepository constructs an auth repository backed by sqlc Queries.
-//
-// sqlDB is required for WithTx — it is used only to call BeginTx; all normal
-// queries go through the prepared-statement handles in queries.
 func NewRepository(sqlDB *sql.DB, queries *db.Queries) Repository {
 	return &repository{sqlDB: sqlDB, queries: queries}
 }
@@ -61,7 +69,6 @@ func (r *repository) WithTx(ctx context.Context, fn func(tx Repository) error) e
 	}
 
 	if err = fn(txRepo); err != nil {
-		// Best-effort rollback: the original fn error is what matters to the caller.
 		_ = tx.Rollback()
 		return err
 	}
@@ -70,6 +77,44 @@ func (r *repository) WithTx(ctx context.Context, fn func(tx Repository) error) e
 		return apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
 	return nil
+}
+
+// DeleteExpiredRefreshTokens removes all refresh_tokens rows whose expires_at
+// is before the current UTC time.
+func (r *repository) DeleteExpiredRefreshTokens(ctx context.Context) (int64, error) {
+	const batchSize = 10_000
+	var total int64
+
+	for {
+		// Check context before each batch so a shutdown signal or per-tick
+		// timeout aborts cleanly without leaving a multi-batch delete partially
+		// complete (partial completion is safe — the next tick picks up where
+		// this one left off).
+		if err := ctx.Err(); err != nil {
+			return total, apperrors.Wrap(apperrors.ErrInternalServer, err)
+		}
+
+		result, err := r.sqlDB.ExecContext(ctx,
+			`DELETE FROM refresh_tokens
+			  WHERE expires_at < UTC_TIMESTAMP()
+			  LIMIT ?`,
+			batchSize,
+		)
+		if err != nil {
+			return total, apperrors.Wrap(apperrors.ErrInternalServer, err)
+		}
+
+		n, _ := result.RowsAffected()
+		total += n
+
+		// When a batch deletes fewer rows than the limit, all expired rows have
+		// been removed. Exiting here also prevents an extra no-op round-trip.
+		if n < batchSize {
+			break
+		}
+	}
+
+	return total, nil
 }
 
 func (r *repository) GetUserByEmail(ctx context.Context, email string) (*db.User, error) {
@@ -102,6 +147,7 @@ func (r *repository) AssignUserRole(ctx context.Context, userID, roleName string
 	}
 	return nil
 }
+
 func (r *repository) GetUserByID(ctx context.Context, id string) (*db.User, error) {
 	user, err := r.queries.GetUserByID(ctx, id)
 	if err != nil {
@@ -115,7 +161,6 @@ func (r *repository) GetUserByID(ctx context.Context, id string) (*db.User, erro
 
 func (r *repository) CreateUser(ctx context.Context, params db.CreateUserParams) error {
 	if err := r.queries.CreateUser(ctx, params); err != nil {
-		// Check for MySQL duplicate entry error (unique constraint violation on email)
 		var mysqlErr *mysql.MySQLError
 		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1062 {
 			return apperrors.ErrEmailAlreadyExists
@@ -129,9 +174,6 @@ func (r *repository) CreateRefreshToken(ctx context.Context, params db.CreateRef
 	if err := r.queries.CreateRefreshToken(ctx, params); err != nil {
 		var mysqlErr *mysql.MySQLError
 		if errors.As(err, &mysqlErr) && mysqlErr.Number == 1452 {
-			// The user was deleted between the read and this write.
-			// Surfacing ErrNotFound lets the service return a 404/401
-			// rather than an opaque 500.
 			return apperrors.Wrap(apperrors.ErrNotFound, err)
 		}
 		return apperrors.Wrap(apperrors.ErrInternalServer, err)
@@ -150,9 +192,25 @@ func (r *repository) GetRefreshTokenByHash(ctx context.Context, tokenHash string
 	return &token, nil
 }
 
-// ConsumeRefreshToken calls the atomic UPDATE and converts sql.Result →
-// bool. RowsAffected == 1 means this caller won the race; 0 means the
-// token was already consumed or revoked by a concurrent request.
+// GetRefreshTokenByHashForUpdate is the FOR UPDATE variant. It must only be
+// called inside a WithTx closure — see the Repository interface for the full
+// contract. The error mapping is identical to GetRefreshTokenByHash so the
+// service can treat both calls uniformly.
+func (r *repository) GetRefreshTokenByHashForUpdate(ctx context.Context, tokenHash string) (*db.RefreshToken, error) {
+	token, err := r.queries.GetRefreshTokenByHashForUpdate(ctx, tokenHash)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// The token existed when GetRefreshTokenByHash was called moments
+			// ago but is gone now. Treat as invalid rather than an internal
+			// error — the token may have been purged by the cleanup job in the
+			// narrow window between the fast-reject read and the tx start.
+			return nil, apperrors.ErrTokenInvalid
+		}
+		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
+	}
+	return &token, nil
+}
+
 func (r *repository) ConsumeRefreshToken(ctx context.Context, id string) (bool, error) {
 	result, err := r.queries.ConsumeRefreshToken(ctx, id)
 	if err != nil {
@@ -182,14 +240,11 @@ func (r *repository) GetUserByEmailWithRoles(ctx context.Context, email string) 
 	}
 
 	result := &UserWithRoles{
-		ID:           rows[0].ID,
-		Name:         rows[0].Name,
-		Email:        rows[0].Email,
-		Roles:        []string{},
-		PasswordHash: rows[0].PasswordHash,
-		// TwoFaEnabled is TINYINT(1); sqlc maps it to bool with tinyInt1isBool=true
-		// in the DSN or a type_override in sqlc.yaml. If your generated type is
-		// int8 instead, change to: rows[0].TwoFaEnabled != 0
+		ID:            rows[0].ID,
+		Name:          rows[0].Name,
+		Email:         rows[0].Email,
+		Roles:         []string{},
+		PasswordHash:  rows[0].PasswordHash,
 		TwoFAEnabled:  rows[0].TwoFaEnabled,
 		EmailVerified: rows[0].EmailVerifiedAt.Valid,
 		CreatedAt:     rows[0].CreatedAt,

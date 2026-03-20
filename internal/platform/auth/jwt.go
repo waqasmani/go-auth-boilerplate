@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -30,17 +31,15 @@ import (
 // No downtime. No forced re-login.
 type JWTKey struct {
 	// ID is the value written into the JWT "kid" header and used to look up the
-	// correct secret during validation.  Must be unique across the key set.
-	// Use a short opaque string (e.g. "v1", "2024-01", a UUID fragment).
+	// correct secret during validation. Must be unique across the key set.
 	ID string
 
-	// Secret is the raw HMAC signing secret.  Minimum 32 bytes recommended;
-	// 64 bytes is preferred for HS256.  Never reuse a secret across key IDs.
+	// Secret is the raw HMAC signing secret. Minimum 32 bytes required;
+	// 64 bytes is preferred for HS256. Never reuse a secret across key IDs.
 	Secret string
 
 	// Active marks the single key used to sign newly issued tokens.
 	// Exactly one key in the set must have Active: true.
-	// Inactive keys are kept to validate tokens issued before the last rotation.
 	Active bool
 }
 
@@ -52,7 +51,7 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
-// TokenPair holds an access and refresh token.
+// TokenPair holds an access and refresh token pair returned by GenerateTokenPair.
 type TokenPair struct {
 	AccessToken        string
 	RefreshToken       string // raw token (returned to client)
@@ -64,10 +63,8 @@ type TokenPair struct {
 
 // JWTConfig holds JWT configuration.
 type JWTConfig struct {
-	// Keys is the full key set.  Must contain exactly one Active key.
-	// All other keys are kept for validation during rolling rotation.
-	Keys []JWTKey
-
+	// Keys is the full key set. Must contain exactly one Active key.
+	Keys       []JWTKey
 	Issuer     string
 	Audience   string
 	AccessTTL  time.Duration
@@ -76,27 +73,25 @@ type JWTConfig struct {
 
 // JWT provides token generation and validation with support for key rotation.
 //
-// Signing always uses the single Active key.
-// Validation looks up the key by the "kid" header so tokens issued before a
-// rotation continue to validate until they expire naturally.
+// Signing always uses the single Active key. Validation looks up the key by
+// the "kid" header so tokens issued before a rotation continue to validate
+// until they expire naturally.
 type JWT struct {
 	cfg       JWTConfig
-	activeKey JWTKey            // the one key with Active==true; selected at construction
-	keyByID   map[string]JWTKey // O(1) lookup during validation
+	activeKey JWTKey
+	keyByID   map[string]JWTKey
 }
 
-// NewJWT creates a new JWT helper.  It panics at startup — not at request time
-// — when the key set is invalid so a misconfiguration is caught immediately
-// rather than silently producing unverifiable tokens in production.
-//
-// Invariants enforced:
-//   - at least one key must be present
-//   - every key must have a non-empty ID and non-empty Secret
-//   - no two keys may share the same ID
-//   - exactly one key must have Active: true
-func NewJWT(cfg JWTConfig) *JWT {
+// NewJWT creates and validates a JWT helper. Returns an error describing the
+// exact misconfiguration so container.New can surface it as a structured
+// startup error rather than a raw stack trace. Common failure modes:
+//   - JWT_KEYS / JWT_SECRET missing or malformed (caught by config.Load first,
+//     but double-checked here in case the struct is built directly in tests).
+//   - No key has Active: true, or more than one does.
+//   - A key secret is shorter than 32 bytes (RFC 7518 §3.2 minimum for HS256).
+func NewJWT(cfg JWTConfig) (*JWT, error) {
 	if len(cfg.Keys) == 0 {
-		panic("jwt: Keys is empty — provide at least one key")
+		return nil, fmt.Errorf("jwt: Keys is empty — provide at least one key")
 	}
 
 	keyByID := make(map[string]JWTKey, len(cfg.Keys))
@@ -105,24 +100,19 @@ func NewJWT(cfg JWTConfig) *JWT {
 
 	for _, k := range cfg.Keys {
 		if k.ID == "" {
-			panic("jwt: a key has an empty ID — every key must have a unique non-empty ID")
+			return nil, fmt.Errorf("jwt: a key has an empty ID — every key must have a unique non-empty ID")
 		}
 		if k.Secret == "" {
-			panic(fmt.Sprintf("jwt: key %q has an empty Secret", k.ID))
+			return nil, fmt.Errorf("jwt: key %q has an empty Secret", k.ID)
 		}
-		// ── NEW ──────────────────────────────────────────────────────────────────
-		// Defense-in-depth: config.validateJWTKeys enforces this first.
-		// This panic fires only when NewJWT is called outside the normal
-		// config.Load → app.New path (e.g. in a test helper or a future CLI tool).
 		if len(k.Secret) < 32 {
-			panic(fmt.Sprintf(
+			return nil, fmt.Errorf(
 				"jwt: key %q secret is %d bytes — minimum 32 bytes required for HS256 (RFC 7518 §3.2)",
 				k.ID, len(k.Secret),
-			))
+			)
 		}
-		// ─────────────────────────────────────────────────────────────────────────
 		if _, dup := keyByID[k.ID]; dup {
-			panic(fmt.Sprintf("jwt: duplicate key ID %q — key IDs must be unique", k.ID))
+			return nil, fmt.Errorf("jwt: duplicate key ID %q — key IDs must be unique", k.ID)
 		}
 		keyByID[k.ID] = k
 		if k.Active {
@@ -133,25 +123,23 @@ func NewJWT(cfg JWTConfig) *JWT {
 
 	switch activeCount {
 	case 0:
-		panic("jwt: no active key — exactly one key must have Active: true")
+		return nil, fmt.Errorf("jwt: no active key — exactly one key must have Active: true")
 	case 1:
 		// correct
 	default:
-		panic(fmt.Sprintf("jwt: %d keys have Active: true — exactly one key must be active", activeCount))
+		return nil, fmt.Errorf("jwt: %d keys have Active: true — exactly one key must be active", activeCount)
 	}
 
-	return &JWT{cfg: cfg, activeKey: activeKey, keyByID: keyByID}
+	return &JWT{cfg: cfg, activeKey: activeKey, keyByID: keyByID}, nil
 }
 
-// generateSecureToken creates a URL-safe base64 encoded string
-// with n bytes of entropy (n * 8 bits).
-// 64 bytes = 512 bits of entropy.
+// generateSecureToken creates a URL-safe base64-encoded string with 64 bytes
+// (512 bits) of cryptographic entropy.
 func generateSecureToken() (string, error) {
 	b := make([]byte, 64)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("crypto: generate token: %w", err)
 	}
-	// Use URL-safe encoding without padding for cookies/headers
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
@@ -159,7 +147,7 @@ func generateSecureToken() (string, error) {
 // The access token is signed with the active key and carries a "kid" header
 // so ValidateAccessToken can look up the correct secret without ambiguity.
 //
-// family can be empty (new login, a fresh family UUID is generated) or
+// family can be empty (new login — a fresh family UUID is generated) or
 // provided (token rotation continues the existing session family).
 func (j *JWT) GenerateTokenPair(userID, email string, roles []string, family string) (*TokenPair, error) {
 	now := time.Now().UTC()
@@ -179,10 +167,6 @@ func (j *JWT) GenerateTokenPair(userID, email string, roles []string, family str
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims)
-
-	// Set kid so ValidateAccessToken can select the right secret without
-	// having to try every key in the set.  This is safe to include in the
-	// header because it names the key, not the secret.
 	token.Header["kid"] = j.activeKey.ID
 
 	signedAccess, err := token.SignedString([]byte(j.activeKey.Secret))
@@ -194,9 +178,6 @@ func (j *JWT) GenerateTokenPair(userID, email string, roles []string, family str
 	if err != nil {
 		return nil, fmt.Errorf("jwt: generate refresh token: %w", err)
 	}
-	hashedRefresh := hashToken(rawRefresh)
-	refreshExp := now.Add(j.cfg.RefreshTTL)
-	accessExp := now.Add(j.cfg.AccessTTL)
 
 	if family == "" {
 		family = uuid.NewString()
@@ -205,47 +186,47 @@ func (j *JWT) GenerateTokenPair(userID, email string, roles []string, family str
 	return &TokenPair{
 		AccessToken:        signedAccess,
 		RefreshToken:       rawRefresh,
-		RefreshTokenHashed: hashedRefresh,
+		RefreshTokenHashed: hashToken(rawRefresh),
 		RefreshTokenFamily: family,
-		RefreshExpiresAt:   refreshExp,
-		AccessExpiresAt:    accessExp,
+		RefreshExpiresAt:   now.Add(j.cfg.RefreshTTL),
+		AccessExpiresAt:    now.Add(j.cfg.AccessTTL),
 	}, nil
 }
 
 // ValidateAccessToken parses and validates a signed JWT access token.
 //
-// The "kid" header is read from the (unverified) token header, the
-// corresponding key is looked up in the key set, and the signature is
-// verified with that key's secret.  This means tokens issued before a key
-// rotation continue to validate as long as their issuing key remains in the
-// set — the active/inactive flag only governs signing.
+// Validation order is intentional and must not be changed:
+//  1. Signing algorithm is verified FIRST — this prevents algorithm-confusion
+//     attacks where an attacker substitutes a public key as an HMAC secret.
+//     Only HMAC variants (HS256/HS384/HS512) are accepted; any other method
+//     causes immediate rejection before any key material is touched.
+//  2. Key lookup by "kid" header — only reached when the algorithm is
+//     confirmed safe. Tokens issued before a key rotation continue to validate
+//     as long as their issuing key remains in the set.
 func (j *JWT) ValidateAccessToken(tokenStr string) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(
 		tokenStr,
 		&Claims{},
 		func(t *jwt.Token) (interface{}, error) {
+			// ── Step 1: algorithm check — MUST come before key lookup ──────────
+			// Rejecting non-HMAC methods here prevents algorithm-confusion
+			// attacks (e.g. RS256 / "none") regardless of the kid value.
 			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+				return nil, fmt.Errorf(
+					"jwt: algorithm %q is not accepted — only HMAC variants (HS256/HS384/HS512) are allowed",
+					t.Header["alg"],
+				)
 			}
 
-			// Extract kid from the parsed (but not yet verified) header.
-			// The library guarantees the header is decoded before the keyfunc
-			// is called, so this is always populated for well-formed tokens.
+			// ── Step 2: kid lookup — only reached when algorithm is safe ───────
 			kid, ok := t.Header["kid"].(string)
 			if !ok || kid == "" {
-				// Tokens without a kid were issued before this fix was deployed.
-				// Reject them so we don't silently accept unidentified tokens
-				// after a rotation removes the old secret from the key set.
-				return nil, fmt.Errorf("jwt: missing kid header — token must be re-issued")
+				return nil, fmt.Errorf("jwt: missing or non-string kid header — token must be re-issued")
 			}
-
 			key, found := j.keyByID[kid]
 			if !found {
-				// The key was removed from the set (post-rotation cleanup) or
-				// the token was forged with an unknown kid.
 				return nil, fmt.Errorf("jwt: unknown kid %q — token must be re-issued", kid)
 			}
-
 			return []byte(key.Secret), nil
 		},
 		jwt.WithIssuer(j.cfg.Issuer),
@@ -268,9 +249,34 @@ func (j *JWT) ValidateAccessToken(tokenStr string) (*Claims, error) {
 }
 
 // HashRefreshToken returns the SHA-256 hex hash of a raw refresh token.
+//
+// Only use this for high-entropy inputs such as the 64-byte opaque refresh
+// tokens and URL-safe email tokens produced by generateSecureToken /
+// generateURLToken. For low-entropy inputs such as 6-digit OTP codes use
+// HMACToken — the full 1,000,000-value OTP space can be precomputed in
+// milliseconds against a plain SHA-256 digest.
 func HashRefreshToken(raw string) string {
 	return hashToken(raw)
 }
+
+// HMACToken returns an HMAC-SHA256 hex digest of raw keyed with secret.
+//
+// Use this — not HashRefreshToken — for any low-entropy input such as a
+// 6-digit numeric OTP. Without a server-side secret, all 1,000,000 possible
+// SHA-256 digests can be precomputed in milliseconds, making any stored hash
+// trivially reversible by anyone with read access to the database. Keying the
+// digest with a secret known only to the server eliminates that attack
+// regardless of input entropy.
+//
+// secret must be at least 32 bytes; enforced at startup by config.Load via
+// the OTP_HMAC_SECRET minimum-length check.
+func HMACToken(raw, secret string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(raw))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// ── internal helpers ──────────────────────────────────────────────────────────
 
 func hashToken(raw string) string {
 	sum := sha256.Sum256([]byte(raw))
