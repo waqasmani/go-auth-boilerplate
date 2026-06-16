@@ -10,7 +10,10 @@ on:
 # Keep GO_VERSION in sync with the Dockerfile's GO_VERSION build arg so the
 # image ships on the same toolchain the gate runs on.
 env:
-  GO_VERSION: "1.25.8"
+  # Pinned to a Go patch that clears the stdlib DoS CVEs flagged by the image
+  # scan (crypto/x509, crypto/tls, net, net/mail, net/http/httputil). Keep in
+  # sync with the Dockerfile GO_VERSION build arg.
+  GO_VERSION: "1.25.11"
   # Coverage floor over ./internal/... . This is a regression guard, not a
   # target — ratchet it up as coverage improves. (Generated db/ and wiring code
   # drag the headline number down; the security primitives are well covered.)
@@ -117,7 +120,9 @@ jobs:
           cache: true
       - name: gosec
         run: |
-          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          # Pinned: gosec's taint rules (G70x) change between releases; an
+          # unpinned @latest silently broke this gate once already.
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.27.1
           # Gate on high-severity findings to keep false positives from blocking
           # CI; run `make sec` locally for the full report. -exclude-generated
           # skips sqlc/swagger-generated files.

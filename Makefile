@@ -556,8 +556,8 @@ install-tools: ## Install all required dev tools (sqlc, mockgen, migrate, golang
 	$(call log,install-tools,Installing dev tools)
 	go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest
 	go install go.uber.org/mock/mockgen@latest
-	go install -tags 'mysql' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
-	go install github.com/securego/gosec/v2/cmd/gosec@latest
+	go install -tags 'mysql' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.1
+	go install github.com/securego/gosec/v2/cmd/gosec@v2.27.1
 	go install golang.org/x/vuln/cmd/govulncheck@latest
 	go install github.com/air-verse/air@latest
 	go install github.com/swaggo/swag/cmd/swag@latest

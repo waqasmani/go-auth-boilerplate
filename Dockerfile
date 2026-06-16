@@ -1,7 +1,7 @@
 # ─── Build Stage ──────────────────────────────────────────────────────────────
 # GO_VERSION is kept in sync with .github/workflows/ci.yml (env.GO_VERSION) so
 # the shipped image is built with the same toolchain that runs the test gate.
-ARG GO_VERSION=1.25.8
+ARG GO_VERSION=1.25.11
 FROM golang:${GO_VERSION}-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates tzdata
