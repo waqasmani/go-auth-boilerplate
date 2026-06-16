@@ -211,11 +211,10 @@ func ValidateTOTP(code, secret string, period uint, digits otp.Digits) (bool, er
 // encryptWithKey encrypts plaintext and prepends the key ID length + key ID.
 // Returned layout: [1-byte idLen][idBytes][12-byte nonce][GCM ciphertext+tag]
 func encryptWithKey(k TOTPEncKey, plaintext string) ([]byte, error) {
-	block, gcm, err := newGCM(k.Key)
+	gcm, err := newGCM(k.Key)
 	if err != nil {
 		return nil, err
 	}
-	_ = block
 	nonce := make([]byte, gcm.NonceSize())
 	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, fmt.Errorf("totp: nonce: %w", err)
@@ -232,7 +231,7 @@ func encryptWithKey(k TOTPEncKey, plaintext string) ([]byte, error) {
 
 // decryptWithKey decrypts the nonce-prefixed GCM payload (without the key ID prefix).
 func decryptWithKey(k TOTPEncKey, payload []byte) (string, error) {
-	_, gcm, err := newGCM(k.Key)
+	gcm, err := newGCM(k.Key)
 	if err != nil {
 		return "", err
 	}
@@ -247,15 +246,19 @@ func decryptWithKey(k TOTPEncKey, payload []byte) (string, error) {
 	return string(plain), nil
 }
 
-func newGCM(rawKey string) (cipher.Block, cipher.AEAD, error) {
-	key := []byte(rawKey)[:32]
-	block, err := aes.NewCipher(key)
+func newGCM(rawKey string) (cipher.AEAD, error) {
+	// Guard the slice: NewTOTPKeySet validates >=32 bytes at startup, but error
+	// (don't panic) if any future call path constructs a key without that check.
+	if len(rawKey) < 32 {
+		return nil, fmt.Errorf("totp: key is %d bytes — minimum 32 required for AES-256", len(rawKey))
+	}
+	block, err := aes.NewCipher([]byte(rawKey)[:32])
 	if err != nil {
-		return nil, nil, fmt.Errorf("totp: aes cipher: %w", err)
+		return nil, fmt.Errorf("totp: aes cipher: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, nil, fmt.Errorf("totp: gcm: %w", err)
+		return nil, fmt.Errorf("totp: gcm: %w", err)
 	}
-	return block, gcm, nil
+	return gcm, nil
 }
