@@ -6,13 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"os"
 	"strings"
 )
 
 // ── JWT key loading ──────────────────────────────────────────────────────────
 func loadJWTKeys() ([]JWTKeyConfig, error) {
-	if raw := os.Getenv("JWT_KEYS"); raw != "" {
+	if raw := env("JWT_KEYS"); raw != "" {
 		var keys []JWTKeyConfig
 		if err := json.Unmarshal([]byte(raw), &keys); err != nil {
 			return nil, fmt.Errorf("JWT_KEYS: invalid JSON: %w", err)
@@ -22,7 +21,7 @@ func loadJWTKeys() ([]JWTKeyConfig, error) {
 		}
 		return keys, nil
 	}
-	secret := os.Getenv("JWT_SECRET")
+	secret := env("JWT_SECRET")
 	if secret == "" {
 		return nil, &MissingEnvError{Keys: []string{"JWT_KEYS (or legacy JWT_SECRET)"}}
 	}
@@ -69,7 +68,7 @@ func validateJWTKeysInternal(keys []JWTKeyConfig) error {
 
 // ── TOTP key loading ─────────────────────────────────────────────────────────
 func loadTOTPKeys() ([]TOTPKeyConfig, error) {
-	if raw := os.Getenv("TOTP_KEYS"); raw != "" {
+	if raw := env("TOTP_KEYS"); raw != "" {
 		var keys []TOTPKeyConfig
 		if err := json.Unmarshal([]byte(raw), &keys); err != nil {
 			return nil, fmt.Errorf("TOTP_KEYS: invalid JSON: %w", err)
@@ -79,7 +78,7 @@ func loadTOTPKeys() ([]TOTPKeyConfig, error) {
 		}
 		return keys, nil
 	}
-	secret := os.Getenv("TOTP_SECRET")
+	secret := env("TOTP_SECRET")
 	if secret == "" {
 		return nil, &MissingEnvError{Keys: []string{"TOTP_KEYS (or legacy TOTP_SECRET)"}}
 	}
@@ -190,7 +189,7 @@ func loadOAuthProviders() (map[string]OAuthProviderConfig, error) {
 
 // ── OAuth token key loading ──────────────────────────────────────────────────
 func loadOAuthTokenKeys() ([]OAuthTokenKeyConfig, error) {
-	if raw := os.Getenv("OAUTH_TOKEN_KEYS"); raw != "" {
+	if raw := env("OAUTH_TOKEN_KEYS"); raw != "" {
 		var keys []OAuthTokenKeyConfig
 		if err := json.Unmarshal([]byte(raw), &keys); err != nil {
 			return nil, fmt.Errorf("OAUTH_TOKEN_KEYS: invalid JSON: %w", err)
@@ -200,7 +199,7 @@ func loadOAuthTokenKeys() ([]OAuthTokenKeyConfig, error) {
 		}
 		return keys, nil
 	}
-	secret := os.Getenv("OAUTH_TOKEN_SECRET")
+	secret := env("OAUTH_TOKEN_SECRET")
 	if secret == "" {
 		return nil, nil
 	}
@@ -258,7 +257,7 @@ func validateOAuthTokenKeysInternal(keys []OAuthTokenKeyConfig) error {
 // REDIS_ENABLED is no longer a valid configuration key — remove it from your
 // environment if it was previously set.
 func loadRedisConfig(cfg *Config) error {
-	redisDSN := os.Getenv("REDIS_DSN")
+	redisDSN := env("REDIS_DSN")
 	if redisDSN == "" {
 		return fmt.Errorf(
 			"REDIS_DSN is required — Redis is a mandatory dependency with no in-memory fallback. " +

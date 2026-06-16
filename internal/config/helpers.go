@@ -4,7 +4,6 @@ package config
 
 import (
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -12,7 +11,7 @@ import (
 
 // getEnv returns the value of an environment variable or a fallback.
 func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
+	if v := env(key); v != "" {
 		return v
 	}
 	return fallback
@@ -35,7 +34,7 @@ func parseDuration(key, fallback string) (time.Duration, error) {
 
 // parseFloat parses an environment variable as float64.
 func parseFloat(key string, fallback float64) float64 {
-	raw := os.Getenv(key)
+	raw := env(key)
 	if raw == "" {
 		return fallback
 	}
@@ -48,7 +47,7 @@ func parseFloat(key string, fallback float64) float64 {
 
 // parseInt parses an environment variable as int.
 func parseInt(key string, fallback int) (int, error) {
-	raw := os.Getenv(key)
+	raw := env(key)
 	if raw == "" {
 		return fallback, nil
 	}
@@ -61,7 +60,7 @@ func parseInt(key string, fallback int) (int, error) {
 
 // parseBool parses an environment variable as bool.
 func parseBool(key string, fallback bool) bool {
-	raw := os.Getenv(key)
+	raw := env(key)
 	if raw == "" {
 		return fallback
 	}
@@ -74,7 +73,7 @@ func parseBool(key string, fallback bool) bool {
 
 // parseStringSlice parses a comma-separated environment variable as []string.
 func parseStringSlice(key string, fallback []string) []string {
-	raw := os.Getenv(key)
+	raw := env(key)
 	if raw == "" {
 		return fallback
 	}
@@ -97,7 +96,7 @@ type requiredReader struct {
 }
 
 func (r *requiredReader) get(key string) string {
-	v := os.Getenv(key)
+	v := env(key)
 	if v == "" {
 		r.missing = append(r.missing, key)
 	}

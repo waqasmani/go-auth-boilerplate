@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -18,6 +17,9 @@ type Config struct {
 	AppPort        string
 	DBDSN          string
 	SkipMigrations bool
+	// LogLevel tunes log verbosity ("debug"/"info"/"warn"/"error") independently
+	// of AppEnv (which controls encoding/colours). Empty = the env's default.
+	LogLevel string
 
 	// JWT
 	JWTKeys     []JWTKeyConfig
@@ -25,6 +27,10 @@ type Config struct {
 	JWTAudience string
 	AccessTTL   time.Duration
 	RefreshTTL  time.Duration
+	// RefreshAbsoluteTTL caps the total lifetime of a refresh-token family
+	// regardless of how often it is rotated (defence against indefinitely
+	// extended sessions). Must be >= RefreshTTL.
+	RefreshAbsoluteTTL time.Duration
 
 	// Security Secrets
 	OTPSecret        string
@@ -66,6 +72,11 @@ type Config struct {
 	CookieDomain   string
 	CookieSameSite string
 	CookieSecure   bool
+	// CookieRefreshInBody controls whether the raw refresh token is echoed in
+	// the JSON response body in addition to the HttpOnly cookie. Browser-only
+	// deployments should set COOKIE_REFRESH_TOKEN_IN_BODY=false so the token is
+	// delivered solely via the HttpOnly cookie (defends against XSS/log capture).
+	CookieRefreshInBody bool
 
 	// CookieCSRF
 	CookieCSRF         string   // primary origin (FrontEndDomain)
@@ -98,6 +109,32 @@ type Config struct {
 	LockoutMaxAttempts int
 	LockoutWindowTTL   time.Duration
 	LockoutDuration    time.Duration
+
+	// MFA / OTP brute-force protection
+	OTPMaxAttempts int
+
+	// Database connection pool
+	DBMaxOpenConns    int
+	DBMaxIdleConns    int
+	DBConnMaxLifetime time.Duration
+	DBConnMaxIdleTime time.Duration
+	// DBAllowInsecure permits a non-TLS DB_DSN in production (escape hatch for
+	// deployments where TLS terminates at a trusted local socket/sidecar).
+	DBAllowInsecure bool
+
+	// HTTP server timeouts
+	ServerReadTimeout       time.Duration
+	ServerReadHeaderTimeout time.Duration
+	ServerWriteTimeout      time.Duration
+	ServerIdleTimeout       time.Duration
+	ServerMaxHeaderBytes    int
+
+	// Observability
+	MetricsEnabled bool
+	// MetricsToken, when non-empty, requires `Authorization: Bearer <token>` on
+	// the /metrics endpoint. Empty leaves /metrics open (restrict at the network
+	// layer in that case).
+	MetricsToken string
 }
 
 // JWTKeyConfig is a single signing key entry.
@@ -135,7 +172,18 @@ func IsMissingEnvError(err error) bool {
 
 // Load reads configuration from the environment (and optional .env file).
 func Load() (*Config, error) {
+	// Load .env into the process environment first (backward compatible) so that
+	// Viper's AutomaticEnv and any external consumer both see those values.
 	_ = godotenv.Load()
+
+	// Initialise the Viper configuration source (environment + optional config
+	// file). Every subsequent read — including the loadX helpers below — resolves
+	// through it via env().
+	v, err := initConfigViper()
+	if err != nil {
+		return nil, err
+	}
+	vp = v
 
 	// ── JWT key set ───────────────────────────────────────────────────────────
 	jwtKeys, err := loadJWTKeys()
@@ -176,6 +224,7 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		AppEnv:               appEnv,
 		AppPort:              getEnv("APP_PORT", "8080"),
+		LogLevel:             getEnv("LOG_LEVEL", ""),
 		DBDSN:                dbDSN,
 		OTPSecret:            otpSecret,
 		JWTKeys:              jwtKeys,
@@ -187,12 +236,14 @@ func Load() (*Config, error) {
 		CORSAllowCredentials: parseBool("CORS_ALLOW_CREDENTIALS", true),
 		FrontEndDomain:       getEnv("FRONT_END_DOMAIN", "http://localhost:3000"),
 		SecHSTSEnabled:       parseBool("SEC_HSTS_ENABLED", false),
-		TrustedProxyCIDRs:    parseStringSlice("TRUSTED_PROXY_CIDRS", []string{""}),
-		EmailSMTPHost:        smtpHost,
-		EmailSMTPUser:        getEnv("EMAIL_SMTP_USERNAME", ""),
-		EmailSMTPPass:        getEnv("EMAIL_SMTP_PASSWORD", ""),
-		EmailSMTPUseTLS:      parseBool("EMAIL_SMTP_USE_TLS", false),
-		EmailFrom:            getEnv("EMAIL_FROM", "App <noreply@example.com>"),
+		// Default to nil (trust no forwarding header). In production an explicit,
+		// non-trust-all CIDR list is required and validated (validateTrustedProxies).
+		TrustedProxyCIDRs: parseStringSlice("TRUSTED_PROXY_CIDRS", nil),
+		EmailSMTPHost:     smtpHost,
+		EmailSMTPUser:     getEnv("EMAIL_SMTP_USERNAME", ""),
+		EmailSMTPPass:     getEnv("EMAIL_SMTP_PASSWORD", ""),
+		EmailSMTPUseTLS:   parseBool("EMAIL_SMTP_USE_TLS", false),
+		EmailFrom:         getEnv("EMAIL_FROM", "App <noreply@example.com>"),
 		// Per-endpoint rate limits
 		RateLimitLoginEmail:     parseFloat("RATE_LIMIT_LOGIN_EMAIL", 0.1),
 		RateLimitForgotPassword: parseFloat("RATE_LIMIT_FORGOT_PASSWORD", 3.0/60.0),
@@ -278,6 +329,16 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
+	cfg.RefreshAbsoluteTTL, err = parseDuration("JWT_REFRESH_ABSOLUTE_TTL", "2160h") // 90 days
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	if cfg.RefreshAbsoluteTTL < cfg.RefreshTTL {
+		return nil, fmt.Errorf(
+			"config: JWT_REFRESH_ABSOLUTE_TTL (%s) must be >= JWT_REFRESH_TTL (%s)",
+			cfg.RefreshAbsoluteTTL, cfg.RefreshTTL,
+		)
+	}
 	cfg.RateLimitTTL, err = parseDuration("RATE_LIMIT_TTL", "10m")
 	if err != nil {
 		return nil, fmt.Errorf("config: %w", err)
@@ -286,6 +347,7 @@ func Load() (*Config, error) {
 	// ── Cookie policy ──────────────────────────────────────────────────────────
 	cfg.CookieSameSite = getEnv("COOKIE_SAMESITE", "lax")
 	cfg.CookieSecure = parseBool("COOKIE_SECURE", appEnv == "production")
+	cfg.CookieRefreshInBody = parseBool("COOKIE_REFRESH_TOKEN_IN_BODY", true)
 	if strings.EqualFold(cfg.CookieSameSite, "none") && !cfg.CookieSecure {
 		return nil, fmt.Errorf(
 			"config: COOKIE_SAMESITE=none requires COOKIE_SECURE=true — " +
@@ -301,7 +363,7 @@ func Load() (*Config, error) {
 	cfg.OAuthProviders = oauthProviders
 
 	// ── OAuth state secret ─────────────────────────────────────────────────────
-	oauthStateSecret := os.Getenv("OAUTH_STATE_SECRET")
+	oauthStateSecret := env("OAUTH_STATE_SECRET")
 	for _, pc := range cfg.OAuthProviders {
 		if !pc.Enabled {
 			continue
@@ -369,6 +431,60 @@ func Load() (*Config, error) {
 			cfg.LockoutDuration,
 		)
 	}
+
+	// ── MFA / OTP brute-force protection ───────────────────────────────────────
+	cfg.OTPMaxAttempts, err = parseInt("OTP_MAX_ATTEMPTS", 5)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	if cfg.OTPMaxAttempts < 1 {
+		return nil, fmt.Errorf("config: OTP_MAX_ATTEMPTS must be ≥1, got %d", cfg.OTPMaxAttempts)
+	}
+
+	// ── Database connection pool ────────────────────────────────────────────────
+	cfg.DBMaxOpenConns, err = parseInt("DB_MAX_OPEN_CONNS", 25)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	cfg.DBMaxIdleConns, err = parseInt("DB_MAX_IDLE_CONNS", 5)
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	cfg.DBConnMaxLifetime, err = parseDuration("DB_CONN_MAX_LIFETIME", "5m")
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	cfg.DBConnMaxIdleTime, err = parseDuration("DB_CONN_MAX_IDLE_TIME", "2m")
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	cfg.DBAllowInsecure = parseBool("DB_ALLOW_INSECURE", false)
+
+	// ── HTTP server timeouts ────────────────────────────────────────────────────
+	cfg.ServerReadTimeout, err = parseDuration("SERVER_READ_TIMEOUT", "10s")
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	cfg.ServerReadHeaderTimeout, err = parseDuration("SERVER_READ_HEADER_TIMEOUT", "5s")
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	cfg.ServerWriteTimeout, err = parseDuration("SERVER_WRITE_TIMEOUT", "30s")
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	cfg.ServerIdleTimeout, err = parseDuration("SERVER_IDLE_TIMEOUT", "60s")
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	cfg.ServerMaxHeaderBytes, err = parseInt("SERVER_MAX_HEADER_BYTES", 1<<20) // 1 MiB
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+
+	// ── Observability ───────────────────────────────────────────────────────────
+	cfg.MetricsEnabled = parseBool("METRICS_ENABLED", true)
+	cfg.MetricsToken = getEnv("METRICS_TOKEN", "")
 
 	// ── Validation ────────────────────────────────────────────────────────────
 	if err := cfg.Validate(); err != nil {

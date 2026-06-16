@@ -1,0 +1,46 @@
+# Optional Viper config file (YAML/JSON/TOML all supported).
+#
+# Configuration precedence (highest first):
+#   1. Environment variables (including values loaded from .env)
+#   2. This config file
+#   3. Built-in defaults
+#
+# So anything set in the environment overrides the same key here. This file is
+# entirely optional — the service runs from environment variables alone.
+#
+# To use it:
+#   cp config.example.yaml config.yaml      # auto-discovered in . or ./config
+#   # or point at any path explicitly:
+#   CONFIG_FILE=/etc/go-auth/config.yaml ./bin/api
+#
+# Keys are flat and case-insensitive — they mirror the environment-variable
+# names documented in .env.example. Secrets are best supplied via the
+# environment, not committed to a file. Complex JSON values (JWT_KEYS,
+# TOTP_KEYS, OAUTH_TOKEN_KEYS) must be provided via environment variables.
+
+APP_ENV: development
+APP_PORT: "8080"
+
+JWT_ISSUER: go-auth-boilerplate
+JWT_AUDIENCE: go-auth-boilerplate-users
+JWT_ACCESS_TTL: 5m
+JWT_REFRESH_TTL: 720h
+JWT_REFRESH_ABSOLUTE_TTL: 2160h
+
+OTP_MAX_ATTEMPTS: 5
+
+CORS_ALLOWED_ORIGINS: http://localhost:3000
+CORS_ALLOW_CREDENTIALS: true
+
+COOKIE_SAMESITE: lax
+COOKIE_REFRESH_TOKEN_IN_BODY: true
+
+DB_MAX_OPEN_CONNS: 25
+DB_MAX_IDLE_CONNS: 5
+
+SERVER_READ_HEADER_TIMEOUT: 5s
+
+METRICS_ENABLED: true
+
+# Secrets — supply via environment / .env instead of committing them here:
+#   DB_DSN, REDIS_DSN, OTP_HMAC_SECRET, JWT_KEYS, TOTP_KEYS, EMAIL_SMTP_HOST, ...
