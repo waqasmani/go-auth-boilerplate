@@ -4,6 +4,8 @@ package config
 
 import (
 	"fmt"
+	"math"
+	"net"
 	"net/url"
 	"strings"
 )
@@ -21,6 +23,9 @@ var Validators = []Validator{
 	validateSMTP,
 	validateCSRFTrustedOrigins,
 	validateCookieDomainPolicy,
+	validateTrustedProxies,
+	validateSecretStrength,
+	validateDBSecurity,
 }
 
 // localhostLikePrefixes is the single canonical list of origin prefixes that
@@ -108,6 +113,22 @@ func validateRedisDSN(c *Config) error {
 // Uses the canonical localhostLikePrefixes list so the check stays in sync
 // with the CSRF validator and any future callers.
 func validateCORSOrigins(c *Config) error {
+	// A wildcard origin combined with credentials is always unsafe (any site
+	// could read credentialed responses). gin-contrib/cors does not reflect
+	// arbitrary origins, but an operator could still list a "*"-bearing pattern.
+	// Reject it in every environment when credentials are enabled.
+	if c.CORSAllowCredentials {
+		for _, origin := range c.CORSAllowedOrigins {
+			if strings.Contains(origin, "*") {
+				return fmt.Errorf(
+					"config: CORS_ALLOWED_ORIGINS entry %q contains a wildcard while "+
+						"CORS_ALLOW_CREDENTIALS=true — credentialed CORS must use an exact "+
+						"origin allowlist. Remove the wildcard or set CORS_ALLOW_CREDENTIALS=false",
+					origin,
+				)
+			}
+		}
+	}
 	if c.AppEnv != "production" {
 		return nil
 	}
@@ -293,4 +314,155 @@ func validateCookieDomainPolicy(c *Config) error {
 		missing,
 		missing,
 	)
+}
+
+// validateTrustedProxies enforces a safe X-Forwarded-For trust boundary in
+// production. An empty list makes forwarded headers unusable; a trust-all CIDR
+// lets any client spoof its IP to bypass per-IP rate limits and poison audit
+// logs. Both are rejected; entries must be valid IPs or CIDRs.
+func validateTrustedProxies(c *Config) error {
+	if c.AppEnv != "production" {
+		return nil
+	}
+	if len(c.TrustedProxyCIDRs) == 0 {
+		return fmt.Errorf(
+			"config: TRUSTED_PROXY_CIDRS is required in production — set it to the exact " +
+				"CIDR(s) of your load balancer / ingress (e.g. 10.0.0.0/8 for a private LB). " +
+				"An empty value makes X-Forwarded-For unusable; a value of 0.0.0.0/0 would " +
+				"let any client spoof its IP",
+		)
+	}
+	for _, raw := range c.TrustedProxyCIDRs {
+		entry := strings.TrimSpace(raw)
+		if entry == "0.0.0.0/0" || entry == "::/0" {
+			return fmt.Errorf(
+				"config: TRUSTED_PROXY_CIDRS entry %q trusts every address — this lets any "+
+					"client spoof X-Forwarded-For to bypass rate limits and forge audit-log IPs. "+
+					"Restrict it to your proxy/LB CIDR",
+				entry,
+			)
+		}
+		if _, _, err := net.ParseCIDR(entry); err != nil {
+			if net.ParseIP(entry) == nil {
+				return fmt.Errorf(
+					"config: TRUSTED_PROXY_CIDRS entry %q is not a valid IP or CIDR", entry,
+				)
+			}
+		}
+	}
+	return nil
+}
+
+// weakSecretMarkers are case-insensitive substrings that strongly indicate a
+// placeholder or human-chosen (low-entropy) secret rather than a generated one.
+var weakSecretMarkers = []string{
+	"change", "replace", "example", "placeholder", "your-", "your_",
+	"secret-here", "todo", "dummy", "insecure", "sample", "password",
+	"changeme", "xxxx", "default-", "test-secret", "longrandom", "long-random",
+}
+
+// validateSecretStrength rejects placeholder / low-entropy secrets in
+// production. The length-only checks elsewhere are insufficient: a 48-byte
+// string like "change-me-in-production-use-a-long-random-secret" passes a
+// length gate but is publicly known.
+func validateSecretStrength(c *Config) error {
+	if c.AppEnv != "production" {
+		return nil
+	}
+	type namedSecret struct {
+		name   string
+		secret string
+	}
+	var secrets []namedSecret
+	for _, k := range c.JWTKeys {
+		secrets = append(secrets, namedSecret{fmt.Sprintf("JWT key %q secret", k.ID), k.Secret})
+	}
+	secrets = append(secrets, namedSecret{"OTP_HMAC_SECRET", c.OTPSecret})
+	for _, k := range c.TOTPKeys {
+		secrets = append(secrets, namedSecret{fmt.Sprintf("TOTP key %q", k.ID), k.Key})
+	}
+	if c.OAuthStateSecret != "" {
+		secrets = append(secrets, namedSecret{"OAUTH_STATE_SECRET", c.OAuthStateSecret})
+	}
+	for _, k := range c.OAuthTokenKeys {
+		secrets = append(secrets, namedSecret{fmt.Sprintf("OAuth token key %q", k.ID), k.Key})
+	}
+	for _, s := range secrets {
+		if err := checkSecretStrength(s.name, s.secret); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkSecretStrength(name, secret string) error {
+	lower := strings.ToLower(secret)
+	for _, marker := range weakSecretMarkers {
+		if strings.Contains(lower, marker) {
+			return fmt.Errorf(
+				"config: %s looks like a placeholder/low-entropy value (contains %q) — "+
+					"production secrets must be randomly generated (e.g. openssl rand -base64 48)",
+				name, marker,
+			)
+		}
+	}
+	distinct := map[rune]struct{}{}
+	for _, r := range secret {
+		distinct[r] = struct{}{}
+	}
+	if len(distinct) < 12 {
+		return fmt.Errorf(
+			"config: %s has only %d distinct characters — too low-entropy for production. "+
+				"Generate a random secret (openssl rand -base64 48)",
+			name, len(distinct),
+		)
+	}
+	if shannonBitsPerByte(secret) < 3.0 {
+		return fmt.Errorf(
+			"config: %s has insufficient entropy for production — "+
+				"generate a random secret (openssl rand -base64 48)",
+			name,
+		)
+	}
+	return nil
+}
+
+func shannonBitsPerByte(s string) float64 {
+	if s == "" {
+		return 0
+	}
+	counts := map[rune]float64{}
+	runes := []rune(s)
+	for _, r := range runes {
+		counts[r]++
+	}
+	n := float64(len(runes))
+	var h float64
+	for _, c := range counts {
+		p := c / n
+		h -= p * math.Log2(p)
+	}
+	return h
+}
+
+// validateDBSecurity requires a TLS-enabled DB_DSN in production unless the
+// operator explicitly acknowledges an already-encrypted transport via
+// DB_ALLOW_INSECURE=true.
+func validateDBSecurity(c *Config) error {
+	if c.AppEnv != "production" || c.DBAllowInsecure {
+		return nil
+	}
+	dsn := strings.ToLower(c.DBDSN)
+	hasTLS := strings.Contains(dsn, "tls=") &&
+		!strings.Contains(dsn, "tls=false") &&
+		!strings.Contains(dsn, "tls=0")
+	if !hasTLS {
+		return fmt.Errorf(
+			"config: DB_DSN does not enable TLS in production (expected a tls= parameter, " +
+				"e.g. ...?tls=true). Database credentials and data would travel in plaintext. " +
+				"Add tls=true (or tls=skip-verify behind a trusted network) to DB_DSN, " +
+				"or set DB_ALLOW_INSECURE=true to acknowledge an already-encrypted transport",
+		)
+	}
+	return nil
 }

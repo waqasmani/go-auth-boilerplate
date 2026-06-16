@@ -27,10 +27,33 @@ import (
 )
 
 const (
-	tokenCleanupInterval  = 1 * time.Hour
-	serverShutdownTimeout = 15 * time.Second
+	// serverShutdownTimeout must exceed the router's per-request timeout
+	// (router.requestTimeout, 25s) so that in-flight requests can drain to
+	// completion before the server gives up. If it were shorter, server.Shutdown
+	// would return early and the container (DB/Redis pool) would be closed out
+	// from under handlers still running up to their full request budget,
+	// surfacing spurious "database is closed" errors during every rolling deploy.
+	serverShutdownTimeout = 30 * time.Second
 	mailerDrainTimeout    = 10 * time.Second
 )
+
+// BuildInfo holds version metadata stamped at build time via -ldflags.
+type BuildInfo struct {
+	Version   string
+	Commit    string
+	BuildTime string
+}
+
+// Build is populated by package main from its -ldflags-injected variables
+// before New is called, and emitted on the structured startup log line.
+var Build BuildInfo
+
+func buildField(v string) string {
+	if v == "" {
+		return "unknown"
+	}
+	return v
+}
 
 // App encapsulates the entire application.
 type App struct {
@@ -48,6 +71,13 @@ func New(migrationsFS fs.FS) (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("app: init container: %w", err)
 	}
+
+	cont.Logger.Info("starting go-auth-boilerplate",
+		zap.String("version", buildField(Build.Version)),
+		zap.String("commit", buildField(Build.Commit)),
+		zap.String("build_time", buildField(Build.BuildTime)),
+		zap.String("env", cont.Config.AppEnv),
+	)
 
 	// ─── Health Check ──────────────────────────────────────────────────────────
 	checkCtx, checkCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -85,6 +115,7 @@ func New(migrationsFS fs.FS) (*App, error) {
 		TokenIssuer:    authMod.Service,
 		Cfg:            cont.Config,
 		OTPSecret:      cont.Config.OTPSecret,
+		OTPMaxAttempts: cont.Config.OTPMaxAttempts,
 		TOTPKeys:       cont.Config.TOTPKeys,
 		TOTPIssuer:     cont.Config.TOTPIssuer,
 		TOTPPeriod:     cont.Config.TOTPPeriod,
@@ -109,6 +140,7 @@ func New(migrationsFS fs.FS) (*App, error) {
 		TokenIssuer: authMod.Service,
 		TokenKeySet: cont.OAuthKeys,
 		StateSecret: cont.Config.OAuthStateSecret,
+		RDB:         cont.RawRedis,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("app: init oauth module: %w", err)
@@ -150,6 +182,8 @@ func New(migrationsFS fs.FS) (*App, error) {
 		TrustedProxyCIDRs: cont.Config.TrustedProxyCIDRs,
 		CookieCSRF:        router.CookieCSRFConfigFromValues(cont.Config.CSRFTrustedOrigins),
 		ShutdownCh:        cont.ShutdownCh,
+		MetricsEnabled:    cont.Config.MetricsEnabled,
+		MetricsToken:      cont.Config.MetricsToken,
 		RedisClient:       cont.Redis,
 		RDB:               cont.RawRedis,
 		Log:               cont.Logger,
@@ -158,11 +192,13 @@ func New(migrationsFS fs.FS) (*App, error) {
 	engine := router.New(cont.Config.AppEnv, cont.Logger, cont.JWT, authMod, usersMod, routerOpts, emailAuthMod, oauthMod)
 
 	server := &http.Server{
-		Addr:         ":" + cont.Config.AppPort,
-		Handler:      engine,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + cont.Config.AppPort,
+		Handler:           engine,
+		ReadTimeout:       cont.Config.ServerReadTimeout,
+		ReadHeaderTimeout: cont.Config.ServerReadHeaderTimeout,
+		WriteTimeout:      cont.Config.ServerWriteTimeout,
+		IdleTimeout:       cont.Config.ServerIdleTimeout,
+		MaxHeaderBytes:    cont.Config.ServerMaxHeaderBytes,
 	}
 
 	return &App{

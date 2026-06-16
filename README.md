@@ -14,7 +14,7 @@ Production-ready Go authentication boilerplate with JWT access + refresh tokens,
 | Password Hash      | bcrypt (`golang.org/x/crypto`) — cost 12                                          |
 | Logging            | [uber-go/zap](https://github.com/uber-go/zap)                                     |
 | Validation         | `go-playground/validator` v10                                                     |
-| Config             | `joho/godotenv` + environment variables                                           |
+| Config             | [`spf13/viper`](https://github.com/spf13/viper) (env + optional YAML/JSON/TOML file) + `joho/godotenv` (`.env`) |
 | CORS               | `gin-contrib/cors`                                                                |
 | Rate Limiting      | `golang.org/x/time/rate` + `hashicorp/golang-lru/v2` (expirable LRU)              |
 | API Docs           | [swaggo/swag](https://github.com/swaggo/swag) + `swaggo/gin-swagger`              |
@@ -44,18 +44,42 @@ Production-ready Go authentication boilerplate with JWT access + refresh tokens,
 ```bash
 git clone https://github.com/waqasmani/go-auth-boilerplate  
 cd go-auth-boilerplate
+
+# Option A (recommended) — generate a .env from .env.example with strong values
+# for the app's own cryptographic secrets (JWT_KEYS, OTP_HMAC_SECRET, TOTP_KEYS,
+# OAUTH_STATE_SECRET, OAUTH_TOKEN_KEYS, METRICS_TOKEN). It does NOT set the
+# infrastructure credentials (DB_PASSWORD, DB_ROOT_PASSWORD, REDIS_PASSWORD and
+# the passwords in DB_DSN/REDIS_DSN) — you define those to match your database /
+# cache. Won't overwrite an existing .env unless you pass FORCE=1.
+make env-init
+# ...then set DB_*/REDIS_PASSWORD and DB_DSN/REDIS_DSN (and any OAuth client IDs).
+
+# Option B — copy the template and fill secrets in by hand.
 cp .env.example .env
-# Edit .env — at minimum set JWT_SECRET (≥ 32 bytes) or JWT_KEYS, DB_DSN, and OTP_HMAC_SECRET
+# Need just the secret values? `make gen-secrets` prints a ready-to-paste block.
 ```
 
 ### 2. Run with Docker Compose (recommended)
 
 ```bash
+cp .env.example .env      # if you haven't already
 docker compose up --build
 # API available at http://localhost:8080
 ```
 
-Migrations are applied automatically on startup via the embedded FS before the first query.
+No secrets are baked into `docker-compose.yml` — it reads everything from your
+`.env` (the bundled `db` and `redis` services and the API container). Compose
+refuses to start until `DB_ROOT_PASSWORD`, `DB_PASSWORD`, and `REDIS_PASSWORD`
+are set; the API's `DB_DSN`/`REDIS_DSN` are wired to the compose service names
+automatically. The default `.env.example` boots in **development** mode with
+placeholder secrets that are long enough to start. For a **production-mode** run
+(`APP_ENV=production`) you must provide strong, unique, randomly-generated
+secrets — the app refuses to boot in production with placeholder/low-entropy
+values.
+
+Migrations are applied automatically on startup via the embedded FS (golang-migrate)
+before the first query. They are intentionally **not** also loaded via MariaDB's
+init scripts, so the schema is applied exactly once.
 
 ### 3. Run locally (requires MariaDB/MySQL)
 
@@ -111,7 +135,10 @@ make run
 
 | Method | Path                     | Auth   | Description                        |
 |--------|--------------------------|--------|------------------------------------|
-| GET    | /health                  | Public | Health check                       |
+| GET    | /livez                   | Public | Liveness — process is up (no dependency checks) |
+| GET    | /readyz                  | Public | Readiness — DB + Redis reachable   |
+| GET    | /health                  | Public | Readiness alias (backward compat)  |
+| GET    | /metrics                 | Public/Token | Prometheus metrics (gated by `METRICS_TOKEN` when set) |
 | GET    | /swagger/*               | Public | Swagger UI (non-production only)   |
 
 ---
@@ -219,7 +246,7 @@ Login / Register
       ▼
 ┌─────────────────────┐       ┌───────────────────────────────────────┐
 │ Access Token        │       │ Refresh Token (opaque, URL-safe b64)   │
-│ JWT / HS256 (15 m)  │       │ SHA-256 hash stored in DB             │
+│ JWT/HS256 (5m def.) │       │ SHA-256 hash stored in DB             │
 │ Header: kid → key   │       │ • token_family (for reuse detection)   │
 │ Claims:             │       │ • expires_at                          │
 │  user_id            │       │ • used_at   (set on rotation)         │
@@ -249,7 +276,7 @@ Refresh flow:
 - **Storage**: Codes are NEVER stored in plaintext. Each OTP is hashed with HMAC-SHA256 using a server-side secret (`OTP_HMAC_SECRET`) before database insertion.
 - **Why HMAC?**: A plain SHA-256 hash of a 6-digit code is trivially reversible (only 1,000,000 possible values). Keying the digest with a server-only secret prevents rainbow-table attacks even if the database is compromised.
 - **TTL**: 10 minutes by default (`otpTokenTTL` constant)
-- **Rate limiting**: Per-endpoint limits applied (see Rate Limiting section)
+- **Brute-force cap**: Each wrong code increments a per-challenge counter; after `OTP_MAX_ATTEMPTS` (default 5) the MFA challenge is **burned**, forcing re-authentication. This is the primary defence — the per-IP rate limit alone would not stop a distributed attacker grinding the 10⁶ code space. The same cap protects the TOTP completion path.
 
 ### TOTP (Authenticator App)
 - **Secret Storage**: TOTP secrets are encrypted with AES-256-GCM before storage. The encryption key set supports rotation (mirroring JWT key rotation).
@@ -300,20 +327,30 @@ Rules enforced at startup:
 
 ## Rate Limiting
 
-Rate limiting uses a per-key in-process token bucket backed by an expirable LRU cache. No Redis is required.
+Rate limiting uses a **Redis-backed** atomic token bucket (Lua), so limits are
+consistent across every instance in a multi-pod deployment. **Redis is a
+mandatory dependency** — the limiter, account lockout, and TOTP replay cache all
+require it, and the app will not start without a reachable instance. The limiter
+**fails closed**: if Redis is unreachable, requests on protected routes are
+rejected rather than allowed through.
 
 ### Per-Route Policies
 
 | Route                     | Policy                                          | Purpose                              |
 |---------------------------|-------------------------------------------------|--------------------------------------|
-| POST /login               | Per-IP + Per-email (0.1 req/s, burst 5)         | Block brute-force & credential stuffing |
+| POST /login               | Per-IP + **Per-email** (0.1 req/s, burst 5)     | Block brute-force & credential stuffing (per-email key is not XFF-spoofable) |
 | POST /register            | Per-IP (5 req/s, burst 10)                      | Prevent account-creation spam        |
 | POST /refresh             | Per-IP (1 req/s, burst 5) + CSRF check          | Protect token rotation endpoint      |
-| POST /forgot-password     | Per-email (3 req/min, burst 5)                  | Prevent email enumeration/spam       |
-| POST /reset-password      | Per-token (5 req/min, burst 5)                  | Limit reset attempts                 |
-| POST /verify-email        | Per-token (10 req/min, burst 10)                | Allow quick verification retries     |
-| POST /otp/verify          | Per-code (5 req/min, burst 5)                   | Prevent OTP brute-forcing            |
+| POST /forgot-password     | Per-IP (3 req/min, burst 5)                     | Prevent enumeration/spam (email send is async to avoid a timing oracle) |
+| POST /reset-password      | Per-IP (5 req/min, burst 5)                     | Limit reset attempts                 |
+| POST /verify-email        | Per-IP (10 req/min, burst 10)                   | Allow quick verification retries     |
+| POST /otp/verify          | Per-IP (5 req/min, burst 5) **+ per-challenge attempt cap** | An MFA challenge is burned after `OTP_MAX_ATTEMPTS` (default 5) wrong codes — the primary defence against brute-forcing the 6-digit code |
 | POST /mfa/totp/enable     | Per-user (5 attempts/min) + JWT auth            | Protect TOTP activation              |
+
+> The per-IP keys above derive the client IP from `X-Forwarded-For` **only**
+> when the request arrives from a CIDR listed in `TRUSTED_PROXY_CIDRS`. In
+> production this list is required and may not be a trust-all range (`0.0.0.0/0`),
+> so a client cannot spoof its IP to evade per-IP limits or forge audit-log IPs.
 
 Global defaults are controlled by `RATE_LIMIT_*` environment variables. The key function is pluggable — see `middleware.KeyByIP`, `KeyByUserID`, `KeyByUserIDWithIPFallback`, and `KeyByHeader` for built-in options.
 
@@ -339,6 +376,9 @@ HSTS is **disabled by default** and must be explicitly enabled in production whe
 ## Makefile Commands
 
 ```bash
+make env-init         # Generate a complete .env from .env.example (app secrets; FORCE=1 to overwrite)
+make gen-secrets      # Print freshly-generated values for the app's secret env vars
+make rotate-key KEY=JWT_KEYS  # Rotate a key set in .env (new active key; old kept for validation)
 make run              # Run API locally
 make build            # Compile binary to bin/
 make test             # Unit tests (go test -race ./...)
@@ -407,6 +447,24 @@ make docker-db && sleep 5 && make migrate && make test-integration
 ```
 
 ---
+
+## Configuration
+
+Configuration is loaded through [Viper](https://github.com/spf13/viper). Values
+resolve in this order (highest precedence first):
+
+1. **Environment variables** — read directly via Viper's `AutomaticEnv` (and a
+   `.env` file is loaded into the environment first by `godotenv`, so the
+   existing `cp .env.example .env` workflow is unchanged).
+2. **Optional config file** — set `CONFIG_FILE=/path/to/config.yaml`, or drop a
+   `config.yaml` (or `.json`/`.toml`) in the working directory or `./config`.
+   Keys are flat and case-insensitive, mirroring the env-var names. See
+   [`config.example.yaml`](config.example.yaml).
+3. **Built-in defaults** — the fallbacks documented below.
+
+Anything set in the environment overrides the same key in the config file.
+Secrets and complex JSON values (`JWT_KEYS`, `TOTP_KEYS`, `OAUTH_TOKEN_KEYS`)
+are best supplied via the environment rather than a committed file.
 
 ## Environment Variables
 
@@ -481,24 +539,39 @@ make docker-db && sleep 5 && make migrate && make test-integration
 ### Proxy
 | Variable               | Default       | Description                                                   |
 |------------------------|---------------|---------------------------------------------------------------|
-| `TRUSTED_PROXY_CIDRS`  | `10.0.0.0/8`  | CIDRs trusted to set `X-Forwarded-For` / `X-Real-IP`          |
+| `TRUSTED_PROXY_CIDRS`  | *(none)*      | Comma-separated CIDRs trusted to set `X-Forwarded-For` / `X-Real-IP`. **Required in production** and validated at startup: an empty list or a trust-all range (`0.0.0.0/0`, `::/0`) is rejected. In development, forwarded headers are ignored entirely. |
+
+> The full, authoritative list of environment variables — including session
+> lifetime (`JWT_REFRESH_ABSOLUTE_TTL`), MFA brute-force cap (`OTP_MAX_ATTEMPTS`),
+> DB pool, server timeouts, `DB_ALLOW_INSECURE`, `COOKIE_REFRESH_TOKEN_IN_BODY`,
+> and observability (`METRICS_ENABLED`, `METRICS_TOKEN`) — lives in
+> [`.env.example`](.env.example) with inline documentation for each.
 
 ---
 
 ## Security Notes
 
-- **Passwords**: Hashed with bcrypt (cost **12**) after SHA-256 pre-hashing to handle arbitrary-length inputs correctly
+- **Passwords**: Hashed with bcrypt (cost **12**) after SHA-256 pre-hashing to handle arbitrary-length inputs correctly (defeats the bcrypt 72-byte truncation pitfall)
 - **Refresh tokens**: 512-bit cryptographically random values (URL-safe base64); only the SHA-256 hex hash is persisted
 - **Token rotation**: Each refresh token is single-use; reuse triggers atomic family-wide revocation
-- **Concurrent rotation race**: Handled at the DB level — `ConsumeRefreshToken` uses `UPDATE … WHERE used_at IS NULL`; `RowsAffected == 0` is treated as reuse
-- **Access tokens**: Carry a `kid` header; validation selects the matching key without trying the full set
-- **Trusted proxy CIDRs**: Enforced to prevent `X-Forwarded-For` spoofing in production (`gin.SetTrustedProxies`)
-- **All DB queries**: Go through sqlc prepared statements — no raw string interpolation
-- **Request body size**: Capped at **64 KB** globally
+- **Absolute session lifetime**: A refresh-token family carries a fixed deadline (`JWT_REFRESH_ABSOLUTE_TTL`, default 90 d) that is preserved across rotations, so a continuously-rotated (e.g. silently stolen) session cannot extend indefinitely
+- **Concurrent rotation race**: Handled at the DB level — the rotation transaction's first op is `SELECT … FOR UPDATE`, then `ConsumeRefreshToken` uses `UPDATE … WHERE used_at IS NULL`; `RowsAffected == 0` is treated as reuse
+- **Refresh token delivery**: Always set as an `HttpOnly` cookie; echoing it in the JSON body is toggleable via `COOKIE_REFRESH_TOKEN_IN_BODY` (set `false` for browser-only clients)
+- **Access tokens**: HMAC-only with algorithm pinning (`jwt.WithValidMethods` + a keyfunc type-assertion) — `alg:none` and RS/HS confusion are rejected before key lookup; the `kid` header selects the matching key with no fallback; a small clock-skew leeway is applied
+- **MFA brute-force**: An MFA challenge is burned after `OTP_MAX_ATTEMPTS` (default 5) wrong OTP/TOTP codes; TOTP replays are rejected within the validity window via a fail-closed Redis cache (RFC 6238 §5.2)
+- **Disabling MFA**: Requires the current TOTP code **and** password re-authentication (for password accounts)
+- **Secrets**: Required at startup; in production, placeholder / low-entropy secrets are rejected (length-only checks are not sufficient)
+- **Trusted proxy CIDRs**: Required in production and validated — empty or trust-all (`0.0.0.0/0`) is rejected — preventing `X-Forwarded-For` spoofing (`gin.SetTrustedProxies`)
+- **Database**: TLS required in production (`tls=` in `DB_DSN`) unless `DB_ALLOW_INSECURE=true`; connection pool is configurable
+- **All DB queries**: Go through sqlc prepared statements (or parameterized `?` placeholders) — no raw string interpolation
+- **Request limits**: Body capped at **64 KB**; query string capped; `ReadHeaderTimeout` set (Slowloris) plus read/write/idle timeouts and a header-size cap
 - **OTP codes**: HMAC-SHA256 hashed before storage; server secret (`OTP_HMAC_SECRET`) prevents rainbow-table attacks
 - **TOTP secrets**: AES-256-GCM encrypted with key-rotation support; key ID embedded in ciphertext blob
-- **Audit logging**: All security-critical events (login, logout, password reset, MFA actions) logged to named `audit` logger stream for SIEM integration
+- **Audit logging**: All security-critical events (login, logout, password reset, MFA actions, token reuse) logged to a named `audit` stream for SIEM integration; email addresses are masked (PII minimisation)
+- **CORS**: Wildcard origins are rejected whenever credentials are enabled
 - **CSRF protection**: Origin/Referer validation on cookie-bearing endpoints (`/auth/refresh`, `/auth/logout`)
+- **OAuth**: Mandatory S256 PKCE, HMAC-signed state with constant-time verification, exact-match redirect allowlist, and **single-use state** enforced server-side (Redis) within the state TTL
+- **Observability**: `GET /livez` (liveness, no dependency checks), `GET /readyz` (readiness — DB + Redis), and a Prometheus `GET /metrics` (optionally bearer-token protected via `METRICS_TOKEN`)
 
 ---
 

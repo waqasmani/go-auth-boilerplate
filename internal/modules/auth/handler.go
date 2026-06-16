@@ -123,6 +123,7 @@ func (h *Handler) Login(c *gin.Context) {
 	}
 
 	h.setCookie(c, result.Token.RefreshToken)
+	h.maybeStripRefreshFromBody(result.Token)
 	response.OK(c, result.Token)
 }
 
@@ -151,6 +152,7 @@ func (h *Handler) Refresh(c *gin.Context) {
 	}
 
 	h.setCookie(c, tokenResp.RefreshToken)
+	h.maybeStripRefreshFromBody(tokenResp)
 	response.OK(c, tokenResp)
 }
 
@@ -180,6 +182,18 @@ func (h *Handler) Logout(c *gin.Context) {
 	}
 
 	response.NoContent(c)
+}
+
+// maybeStripRefreshFromBody blanks the refresh token in the JSON response body
+// when the deployment delivers it solely via the HttpOnly cookie
+// (COOKIE_REFRESH_TOKEN_IN_BODY=false). The cookie is always set regardless;
+// this only controls whether a JS-readable copy is also returned, defending
+// browser clients against XSS/log capture. Non-browser API clients that need
+// the token in the body keep the default (true).
+func (h *Handler) maybeStripRefreshFromBody(t *TokenResponse) {
+	if t != nil && !h.cfg.CookieRefreshInBody {
+		t.RefreshToken = ""
+	}
 }
 
 // ── Cookie helpers ────────────────────────────────────────────────────────────

@@ -12,6 +12,7 @@ func Recovery(log *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer func() {
 			if r := recover(); r != nil {
+				panicsTotal.Inc()
 				requestID, _ := c.Get(RequestIDKey)
 				log.Error("panic recovered",
 					zap.Any("panic", r),

@@ -59,6 +59,10 @@ type TokenPair struct {
 	RefreshTokenFamily string
 	RefreshExpiresAt   time.Time
 	AccessExpiresAt    time.Time
+	// FamilyExpiresAt is the absolute deadline for the whole token family. It is
+	// fixed when the family is created (login) and copied unchanged across every
+	// rotation, so a continuously-rotated session cannot extend indefinitely.
+	FamilyExpiresAt time.Time
 }
 
 // JWTConfig holds JWT configuration.
@@ -69,6 +73,12 @@ type JWTConfig struct {
 	Audience   string
 	AccessTTL  time.Duration
 	RefreshTTL time.Duration
+	// RefreshAbsoluteTTL caps the total lifetime of a refresh-token family.
+	// Defaults to RefreshTTL when unset (no extra cap beyond the sliding window).
+	RefreshAbsoluteTTL time.Duration
+	// Leeway tolerates small clock skew between issuing and validating hosts
+	// when checking exp/nbf/iat. Defaults to 30s when unset.
+	Leeway time.Duration
 }
 
 // JWT provides token generation and validation with support for key rotation.
@@ -130,6 +140,15 @@ func NewJWT(cfg JWTConfig) (*JWT, error) {
 		return nil, fmt.Errorf("jwt: %d keys have Active: true — exactly one key must be active", activeCount)
 	}
 
+	// Sensible defaults for tests / direct construction. config.Load enforces
+	// RefreshAbsoluteTTL >= RefreshTTL in production.
+	if cfg.RefreshAbsoluteTTL <= 0 {
+		cfg.RefreshAbsoluteTTL = cfg.RefreshTTL
+	}
+	if cfg.Leeway <= 0 {
+		cfg.Leeway = 30 * time.Second
+	}
+
 	return &JWT{cfg: cfg, activeKey: activeKey, keyByID: keyByID}, nil
 }
 
@@ -149,7 +168,12 @@ func generateSecureToken() (string, error) {
 //
 // family can be empty (new login — a fresh family UUID is generated) or
 // provided (token rotation continues the existing session family).
-func (j *JWT) GenerateTokenPair(userID, email string, roles []string, family string) (*TokenPair, error) {
+//
+// familyExpiresAt carries the family's absolute deadline across rotations. It
+// is ignored (and recomputed) for a new family, and reused unchanged for a
+// rotation. A zero value during rotation (e.g. a token created before the
+// absolute-TTL column existed) is assigned a fresh deadline from now.
+func (j *JWT) GenerateTokenPair(userID, email string, roles []string, family string, familyExpiresAt time.Time) (*TokenPair, error) {
 	now := time.Now().UTC()
 
 	accessClaims := Claims{
@@ -181,6 +205,9 @@ func (j *JWT) GenerateTokenPair(userID, email string, roles []string, family str
 
 	if family == "" {
 		family = uuid.NewString()
+		familyExpiresAt = now.Add(j.cfg.RefreshAbsoluteTTL)
+	} else if familyExpiresAt.IsZero() {
+		familyExpiresAt = now.Add(j.cfg.RefreshAbsoluteTTL)
 	}
 
 	return &TokenPair{
@@ -190,6 +217,7 @@ func (j *JWT) GenerateTokenPair(userID, email string, roles []string, family str
 		RefreshTokenFamily: family,
 		RefreshExpiresAt:   now.Add(j.cfg.RefreshTTL),
 		AccessExpiresAt:    now.Add(j.cfg.AccessTTL),
+		FamilyExpiresAt:    familyExpiresAt,
 	}, nil
 }
 
@@ -229,9 +257,14 @@ func (j *JWT) ValidateAccessToken(tokenStr string) (*Claims, error) {
 			}
 			return []byte(key.Secret), nil
 		},
+		// WithValidMethods enforces the algorithm allowlist at the parser level,
+		// independently of (and before) the keyfunc — defence-in-depth so alg
+		// pinning survives any future refactor of the keyfunc body.
+		jwt.WithValidMethods([]string{"HS256", "HS384", "HS512"}),
 		jwt.WithIssuer(j.cfg.Issuer),
 		jwt.WithAudience(j.cfg.Audience),
 		jwt.WithExpirationRequired(),
+		jwt.WithLeeway(j.cfg.Leeway),
 	)
 	if err != nil {
 		if isExpiredError(err) {

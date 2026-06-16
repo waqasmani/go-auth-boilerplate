@@ -63,6 +63,17 @@ func (r *repository) WithTx(ctx context.Context, fn func(tx Repository) error) e
 		queries: r.queries.WithTx(tx),
 	}
 
+	// Recover from a panic inside fn so the transaction is rolled back rather
+	// than abandoned. Without this, a panic (e.g. nil deref) unwinds past this
+	// frame to the HTTP Recovery middleware while the tx — and any FOR UPDATE
+	// row locks it holds — leaks until the driver reaps the connection.
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+	}()
+
 	if err = fn(txRepo); err != nil {
 		_ = tx.Rollback()
 		return err

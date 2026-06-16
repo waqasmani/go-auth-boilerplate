@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	goredis "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
 	"github.com/waqasmani/go-auth-boilerplate/internal/config"
@@ -44,6 +45,11 @@ type ModuleConfig struct {
 	// when this is empty so misconfiguration surfaces at startup with a clear
 	// message rather than silently issuing forgeable state tokens.
 	StateSecret string
+
+	// RDB enables server-side single-use enforcement of OAuth state nonces.
+	// Optional: when nil, replay resistance relies on the single-use IdP code
+	// and PKCE.
+	RDB *goredis.Client
 }
 
 // NewModule constructs the OAuth module. Returns an error on any
@@ -81,6 +87,7 @@ func NewModule(m ModuleConfig) (*Module, error) {
 		m.StateSecret,
 		m.Log,
 		m.AuditLog,
+		m.RDB,
 	)
 	h := NewHandler(svc, m.Cfg)
 

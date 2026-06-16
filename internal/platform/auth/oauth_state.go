@@ -11,7 +11,9 @@ import (
 	"time"
 )
 
-const oauthStateTTL = 15 * time.Minute
+// OAuthStateTTL is the validity window for a signed OAuth state. The same value
+// is used as the TTL for the server-side single-use nonce record.
+const OAuthStateTTL = 15 * time.Minute
 
 // OAuthState is the tamper-proof payload embedded in the OAuth `state`
 // parameter. It binds a single authorisation request to a specific provider,
@@ -52,21 +54,24 @@ type OAuthState struct {
 //
 // OAUTH_STATE_SECRET must be ≥32 bytes; this is enforced at startup by
 // config.Load() when any OAuth provider is enabled.
-func SignOAuthState(state OAuthState, secret string) (string, error) {
-	nonce, err := generateOAuthNonce()
+// Returns the signed compact state and the generated nonce. The caller records
+// the nonce server-side (e.g. in Redis) so ParseAndVerifyOAuthState's result can
+// be checked for single-use at the callback, closing the replay window.
+func SignOAuthState(state OAuthState, secret string) (signed, nonce string, err error) {
+	nonce, err = generateOAuthNonce()
 	if err != nil {
-		return "", fmt.Errorf("oauth state: generate nonce: %w", err)
+		return "", "", fmt.Errorf("oauth state: generate nonce: %w", err)
 	}
 	state.Nonce = nonce
-	state.ExpiresAt = time.Now().UTC().Add(oauthStateTTL).Unix()
+	state.ExpiresAt = time.Now().UTC().Add(OAuthStateTTL).Unix()
 
 	payload, err := json.Marshal(state)
 	if err != nil {
-		return "", fmt.Errorf("oauth state: marshal: %w", err)
+		return "", "", fmt.Errorf("oauth state: marshal: %w", err)
 	}
 	encoded := base64.RawURLEncoding.EncodeToString(payload)
 	sig := oauthStateHMAC(encoded, secret)
-	return encoded + "." + sig, nil
+	return encoded + "." + sig, nonce, nil
 }
 
 // ParseAndVerifyOAuthState validates the signature, checks expiry, and returns

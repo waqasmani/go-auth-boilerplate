@@ -139,17 +139,19 @@ INSERT INTO
         token_hash,
         token_family,
         expires_at,
+        family_expires_at,
         created_at
     )
-VALUES (?, ?, ?, ?, ?, NOW())
+VALUES (?, ?, ?, ?, ?, ?, NOW())
 `
 
 type CreateRefreshTokenParams struct {
-	ID          string    `json:"id"`
-	UserID      string    `json:"user_id"`
-	TokenHash   string    `json:"token_hash"`
-	TokenFamily string    `json:"token_family"`
-	ExpiresAt   time.Time `json:"expires_at"`
+	ID              string    `json:"id"`
+	UserID          string    `json:"user_id"`
+	TokenHash       string    `json:"token_hash"`
+	TokenFamily     string    `json:"token_family"`
+	ExpiresAt       time.Time `json:"expires_at"`
+	FamilyExpiresAt time.Time `json:"family_expires_at"`
 }
 
 func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshTokenParams) error {
@@ -159,6 +161,7 @@ func (q *Queries) CreateRefreshToken(ctx context.Context, arg CreateRefreshToken
 		arg.TokenHash,
 		arg.TokenFamily,
 		arg.ExpiresAt,
+		arg.FamilyExpiresAt,
 	)
 	return err
 }
@@ -200,6 +203,7 @@ SELECT
     token_hash,
     token_family,
     expires_at,
+    family_expires_at,
     used_at,
     revoked_at,
     created_at
@@ -218,6 +222,7 @@ func (q *Queries) GetRefreshTokenByHash(ctx context.Context, tokenHash string) (
 		&i.TokenHash,
 		&i.TokenFamily,
 		&i.ExpiresAt,
+		&i.FamilyExpiresAt,
 		&i.UsedAt,
 		&i.RevokedAt,
 		&i.CreatedAt,
@@ -232,6 +237,7 @@ SELECT
     token_hash,
     token_family,
     expires_at,
+    family_expires_at,
     used_at,
     revoked_at,
     created_at
@@ -261,6 +267,7 @@ func (q *Queries) GetRefreshTokenByHashForUpdate(ctx context.Context, tokenHash 
 		&i.TokenHash,
 		&i.TokenFamily,
 		&i.ExpiresAt,
+		&i.FamilyExpiresAt,
 		&i.UsedAt,
 		&i.RevokedAt,
 		&i.CreatedAt,

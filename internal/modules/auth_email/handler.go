@@ -58,6 +58,9 @@ type OTPTokenResponse struct {
 
 type DisableTOTPRequest struct {
 	Code string `json:"code" validate:"required,len=6,numeric"`
+	// Password re-authenticates the user when disabling MFA. Required for
+	// password accounts; ignored for OAuth-only accounts (no password set).
+	Password string `json:"password"`
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -199,6 +202,11 @@ func (h *Handler) VerifyOTP(c *gin.Context) {
 	}
 	if tokens != nil {
 		h.setCookie(c, tokens.RefreshToken)
+		// Deliver the refresh token solely via the HttpOnly cookie when the
+		// deployment opts out of body delivery (see auth.Handler).
+		if !h.cfg.CookieRefreshInBody {
+			tokens.RefreshToken = ""
+		}
 		response.OK(c, tokens)
 		return
 	}
@@ -383,7 +391,7 @@ func (h *Handler) DisableTOTP(c *gin.Context) {
 		return
 	}
 
-	if err := h.svc.DisableTOTP(c.Request.Context(), claims.UserID, req.Code); err != nil {
+	if err := h.svc.DisableTOTP(c.Request.Context(), claims.UserID, req.Code, req.Password); err != nil {
 		response.Error(c, err)
 		return
 	}

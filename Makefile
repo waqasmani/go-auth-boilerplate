@@ -309,6 +309,34 @@ print('OK -- JWT_KEYS is valid'); \
 
 
 # =============================================================================
+#  SECRETS / ENVIRONMENT
+# =============================================================================
+# cmd/gensecrets generates strong, correctly-formatted values for the app's own
+# cryptographic secrets: JWT_KEYS, OTP_HMAC_SECRET, TOTP_KEYS, OAUTH_STATE_SECRET,
+# OAUTH_TOKEN_KEYS, METRICS_TOKEN — in the exact formats the config loaders
+# expect, guaranteed to pass the production strength validator. It does NOT touch
+# infrastructure credentials (DB_*/REDIS_PASSWORD, DB_DSN, REDIS_DSN) — those are
+# operator-defined to match your database / cache.
+
+.PHONY: gen-secrets
+gen-secrets: ## Print a block of freshly-generated KEY=VALUE secret lines (all secret env vars)
+	$(call log,gen-secrets,Generating values for every secret env var)
+	@go run ./cmd/gensecrets
+
+.PHONY: env-init
+env-init: ## Create a ready-to-run .env from .env.example with all secrets generated (FORCE=1 to overwrite)
+	$(call log,env-init,Generating .env from .env.example)
+	@go run ./cmd/gensecrets -merge .env.example -o .env $(if $(FORCE),-force,)
+	$(call success,.env written with generated secrets — set DB_*/REDIS_PASSWORD + DB_DSN/REDIS_DSN and OAuth client values before running)
+
+.PHONY: rotate-key
+rotate-key: ## Rotate a key set in .env, keeping old keys for validation. Usage: make rotate-key KEY=JWT_KEYS
+	@[ -n "$(KEY)" ] || { printf "$(RED)Usage: make rotate-key KEY=JWT_KEYS|TOTP_KEYS|OAUTH_TOKEN_KEYS$(RESET)\n"; exit 1; }
+	$(call log,rotate-key,Rotating $(KEY) in .env)
+	@go run ./cmd/gensecrets -rotate $(KEY) -merge .env -o .env
+
+
+# =============================================================================
 #  CODE GENERATION
 # =============================================================================
 
@@ -424,11 +452,18 @@ tidy: ## Tidy go.mod / go.sum and assert no uncommitted changes result
 	$(call success,go.mod and go.sum are tidy and committed)
 
 .PHONY: sec
-sec: ## Run gosec security scanner
+sec: ## Run gosec security scanner (full report — all severities)
 	$(call log,sec,Running gosec)
 	@which gosec > /dev/null 2>&1 || \
 		(printf "$(RED)gosec not found. Install: go install github.com/securego/gosec/v2/cmd/gosec@latest$(RESET)\n" && exit 1)
 	gosec -fmt=sarif -out=gosec.sarif ./... || gosec ./...
+
+.PHONY: sec-ci
+sec-ci: ## Run gosec gating only on high-severity findings (matches CI)
+	$(call log,sec-ci,Running gosec [high severity gate])
+	@which gosec > /dev/null 2>&1 || \
+		(printf "$(RED)gosec not found. Install: go install github.com/securego/gosec/v2/cmd/gosec@latest$(RESET)\n" && exit 1)
+	gosec -exclude-generated -severity=high -confidence=medium ./...
 
 .PHONY: vuln
 vuln: ## Run govulncheck for known CVEs in dependencies
@@ -438,7 +473,7 @@ vuln: ## Run govulncheck for known CVEs in dependencies
 	govulncheck ./...
 
 .PHONY: ci
-ci: tidy vet lint test test-cover-pct vuln ## Full CI gate: tidy → vet → lint → test → vuln
+ci: tidy vet lint test test-cover-pct sec-ci vuln ## Full CI gate: tidy → vet → lint → test → gosec → vuln
 
 
 # =============================================================================
@@ -521,8 +556,8 @@ install-tools: ## Install all required dev tools (sqlc, mockgen, migrate, golang
 	$(call log,install-tools,Installing dev tools)
 	go install github.com/sqlc-dev/sqlc/cmd/sqlc@latest
 	go install go.uber.org/mock/mockgen@latest
-	go install -tags 'mysql' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
-	go install github.com/securego/gosec/v2/cmd/gosec@latest
+	go install -tags 'mysql' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.1
+	go install github.com/securego/gosec/v2/cmd/gosec@v2.27.1
 	go install golang.org/x/vuln/cmd/govulncheck@latest
 	go install github.com/air-verse/air@latest
 	go install github.com/swaggo/swag/cmd/swag@latest

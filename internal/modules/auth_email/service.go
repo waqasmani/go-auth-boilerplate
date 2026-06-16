@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pquerna/otp"
+	goredis "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
 	"github.com/waqasmani/go-auth-boilerplate/internal/db"
@@ -66,7 +67,7 @@ type Service interface {
 	InitiateChallenge(ctx context.Context, userID, email, name string) (string, time.Time, error)
 	SetupTOTP(ctx context.Context, userID string) (secret, uri, qrBase64 string, err error)
 	EnableTOTP(ctx context.Context, userID, code string) error
-	DisableTOTP(ctx context.Context, userID, code string) error
+	DisableTOTP(ctx context.Context, userID, code, password string) error
 }
 
 type service struct {
@@ -77,6 +78,11 @@ type service struct {
 	tokenIssuer    TokenIssuer
 	auditLog       *audit.Logger
 	otpSecret      string
+	otpMaxAttempts int
+
+	// rdb backs the global standalone-OTP brute-force breaker. May be nil
+	// (breaker disabled, fails open) — see standaloneOTPBreakerTripped.
+	rdb *goredis.Client
 
 	totpKeySet  *platformauth.TOTPKeySet
 	totpIssuer  string
@@ -97,12 +103,14 @@ func NewService(
 	frontEndDomain string,
 	tokenIssuer TokenIssuer,
 	otpSecret string,
+	otpMaxAttempts int,
 	auditLog *audit.Logger,
 	totpKeySet *platformauth.TOTPKeySet,
 	totpIssuer string,
 	totpPeriod int,
 	totpDigits int,
 	replayCache *platformauth.TOTPReplayCache,
+	rdb *goredis.Client,
 ) (Service, error) {
 	if replayCache == nil {
 		return nil, fmt.Errorf(
@@ -126,13 +134,71 @@ func NewService(
 		frontEndDomain: frontEndDomain,
 		tokenIssuer:    tokenIssuer,
 		otpSecret:      otpSecret,
+		otpMaxAttempts: otpMaxAttempts,
 		auditLog:       auditLog,
 		totpKeySet:     totpKeySet,
 		totpIssuer:     totpIssuer,
 		totpPeriod:     period,
 		totpDigits:     digits,
 		replayCache:    replayCache,
+		rdb:            rdb,
 	}, nil
+}
+
+// ── Standalone-OTP brute-force breaker ─────────────────────────────────────────
+//
+// The standalone POST /auth/otp/verify path accepts an unauthenticated 6-digit
+// code with no account identifier. A wrong guess resolves to no token row, so a
+// per-account attempt cap (as used on the MFA login path) is structurally
+// impossible here, and a per-IP limiter alone cannot stop a *distributed*
+// attacker grinding the 10^6 code space across many source IPs.
+//
+// This global, fixed-window counter caps the total number of FAILED standalone
+// verifications across all clients. It is defence-in-depth, not the primary
+// control: a successful standalone verification grants no credential (it only
+// marks the OTP consumed), and the credential-issuing MFA login flow is a
+// separate code path with its own per-challenge burn, so tripping this breaker
+// never blocks login. It fails OPEN on any Redis error or when no client is
+// configured, so it can never become an availability risk.
+const (
+	standaloneOTPFailWindow   = time.Minute
+	standaloneOTPFailMax      = 100
+	standaloneOTPRedisTimeout = 2 * time.Second
+	standaloneOTPFailKey      = "otp:standalone:fails"
+)
+
+func (s *service) standaloneOTPBreakerTripped(ctx context.Context) bool {
+	if s.rdb == nil {
+		return false
+	}
+	cctx, cancel := context.WithTimeout(ctx, standaloneOTPRedisTimeout)
+	defer cancel()
+	n, err := s.rdb.Get(cctx, standaloneOTPFailKey).Int()
+	if err != nil {
+		// redis.Nil (no failures yet) or any transient error → fail open.
+		return false
+	}
+	return n >= standaloneOTPFailMax
+}
+
+func (s *service) recordStandaloneOTPFailure(ctx context.Context) {
+	if s.rdb == nil {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, standaloneOTPRedisTimeout)
+	defer cancel()
+	n, err := s.rdb.Incr(cctx, standaloneOTPFailKey).Result()
+	if err != nil {
+		s.log.Warn("standalone OTP breaker: record failure failed", zap.Error(err))
+		return
+	}
+	// Set the fixed-window TTL only when the key is first created so the window
+	// rolls over cleanly every standaloneOTPFailWindow.
+	if n == 1 {
+		if err := s.rdb.Expire(cctx, standaloneOTPFailKey, standaloneOTPFailWindow).Err(); err != nil {
+			s.log.Warn("standalone OTP breaker: set window TTL failed", zap.Error(err))
+		}
+	}
 }
 
 // ── ForgotPassword ────────────────────────────────────────────────────────────
@@ -173,7 +239,10 @@ func (s *service) ForgotPassword(ctx context.Context, req ForgotPasswordRequest)
 	}
 
 	link := fmt.Sprintf("%s/auth/reset-password?token=%s", s.frontEndDomain, raw)
-	s.sendEmailSync(ctx, user.Email, "Reset your password", func() (string, error) {
+	// Enqueue (async) rather than send synchronously: a synchronous SMTP round
+	// trip on the account-exists branch, against an instant return on the
+	// unknown-account branch, is a user-enumeration timing oracle.
+	s.sendEmail(ctx, user.Email, "Reset your password", func() (string, error) {
 		return mailer.ResetPassword(user.Name, link)
 	}, "forgot-password", user.ID)
 
@@ -296,9 +365,19 @@ func (s *service) VerifyOTP(ctx context.Context, req VerifyOTPRequest) (*platfor
 func (s *service) consumeStandaloneEmailOTP(ctx context.Context, code string) error {
 	log := logger.FromContext(ctx)
 
+	// Defence-in-depth against distributed brute-forcing of the 6-digit code
+	// space (see standaloneOTPBreakerTripped). Checked before any DB work.
+	if s.standaloneOTPBreakerTripped(ctx) {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, "", zap.String("reason", "standalone_breaker_open"))
+		return apperrors.ErrRateLimitExceeded
+	}
+
 	otpHash := platformauth.HMACToken(code, s.otpSecret)
 	otpToken, err := s.repo.GetEmailTokenByHash(ctx, otpHash)
 	if err != nil {
+		// A failed lookup is the brute-force signal — count it toward the global
+		// window so the breaker trips before the code space can be ground down.
+		s.recordStandaloneOTPFailure(ctx)
 		s.auditLog.Log(ctx, audit.EventOTPFailed, "", zap.String("reason", "invalid_code"))
 		return apperrors.ErrTokenInvalid
 	}
@@ -374,32 +453,12 @@ func (s *service) completeMFALoginEmail(ctx context.Context, challengeToken *db.
 		return nil, apperrors.ErrInternalServer
 	}
 
-	otpHash := platformauth.HMACToken(code, s.otpSecret)
-	otpToken, err := s.repo.GetEmailTokenByHash(ctx, otpHash)
+	otpToken, err := s.validateEmailOTP(ctx, challengeToken, code)
 	if err != nil {
-		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID, zap.String("reason", "invalid_code"))
-		return nil, apperrors.ErrTokenInvalid
-	}
-	if otpToken.TokenType != tokenTypeOTP {
-		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID, zap.String("reason", "wrong_token_type"))
-		return nil, apperrors.ErrTokenInvalid
-	}
-	if otpToken.UsedAt.Valid {
-		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID, zap.String("reason", "replay_attempt"))
-		return nil, apperrors.ErrTokenInvalid
-	}
-	if time.Now().UTC().After(otpToken.ExpiresAt) {
-		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID, zap.String("reason", "expired"))
-		return nil, apperrors.ErrTokenInvalid
-	}
-
-	if challengeToken.UserID != otpToken.UserID {
-		log.Warn("completeMFALoginEmail: challenge/OTP user mismatch",
-			zap.String("challenge_user", challengeToken.UserID),
-			zap.String("otp_user", otpToken.UserID))
-		s.auditLog.Log(ctx, audit.EventMFACompleted, challengeToken.UserID,
-			zap.String("result", "rejected_user_mismatch"))
-		return nil, apperrors.ErrTokenInvalid
+		// Count the failed guess against the challenge and burn it once the
+		// per-challenge limit is reached, so a 6-digit OTP cannot be brute-forced.
+		s.registerMFAFailure(ctx, challengeToken)
+		return nil, err
 	}
 
 	userID := challengeToken.UserID
@@ -426,11 +485,12 @@ func (s *service) completeMFALoginEmail(ctx context.Context, challengeToken *db.
 			return apperrors.ErrTokenInvalid
 		}
 		return tx.CreateRefreshToken(ctx, db.CreateRefreshTokenParams{
-			ID:          uuid.NewString(),
-			UserID:      userID,
-			TokenHash:   pair.RefreshTokenHashed,
-			TokenFamily: pair.RefreshTokenFamily,
-			ExpiresAt:   pair.RefreshExpiresAt,
+			ID:              uuid.NewString(),
+			UserID:          userID,
+			TokenHash:       pair.RefreshTokenHashed,
+			TokenFamily:     pair.RefreshTokenFamily,
+			ExpiresAt:       pair.RefreshExpiresAt,
+			FamilyExpiresAt: pair.FamilyExpiresAt,
 		})
 	}); err != nil {
 		return nil, err
@@ -447,6 +507,66 @@ func (s *service) completeMFALoginEmail(ctx context.Context, challengeToken *db.
 		zap.String("method", "email"), zap.String("result", "success"))
 	log.Info("mfa email login completed", zap.String("user_id", userID))
 	return tokens, nil
+}
+
+// validateEmailOTP looks up and validates the email OTP for an MFA challenge,
+// returning the matching OTP token on success. Every failure maps to
+// ErrTokenInvalid and emits an audit event; the caller is responsible for
+// incrementing the challenge's failed-attempt counter via registerMFAFailure.
+func (s *service) validateEmailOTP(ctx context.Context, challengeToken *db.EmailToken, code string) (*db.EmailToken, error) {
+	otpHash := platformauth.HMACToken(code, s.otpSecret)
+	otpToken, err := s.repo.GetEmailTokenByHash(ctx, otpHash)
+	if err != nil {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID, zap.String("reason", "invalid_code"))
+		return nil, apperrors.ErrTokenInvalid
+	}
+	if otpToken.TokenType != tokenTypeOTP {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID, zap.String("reason", "wrong_token_type"))
+		return nil, apperrors.ErrTokenInvalid
+	}
+	if otpToken.UsedAt.Valid {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID, zap.String("reason", "replay_attempt"))
+		return nil, apperrors.ErrTokenInvalid
+	}
+	if time.Now().UTC().After(otpToken.ExpiresAt) {
+		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID, zap.String("reason", "expired"))
+		return nil, apperrors.ErrTokenInvalid
+	}
+	if challengeToken.UserID != otpToken.UserID {
+		logger.FromContext(ctx).Warn("completeMFALoginEmail: challenge/OTP user mismatch",
+			zap.String("challenge_user", challengeToken.UserID),
+			zap.String("otp_user", otpToken.UserID))
+		s.auditLog.Log(ctx, audit.EventOTPFailed, challengeToken.UserID,
+			zap.String("reason", "user_mismatch"))
+		return nil, apperrors.ErrTokenInvalid
+	}
+	return otpToken, nil
+}
+
+// registerMFAFailure increments the failed-attempt counter on an MFA challenge
+// and burns the challenge once otpMaxAttempts is reached, capping brute-force
+// guesses against a 6-digit OTP/TOTP code per challenge. Best-effort: a counter
+// error is logged but never converts the caller's 401 into a 500.
+func (s *service) registerMFAFailure(ctx context.Context, challenge *db.EmailToken) {
+	if s.otpMaxAttempts <= 0 {
+		return
+	}
+	attempts, err := s.repo.RecordChallengeAttempt(ctx, challenge.ID)
+	if err != nil {
+		s.log.Warn("mfa: record challenge attempt failed",
+			zap.Error(err), zap.String("user_id", challenge.UserID))
+		return
+	}
+	if attempts >= s.otpMaxAttempts {
+		// Burn the challenge so further guesses against this mfa_token are
+		// rejected up-front (completeMFALoginDispatch sees used_at IS NOT NULL).
+		if _, cErr := s.repo.ConsumeEmailToken(ctx, challenge.ID); cErr != nil {
+			s.log.Error("mfa: burn challenge after max attempts failed",
+				zap.Error(cErr), zap.String("user_id", challenge.UserID))
+		}
+		s.auditLog.Log(ctx, audit.EventMFAChallengeLocked, challenge.UserID,
+			zap.Int("attempts", attempts))
+	}
 }
 
 func (s *service) completeMFALoginTOTP(ctx context.Context, challengeToken *db.EmailToken, code string) (*platformauth.SessionTokens, error) {
@@ -476,11 +596,13 @@ func (s *service) completeMFALoginTOTP(ctx context.Context, challengeToken *db.E
 	valid, err := platformauth.ValidateTOTP(code, plainSecret, s.totpPeriod, s.totpDigits)
 	if err != nil || !valid {
 		s.auditLog.Log(ctx, audit.EventTOTPFailed, userID, zap.String("reason", "invalid_code"))
+		s.registerMFAFailure(ctx, challengeToken)
 		return nil, apperrors.ErrTokenInvalid
 	}
 
 	if !s.replayCache.CheckAndRecord(userID, code) {
 		s.auditLog.Log(ctx, audit.EventTOTPFailed, userID, zap.String("reason", "replay_detected"))
+		s.registerMFAFailure(ctx, challengeToken)
 		return nil, apperrors.ErrTokenInvalid
 	}
 
@@ -499,11 +621,12 @@ func (s *service) completeMFALoginTOTP(ctx context.Context, challengeToken *db.E
 			return apperrors.ErrTokenInvalid
 		}
 		return tx.CreateRefreshToken(ctx, db.CreateRefreshTokenParams{
-			ID:          uuid.NewString(),
-			UserID:      userID,
-			TokenHash:   pair.RefreshTokenHashed,
-			TokenFamily: pair.RefreshTokenFamily,
-			ExpiresAt:   pair.RefreshExpiresAt,
+			ID:              uuid.NewString(),
+			UserID:          userID,
+			TokenHash:       pair.RefreshTokenHashed,
+			TokenFamily:     pair.RefreshTokenFamily,
+			ExpiresAt:       pair.RefreshExpiresAt,
+			FamilyExpiresAt: pair.FamilyExpiresAt,
 		})
 	}); err != nil {
 		return nil, err
@@ -562,7 +685,8 @@ func (s *service) ResendVerification(ctx context.Context, req ResendVerification
 	}
 
 	link := fmt.Sprintf("%s/auth/verify-email?token=%s", s.frontEndDomain, raw)
-	s.sendEmailSync(ctx, user.Email, "Verify your email address", func() (string, error) {
+	// Async enqueue to avoid a user-enumeration timing oracle (see ForgotPassword).
+	s.sendEmail(ctx, user.Email, "Verify your email address", func() (string, error) {
 		return mailer.VerifyEmail(user.Name, link)
 	}, "resend-verification", user.ID)
 
@@ -728,6 +852,17 @@ func (s *service) SetupTOTP(ctx context.Context, userID string) (secret, uri, qr
 		return "", "", "", err
 	}
 
+	// Refuse to overwrite a live secret. Re-running setup while TOTP is already
+	// enabled would clobber the active secret and could lock the user out if the
+	// new enrollment is never confirmed. They must disable first.
+	if user.TwoFaEnabled {
+		return "", "", "", apperrors.New(
+			"TOTP_ALREADY_ENABLED",
+			"TOTP is already enabled on this account — disable it before enrolling a new authenticator",
+			http.StatusConflict, nil,
+		)
+	}
+
 	result, err := platformauth.GenerateTOTPSecret(platformauth.TOTPGenerateConfig{
 		Issuer: s.totpIssuer,
 		Period: s.totpPeriod,
@@ -784,8 +919,23 @@ func (s *service) EnableTOTP(ctx context.Context, userID, code string) error {
 	return nil
 }
 
-func (s *service) DisableTOTP(ctx context.Context, userID, code string) error {
+func (s *service) DisableTOTP(ctx context.Context, userID, code, password string) error {
 	log := logger.FromContext(ctx)
+
+	// Require password re-auth (in addition to the TOTP code) before stepping
+	// down a security control, so an attacker with only a stolen access token —
+	// and a glimpse of one code — cannot silently downgrade MFA. OAuth-only
+	// accounts have no password and are gated by the TOTP code alone.
+	user, err := s.repo.GetUserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if user.PasswordHash != "" {
+		if vErr := platformauth.VerifyPassword(password, user.PasswordHash); vErr != nil {
+			s.auditLog.Log(ctx, audit.EventTOTPFailed, userID, zap.String("reason", "invalid_password_during_disable"))
+			return apperrors.ErrInvalidCredentials
+		}
+	}
 
 	encrypted, err := s.repo.GetUserTOTPSecretEncrypted(ctx, userID)
 	if err != nil {
@@ -867,7 +1017,15 @@ func (s *service) sendEmail(ctx context.Context, to, subject string, renderFn fu
 		s.log.Error(op+": render email template", zap.Error(err), zap.String("user_id", userID))
 		return
 	}
-	if err = s.mailer.Enqueue(ctx, mailer.Message{To: to, Subject: subject, HTML: html}); err != nil {
+	// Detach from the request context before enqueuing. The router's timeout
+	// middleware cancels the request context via `defer cancel()` the instant
+	// the handler returns, which almost always happens before a background
+	// worker dequeues the message — causing the send to be silently dropped
+	// (the worker bails on item.ctx.Err()). context.WithoutCancel severs
+	// cancellation/deadline propagation while preserving request-scoped values
+	// (e.g. request_id) for logging; the mailer worker applies its own
+	// workerMsgTimeout to bound the actual send.
+	if err = s.mailer.Enqueue(context.WithoutCancel(ctx), mailer.Message{To: to, Subject: subject, HTML: html}); err != nil {
 		s.log.Warn(op+": enqueue email failed", zap.Error(err), zap.String("user_id", userID))
 	}
 }

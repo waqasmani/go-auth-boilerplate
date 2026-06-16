@@ -76,9 +76,10 @@ INSERT INTO
         token_hash,
         token_family,
         expires_at,
+        family_expires_at,
         created_at
     )
-VALUES (?, ?, ?, ?, ?, NOW());
+VALUES (?, ?, ?, ?, ?, ?, NOW());
 
 -- name: GetRefreshTokenByHash :one
 SELECT
@@ -87,6 +88,7 @@ SELECT
     token_hash,
     token_family,
     expires_at,
+    family_expires_at,
     used_at,
     revoked_at,
     created_at
@@ -112,6 +114,7 @@ SELECT
     token_hash,
     token_family,
     expires_at,
+    family_expires_at,
     used_at,
     revoked_at,
     created_at

@@ -37,6 +37,7 @@ type ModuleConfig struct {
 	TokenIssuer    TokenIssuer
 	Cfg            *config.Config
 	OTPSecret      string
+	OTPMaxAttempts int
 
 	// TOTP configuration — sourced directly from config.Config fields.
 	TOTPKeys   []config.TOTPKeyConfig
@@ -90,12 +91,14 @@ func NewModule(cfg ModuleConfig) (*Module, error) {
 		cfg.FrontEndDomain,
 		cfg.TokenIssuer,
 		cfg.OTPSecret,
+		cfg.OTPMaxAttempts,
 		cfg.AuditLog,
 		totpKeySet,
 		cfg.TOTPIssuer,
 		cfg.TOTPPeriod,
 		cfg.TOTPDigits,
 		replayCache,
+		cfg.RDB,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("authemail: init service: %w", err)
