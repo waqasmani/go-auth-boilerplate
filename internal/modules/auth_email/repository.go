@@ -24,6 +24,12 @@ type Repository interface {
 	ConsumeEmailToken(ctx context.Context, id string) (bool, error)
 	InvalidateUserTokensByType(ctx context.Context, params db.InvalidateUserTokensByTypeParams) error
 	UpdateUserPasswordHash(ctx context.Context, params db.UpdateUserPasswordHashParams) error
+
+	// RecordChallengeAttempt atomically increments the failed-attempt counter on
+	// a still-active MFA challenge token and returns the new count. The service
+	// burns the challenge once the count reaches the configured maximum, which
+	// caps brute-force guesses against a 6-digit OTP/TOTP code per challenge.
+	RecordChallengeAttempt(ctx context.Context, challengeID string) (int, error)
 	MarkEmailVerified(ctx context.Context, id string) error
 	ClearEmailVerified(ctx context.Context, id string) error
 	RevokeUserRefreshTokens(ctx context.Context, userID string) error
@@ -84,6 +90,15 @@ func (r *repository) WithTx(ctx context.Context, fn func(tx Repository) error) e
 		sqlDB:   r.sqlDB,
 		queries: r.queries.WithTx(tx),
 	}
+	// Recover from a panic inside fn so the transaction is rolled back rather
+	// than abandoned (otherwise the tx and its row locks leak until the driver
+	// reaps the connection).
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback()
+			panic(p)
+		}
+	}()
 	if err = fn(txRepo); err != nil {
 		_ = tx.Rollback()
 		return err
@@ -165,6 +180,23 @@ func (r *repository) UpdateUserPasswordHash(ctx context.Context, params db.Updat
 		return apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
 	return nil
+}
+
+// RecordChallengeAttempt increments attempts on a still-active challenge token
+// and returns the new value. The increment is guarded by `used_at IS NULL` so a
+// burned/used challenge is never resurrected; the read-back reflects the current
+// count (monotonic, so a small read race only ever under-reports, never over-).
+func (r *repository) RecordChallengeAttempt(ctx context.Context, challengeID string) (int, error) {
+	const incQ = `UPDATE email_tokens SET attempts = attempts + 1 WHERE id = ? AND used_at IS NULL`
+	if _, err := r.sqlDB.ExecContext(ctx, incQ, challengeID); err != nil {
+		return 0, apperrors.Wrap(apperrors.ErrInternalServer, err)
+	}
+	const readQ = `SELECT attempts FROM email_tokens WHERE id = ?`
+	var attempts int
+	if err := r.sqlDB.QueryRowContext(ctx, readQ, challengeID).Scan(&attempts); err != nil {
+		return 0, apperrors.Wrap(apperrors.ErrInternalServer, err)
+	}
+	return attempts, nil
 }
 
 func (r *repository) MarkEmailVerified(ctx context.Context, id string) error {

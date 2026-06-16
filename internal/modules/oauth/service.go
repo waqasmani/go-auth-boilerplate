@@ -9,11 +9,13 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	goredis "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 
@@ -69,6 +71,10 @@ type service struct {
 	log           *zap.Logger
 	auditLog      *audit.Logger
 	linkingSecret string
+	// rdb records and consumes OAuth state nonces for single-use enforcement.
+	// May be nil (Redis not configured), in which case replay resistance falls
+	// back to the single-use IdP authorization code + PKCE.
+	rdb *goredis.Client
 }
 
 // NewService constructs the OAuth service.
@@ -81,6 +87,7 @@ func NewService(
 	stateSecret string,
 	log *zap.Logger,
 	auditLog *audit.Logger,
+	rdb *goredis.Client,
 ) Service {
 	return &service{
 		db:            db,
@@ -92,7 +99,27 @@ func NewService(
 		log:           log,
 		auditLog:      auditLog,
 		linkingSecret: stateSecret + ":linking",
+		rdb:           rdb,
 	}
+}
+
+// oauthStateRedisKey namespaces the single-use state nonce record.
+func oauthStateRedisKey(nonce string) string { return "oauth:state:" + nonce }
+
+// consumeStateNonce enforces single-use of an OAuth state. A missing key means
+// the state was already used (or never issued) → reject as replay. A Redis error
+// fails open (logged): the single-use IdP code + PKCE still bound the exchange.
+func (s *service) consumeStateNonce(ctx context.Context, nonce string) error {
+	if s.rdb == nil {
+		return nil
+	}
+	if err := s.rdb.GetDel(ctx, oauthStateRedisKey(nonce)).Err(); err != nil {
+		if errors.Is(err, goredis.Nil) {
+			return ErrInvalidState
+		}
+		s.log.Warn("oauth: state nonce consume failed (fail-open)", zap.Error(err))
+	}
+	return nil
 }
 
 // ── BuildAuthURL ───────────────────────────────────────────────────────────────
@@ -113,9 +140,18 @@ func (s *service) BuildAuthURL(ctx context.Context, provider, redirectURL string
 		RedirectURL:  redirectURL,
 		PKCEVerifier: verifier,
 	}
-	signedState, err := platformauth.SignOAuthState(state, s.stateSecret)
+	signedState, nonce, err := platformauth.SignOAuthState(state, s.stateSecret)
 	if err != nil {
 		return "", "", apperrors.Wrap(apperrors.ErrInternalServer, err)
+	}
+
+	// Record the nonce so the callback can enforce single-use within the state
+	// TTL. Best-effort: a Redis failure here must not block login start — the
+	// single-use IdP authorization code and PKCE remain the primary protections.
+	if s.rdb != nil {
+		if err := s.rdb.Set(ctx, oauthStateRedisKey(nonce), "", platformauth.OAuthStateTTL).Err(); err != nil {
+			s.log.Warn("oauth: failed to record state nonce for single-use", zap.Error(err))
+		}
 	}
 
 	cfg := p.Config()
@@ -144,6 +180,17 @@ func (s *service) HandleCallback(ctx context.Context, provider, code, rawState s
 		s.log.Warn("oauth: provider mismatch in state",
 			zap.String("state_provider", oauthState.Provider),
 			zap.String("url_provider", provider),
+		)
+		return nil, ErrInvalidState
+	}
+
+	// Enforce single-use of the state (replay protection within the TTL). A
+	// reused or unknown nonce is rejected; a Redis error fails open.
+	if err := s.consumeStateNonce(ctx, oauthState.Nonce); err != nil {
+		s.log.Warn("oauth: state replay or unknown nonce", zap.String("provider", provider))
+		s.auditLog.Log(ctx, eventLoginFailed, "",
+			zap.String("provider", provider),
+			zap.String("reason", "state_replay"),
 		)
 		return nil, ErrInvalidState
 	}
@@ -503,14 +550,15 @@ func (s *service) LinkAccount(ctx context.Context, authenticatedUserID, linkingT
 		return nil, err
 	}
 
-	name, email, err := s.repo.GetUserNameAndEmail(ctx, authenticatedUserID)
+	_, email, err := s.repo.GetUserNameAndEmail(ctx, authenticatedUserID)
 	if err != nil {
 		return nil, err
 	}
+	// PII policy (see platform/audit): mask the email and omit the raw name from
+	// the audit stream; user_id is the cross-reference key for investigations.
 	s.auditLog.Log(ctx, eventAccountLinked, authenticatedUserID,
 		zap.String("provider", state.Provider),
-		zap.String("email", email),
-		zap.String("name", name),
+		zap.String("email", audit.MaskEmail(email)),
 	)
 	return &CallbackResponse{Tokens: sessionToTokenResponse(session)}, nil
 }

@@ -77,7 +77,7 @@ func (s *service) SetVerificationSender(v VerificationSender) { s.verificationSe
 // ── Register ──────────────────────────────────────────────────────────────────
 
 func (s *service) Register(ctx context.Context, req RegisterRequest) error {
-	log := logger.FromContext(ctx).With(zap.String("email", req.Email))
+	log := logger.FromContext(ctx).With(zap.String("email", audit.MaskEmail(req.Email)))
 
 	normalizedEmail := strings.ToLower(strings.TrimSpace(req.Email))
 	hash, err := platformauth.HashPassword(req.Password)
@@ -102,7 +102,7 @@ func (s *service) Register(ctx context.Context, req RegisterRequest) error {
 		return err
 	}
 
-	s.auditLog.Log(ctx, audit.EventRegister, userID, zap.String("email", normalizedEmail))
+	s.auditLog.Log(ctx, audit.EventRegister, userID, zap.String("email", audit.MaskEmail(normalizedEmail)))
 	log.Info("user registered", zap.String("user_id", userID))
 
 	if s.verificationSender != nil {
@@ -139,7 +139,7 @@ func (s *service) Login(ctx context.Context, req LoginRequest) (*LoginResult, er
 		if appErr, ok := apperrors.As(err); ok && appErr.Code == apperrors.ErrNotFound.Code {
 			s.auditLog.Log(ctx, audit.EventLoginFailed, "",
 				zap.String("reason", "user_not_found"),
-				zap.String("email", req.Email),
+				zap.String("email", audit.MaskEmail(req.Email)),
 			)
 			return nil, apperrors.ErrInvalidCredentials
 		}
@@ -235,7 +235,7 @@ func (s *service) Login(ctx context.Context, req LoginRequest) (*LoginResult, er
 	}
 
 	// ── 4. Non-2FA: issue token pair directly ─────────────────────────────────
-	tokenResp, err := s.issueTokenPair(ctx, s.repo, user.ID, user.Email, user.Roles, "")
+	tokenResp, err := s.issueTokenPair(ctx, s.repo, user.ID, user.Email, user.Roles, "", time.Time{})
 	if err != nil {
 		return nil, err
 	}
@@ -309,6 +309,13 @@ func (s *service) Refresh(ctx context.Context, req RefreshRequest) (*TokenRespon
 			return apperrors.ErrTokenExpired
 		}
 
+		// Absolute family lifetime cap: even a continuously-rotated session must
+		// not outlive RefreshAbsoluteTTL from its creation. NULL (pre-migration
+		// rows) is treated as no cap; those families are bounded on next rotation.
+		if locked.FamilyExpiresAt.Valid && time.Now().UTC().After(locked.FamilyExpiresAt.Time) {
+			return apperrors.ErrTokenExpired
+		}
+
 		// Token was revoked by a concurrent Logout, an admin action, or a
 		// previous replay detection. Return ErrTokenRevoked (not ErrTokenReuse)
 		// so the caller receives the correct error code and no spurious second
@@ -366,7 +373,11 @@ func (s *service) Refresh(ctx context.Context, req RefreshRequest) (*TokenRespon
 			return apperrors.ErrTokenReuse
 		}
 
-		tokenResp, err = s.issueTokenPair(ctx, tx, user.ID, user.Email, user.Roles, locked.TokenFamily)
+		var familyExpiresAt time.Time
+		if locked.FamilyExpiresAt.Valid {
+			familyExpiresAt = locked.FamilyExpiresAt.Time
+		}
+		tokenResp, err = s.issueTokenPair(ctx, tx, user.ID, user.Email, user.Roles, locked.TokenFamily, familyExpiresAt)
 		return err
 	})
 
@@ -475,7 +486,7 @@ func (s *service) IssueTokensForUser(ctx context.Context, userID string) (*platf
 		return nil, apperrors.ErrEmailNotVerified
 	}
 
-	resp, err := s.issueTokenPair(ctx, s.repo, user.ID, user.Email, user.Roles, "")
+	resp, err := s.issueTokenPair(ctx, s.repo, user.ID, user.Email, user.Roles, "", time.Time{})
 	if err != nil {
 		return nil, err
 	}
@@ -515,7 +526,7 @@ func (s *service) PrepareTokensForUser(ctx context.Context, userID string) (*pla
 		return nil, apperrors.ErrEmailNotVerified
 	}
 
-	pair, err := s.jwt.GenerateTokenPair(user.ID, user.Email, user.Roles, "")
+	pair, err := s.jwt.GenerateTokenPair(user.ID, user.Email, user.Roles, "", time.Time{})
 	if err != nil {
 		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
@@ -525,18 +536,19 @@ func (s *service) PrepareTokensForUser(ctx context.Context, userID string) (*pla
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-func (s *service) issueTokenPair(ctx context.Context, repo Repository, userID, email string, roles []string, family string) (*TokenResponse, error) {
-	pair, err := s.jwt.GenerateTokenPair(userID, email, roles, family)
+func (s *service) issueTokenPair(ctx context.Context, repo Repository, userID, email string, roles []string, family string, familyExpiresAt time.Time) (*TokenResponse, error) {
+	pair, err := s.jwt.GenerateTokenPair(userID, email, roles, family, familyExpiresAt)
 	if err != nil {
 		return nil, apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
 
 	if err = repo.CreateRefreshToken(ctx, db.CreateRefreshTokenParams{
-		ID:          uuid.NewString(),
-		UserID:      userID,
-		TokenHash:   pair.RefreshTokenHashed,
-		TokenFamily: pair.RefreshTokenFamily,
-		ExpiresAt:   pair.RefreshExpiresAt,
+		ID:              uuid.NewString(),
+		UserID:          userID,
+		TokenHash:       pair.RefreshTokenHashed,
+		TokenFamily:     pair.RefreshTokenFamily,
+		ExpiresAt:       pair.RefreshExpiresAt,
+		FamilyExpiresAt: pair.FamilyExpiresAt,
 	}); err != nil {
 		return nil, err
 	}
