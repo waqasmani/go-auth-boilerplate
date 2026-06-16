@@ -14,18 +14,73 @@
 package main
 
 import (
+	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/waqasmani/go-auth-boilerplate/internal/app"
 	"github.com/waqasmani/go-auth-boilerplate/sql/migrations"
 )
 
+// Build metadata, injected at link time via -ldflags "-X main.Version=…".
+// See the Makefile's LDFLAGS and the Dockerfile build stage. The defaults below
+// are what an un-stamped `go run`/`go build` produces.
+var (
+	Version   = "dev"
+	Commit    = "none"
+	BuildTime = "unknown"
+)
+
 func main() {
+	versionFlag := flag.Bool("version", false, "print version information and exit")
+	flag.Parse()
+
+	if *versionFlag {
+		fmt.Printf("go-auth-boilerplate %s (commit %s, built %s)\n", Version, Commit, BuildTime)
+		return
+	}
+
+	// `api healthcheck [path]` performs an in-container HTTP probe and exits 0/1.
+	// It exists so the scratch-based runtime image (no shell, no curl/wget) can
+	// still declare a Docker HEALTHCHECK. Defaults to /livez (liveness); pass
+	// /readyz for a dependency-aware readiness probe.
+	if flag.Arg(0) == "healthcheck" {
+		os.Exit(healthcheck(flag.Arg(1)))
+	}
+
+	// Hand the link-time build metadata to the app so it is emitted on the
+	// structured startup log line for incident triage.
+	app.Build = app.BuildInfo{Version: Version, Commit: Commit, BuildTime: BuildTime}
+
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// healthcheck probes the local server and returns a process exit code.
+func healthcheck(path string) int {
+	if path == "" {
+		path = "/livez"
+	}
+	port := os.Getenv("APP_PORT")
+	if port == "" {
+		port = "8080"
+	}
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get("http://127.0.0.1:" + port + path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "healthcheck: %v\n", err)
+		return 1
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "healthcheck: %s returned %d\n", path, resp.StatusCode)
+		return 1
+	}
+	return 0
 }
 
 func run() error {

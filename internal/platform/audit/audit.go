@@ -53,9 +53,10 @@ const (
 	EventSessionsRevoked    EventType = "auth.sessions_revoked"
 
 	// ─── Multi-factor authentication ─────────────────────────────────────────
-	EventMFAChallenged EventType = "auth.mfa_challenged"
-	EventMFACompleted  EventType = "auth.mfa_completed"
-	EventOTPFailed     EventType = "auth.otp_failed"
+	EventMFAChallenged      EventType = "auth.mfa_challenged"
+	EventMFACompleted       EventType = "auth.mfa_completed"
+	EventOTPFailed          EventType = "auth.otp_failed"
+	EventMFAChallengeLocked EventType = "auth.mfa_challenge_locked"
 
 	// ─── Email / credential lifecycle ────────────────────────────────────────
 	EventPasswordResetRequested EventType = "auth.password_reset_requested"

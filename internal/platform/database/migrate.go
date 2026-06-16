@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4"
 	mysqldrv "github.com/golang-migrate/migrate/v4/database/mysql"
@@ -16,6 +17,16 @@ import (
 
 	"database/sql"
 )
+
+// migrationTimeout bounds how long a single startup migration run may take.
+// golang-migrate's Up() has no context variant and blocks indefinitely if
+// another instance holds the migration advisory lock or a DDL statement stalls.
+// Without a bound the process would hang in startup forever — never becoming
+// ready and never crashing, so an orchestrator never restarts it. When the
+// bound is exceeded we abort startup with an error; the process exits and the
+// orchestrator retries, which is the correct fail-fast behaviour. Declared as a
+// var so tests can shorten it.
+var migrationTimeout = 2 * time.Minute
 
 // RunMigrations applies every pending migration in migrationsFS to db and
 // returns nil when the schema is already at the latest version (ErrNoChange).
@@ -85,7 +96,21 @@ func newMigrator(sqlDB *sql.DB, migrationsFS fs.FS) (migrator, error) {
 //   - ErrNoChange    → schema was already at the latest version; not an error
 //   - anything else  → wrapped and returned so the caller can abort startup
 func runMigrator(m migrator, log *zap.Logger) error {
-	err := m.Up()
+	// Run Up() under a watchdog. The buffered channel ensures the goroutine can
+	// always complete its send and exit even if we have already returned on
+	// timeout (the process aborts startup in that case, killing any still-blocked
+	// migration along with it).
+	done := make(chan error, 1)
+	go func() { done <- m.Up() }()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(migrationTimeout):
+		return fmt.Errorf("migrate: timed out after %s waiting for migrations to apply "+
+			"(another instance may hold the migration lock, or a statement is stalled)", migrationTimeout)
+	}
+
 	switch {
 	case err == nil:
 		log.Info("database migrations applied successfully")

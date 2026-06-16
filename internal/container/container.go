@@ -51,17 +51,31 @@ func New(migrationsFS fs.FS) (*Container, error) {
 	c.Config = cfg
 
 	// ─── Logger ────────────────────────────────────────────────────────────────
-	log, err := logger.New(cfg.AppEnv)
+	log, err := logger.NewWithLevel(cfg.AppEnv, cfg.LogLevel)
 	if err != nil {
 		return nil, fmt.Errorf("container: init logger: %w", err)
 	}
 	c.Logger = log
 
+	// Surface an operational warning when HSTS is disabled in production. The
+	// off-by-default is intentional (never send HSTS over plain HTTP), but a
+	// TLS-terminated production deployment should enable it.
+	if cfg.AppEnv == "production" && !cfg.SecHSTSEnabled {
+		log.Warn("SEC_HSTS_ENABLED=false in production — Strict-Transport-Security will not " +
+			"be sent; enable it once TLS is terminated in front of the app")
+	}
+
 	// ─── Audit Logger ──────────────────────────────────────────────────────────
 	c.AuditLog = audit.New(log)
 
 	// ─── Database ──────────────────────────────────────────────────────────────
-	dbCfg := database.DefaultConfig(cfg.DBDSN)
+	dbCfg := database.Config{
+		DSN:             cfg.DBDSN,
+		MaxOpenConns:    cfg.DBMaxOpenConns,
+		MaxIdleConns:    cfg.DBMaxIdleConns,
+		ConnMaxLifetime: cfg.DBConnMaxLifetime,
+		ConnMaxIdleTime: cfg.DBConnMaxIdleTime,
+	}
 	sqlDB, err := database.New(dbCfg)
 	if err != nil {
 		return nil, fmt.Errorf("container: connect database: %w", err)
@@ -102,11 +116,12 @@ func New(migrationsFS fs.FS) (*Container, error) {
 	// (wrong format, no active key, key too short) produces a structured startup
 	// message rather than a raw stack trace in container logs.
 	jwtHelper, err := platformauth.NewJWT(platformauth.JWTConfig{
-		Keys:       jwtKeysFromConfig(cfg.JWTKeys),
-		Issuer:     cfg.JWTIssuer,
-		Audience:   cfg.JWTAudience,
-		AccessTTL:  cfg.AccessTTL,
-		RefreshTTL: cfg.RefreshTTL,
+		Keys:               jwtKeysFromConfig(cfg.JWTKeys),
+		Issuer:             cfg.JWTIssuer,
+		Audience:           cfg.JWTAudience,
+		AccessTTL:          cfg.AccessTTL,
+		RefreshTTL:         cfg.RefreshTTL,
+		RefreshAbsoluteTTL: cfg.RefreshAbsoluteTTL,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("container: init jwt: %w", err)
@@ -145,7 +160,20 @@ func New(migrationsFS fs.FS) (*Container, error) {
 		Password: cfg.EmailSMTPPass,
 		UseTLS:   cfg.EmailSMTPUseTLS,
 		From:     cfg.EmailFrom,
-	})
+	}, mailer.WithErrorHandler(func(msg mailer.Message, sendErr error) {
+		// Without this handler, the mailer's onErr defaults to a no-op and every
+		// async send failure is invisible. Log with the masked recipient so a
+		// persistently-broken SMTP path (verification, reset, login OTP) is
+		// observable without leaking PII.
+		var me *mailer.Error
+		retryable := errors.As(sendErr, &me) && me.IsRetryable()
+		log.Error("mailer: async send failed",
+			zap.String("to", audit.MaskEmail(msg.To)),
+			zap.String("subject", msg.Subject),
+			zap.Bool("retryable", retryable),
+			zap.Error(sendErr),
+		)
+	}))
 	if err != nil {
 		return nil, fmt.Errorf("container: init mailer: %w", err)
 	}

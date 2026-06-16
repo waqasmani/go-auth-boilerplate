@@ -2,12 +2,15 @@ package router
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	goredis "github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
@@ -38,6 +41,11 @@ type Options struct {
 	CookieCSRF        middleware.CookieCSRFConfig
 	SqlDB             *sql.DB
 	ShutdownCh        <-chan struct{}
+
+	// MetricsEnabled controls whether the Prometheus /metrics endpoint is served.
+	MetricsEnabled bool
+	// MetricsToken, when non-empty, requires a matching bearer token on /metrics.
+	MetricsToken string
 
 	// RedisClient is the optional Redis wrapper used by the /health endpoint.
 	RedisClient *redispkg.Client
@@ -98,8 +106,14 @@ func New(
 
 	// ─── Global Middleware ─────────────────────────────────────────────────────
 	//
-	// Size guards must be registered first so that oversized input is rejected
-	// before any other middleware — logging, rate limiting, CSRF — processes it.
+	// Recovery is registered FIRST so its deferred recover() wraps every
+	// subsequent middleware and handler — a panic anywhere in the chain (logger,
+	// request-id, timeout wrapper, size guards, handlers) is converted to a 500
+	// instead of crashing the worker goroutine.
+	r.Use(middleware.Recovery(log))
+
+	// Size guards next so that oversized input is rejected before logging, rate
+	// limiting, or CSRF processes it.
 	//
 	// Order matters:
 	//   1. Body cap     — MaxBytesReader on the request body (POST/PUT/PATCH).
@@ -131,10 +145,21 @@ func New(
 
 	r.Use(middleware.RequestID())
 	r.Use(middleware.Logger(log))
-	r.Use(middleware.Recovery(log))
+	r.Use(middleware.Metrics())
 
-	// ─── Health endpoint ───────────────────────────────────────────────────────
+	// ─── Health / probe endpoints ───────────────────────────────────────────────
+	// /livez  — liveness: process is up. No dependency checks, so a transient
+	//           DB/Redis blip does not cause the orchestrator to restart the pod.
+	// /readyz — readiness: dependencies (DB, Redis) are reachable; gate traffic.
+	// /health — retained for backward compatibility (same as readiness).
+	r.GET("/livez", func(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "alive"}) })
+	r.GET("/readyz", buildHealthHandler(opts))
 	r.GET("/health", buildHealthHandler(opts))
+
+	// ─── Metrics ────────────────────────────────────────────────────────────────
+	if opts.MetricsEnabled {
+		r.GET("/metrics", metricsHandler(opts.MetricsToken))
+	}
 
 	// ─── Swagger UI (non-production only) ─────────────────────────────────────
 	if env != "production" {
@@ -208,6 +233,24 @@ func buildHealthHandler(opts Options) gin.HandlerFunc {
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	}
+}
+
+// metricsHandler serves the Prometheus default registry (Go runtime + the HTTP
+// metrics recorded by middleware.Metrics). When token is non-empty it requires
+// `Authorization: Bearer <token>` (constant-time compared); when empty it is
+// open and should be restricted at the network/ingress layer.
+func metricsHandler(token string) gin.HandlerFunc {
+	h := promhttp.Handler()
+	return func(c *gin.Context) {
+		if token != "" {
+			got := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+			if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+				c.AbortWithStatus(http.StatusUnauthorized)
+				return
+			}
+		}
+		h.ServeHTTP(c.Writer, c.Request)
 	}
 }
 
