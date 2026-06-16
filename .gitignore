@@ -1,5 +1,7 @@
 # Binaries
 bin/
+# Locally-built command binaries (e.g. `go build ./cmd/gensecrets`)
+/gensecrets
 *.exe
 *.exe~
 *.dll
@@ -17,6 +19,14 @@ scripts
 .env
 .env.local
 .env.*.local
+
+# Viper config files (may contain secrets). The committed template is
+# config.example.yaml; a real config.yaml / config/ is ignored.
+config.yaml
+config.yml
+config.json
+config.toml
+/config/
 
 # IDE
 .idea/
