@@ -70,7 +70,8 @@ func healthcheck(path string) int {
 		port = "8080"
 	}
 	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Get("http://127.0.0.1:" + port + path)
+	resp, err := client.Get("http://127.0.0.1:" + port + path) // #nosec G704 -- localhost-only liveness probe; host is the hardcoded loopback, only port/path come from operator config (APP_ENV / CLI arg), never request input
+
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "healthcheck: %v\n", err)
 		return 1

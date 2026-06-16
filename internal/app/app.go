@@ -27,7 +27,6 @@ import (
 )
 
 const (
-	tokenCleanupInterval = 1 * time.Hour
 	// serverShutdownTimeout must exceed the router's per-request timeout
 	// (router.requestTimeout, 25s) so that in-flight requests can drain to
 	// completion before the server gives up. If it were shorter, server.Shutdown

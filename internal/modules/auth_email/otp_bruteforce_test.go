@@ -105,7 +105,7 @@ func TestVerifyOTP_EmailBruteForceBurnsChallenge(t *testing.T) {
 	}
 	defer mr.Close()
 	rdb := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 
 	replay, err := platformauth.NewTOTPReplayCacheWithTTL(rdb, zap.NewNop(), 90*time.Second)
 	if err != nil {

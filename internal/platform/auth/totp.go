@@ -223,7 +223,7 @@ func encryptWithKey(k TOTPEncKey, plaintext string) ([]byte, error) {
 
 	idBytes := []byte(k.ID)
 	blob := make([]byte, 0, 1+len(idBytes)+len(sealed))
-	blob = append(blob, byte(len(idBytes)))
+	blob = append(blob, byte(len(idBytes))) // #nosec G115 -- key ID length is validated <= 255 bytes at construction (NewTOTPKeySet)
 	blob = append(blob, idBytes...)
 	blob = append(blob, sealed...)
 	return blob, nil

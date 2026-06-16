@@ -148,7 +148,8 @@ func writeOut(content, out string, force bool, mergeSrc string) {
 		}
 	}
 	// 0600: secrets must not be world-readable.
-	if wErr := os.WriteFile(out, []byte(content), 0o600); wErr != nil {
+	wErr := os.WriteFile(out, []byte(content), 0o600) // #nosec G703 -- out is an operator-supplied path for a local dev/ops CLI (gensecrets), not untrusted input
+	if wErr != nil {
 		fatalf("gensecrets: write %s: %v", out, wErr)
 	}
 	fmt.Fprintf(os.Stderr, "gensecrets: wrote %s (mode 0600)\n", out)

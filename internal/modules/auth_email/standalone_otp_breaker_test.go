@@ -158,7 +158,7 @@ func TestStandaloneOTPBreaker_CountsFailures(t *testing.T) {
 	}
 	defer mr.Close()
 	rdb := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 
 	repo := &breakerFakeRepo{}
 	svc := newBreakerService(t, repo, rdb)
@@ -194,7 +194,7 @@ func TestStandaloneOTPBreaker_TripsAndShortCircuitsDB(t *testing.T) {
 	}
 	defer mr.Close()
 	rdb := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 
 	repo := &breakerFakeRepo{}
 	svc := newBreakerService(t, repo, rdb)
@@ -236,7 +236,7 @@ func TestStandaloneOTPBreaker_BelowCapDoesNotTrip(t *testing.T) {
 	}
 	defer mr.Close()
 	rdb := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 
 	repo := &breakerFakeRepo{}
 	svc := newBreakerService(t, repo, rdb)
@@ -269,7 +269,7 @@ func TestStandaloneOTPBreaker_FailsOpenWhenRedisDown(t *testing.T) {
 		t.Fatalf("miniredis: %v", err)
 	}
 	rdb := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 
 	// Drive the counter over the cap while Redis is still up.
 	if err := mr.Set(standaloneOTPFailKey, strconv.Itoa(standaloneOTPFailMax+10)); err != nil {
@@ -306,7 +306,7 @@ func TestStandaloneOTPBreaker_DoesNotAffectMFAPath(t *testing.T) {
 	}
 	defer mr.Close()
 	rdb := goredis.NewClient(&goredis.Options{Addr: mr.Addr()})
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 
 	// Standalone counter way over the cap — would trip the standalone breaker.
 	if err := mr.Set(standaloneOTPFailKey, strconv.Itoa(standaloneOTPFailMax*2)); err != nil {
