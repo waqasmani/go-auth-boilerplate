@@ -1,28 +1,79 @@
-version: "3.9"
+# Local / self-hosted stack for go-auth-boilerplate.
+#
+# SECURITY: no secrets are baked into this file. All secrets are read from a
+# local .env file (gitignored). Copy .env.example to .env and fill in the
+# REQUIRED values before running:
+#
+#     cp .env.example .env      # then edit .env
+#     docker compose up --build
+#
+# The `${VAR:?message}` syntax makes Compose refuse to start until the variable
+# is set in .env, so you can never accidentally launch with an empty/placeholder
+# secret. APP_ENV defaults to development; for a production-mode run set
+# APP_ENV=production in .env and provide strong, unique secrets (the app refuses
+# to boot in production with placeholder/low-entropy secrets).
 
 services:
   # ─── MariaDB ──────────────────────────────────────────────────────────────
   db:
-    image: mariadb:11.3
+    image: mariadb:11.4
     restart: unless-stopped
     environment:
-      MARIADB_ROOT_PASSWORD: rootpassword
-      MARIADB_DATABASE: auth_db
-      MARIADB_USER: appuser
-      MARIADB_PASSWORD: apppassword
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD in .env}
+      MARIADB_DATABASE: ${DB_NAME:-go_auth}
+      MARIADB_USER: ${DB_USER:-app_user}
+      MARIADB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
     ports:
       - "3306:3306"
     volumes:
       - db_data:/var/lib/mysql
-      - ./sql/migrations:/docker-entrypoint-initdb.d
+      # NOTE: schema migrations are applied by the application via golang-migrate
+      # on startup — they are intentionally NOT mounted into
+      # /docker-entrypoint-initdb.d. Mounting them there would apply each .up.sql
+      # twice (once by MariaDB init, once by the app) and desync schema_migrations.
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+        reservations:
+          memory: 512m
 
-  # ─── API ──────────────────────────────────────────────────────────────────
+  # ─── Redis (mandatory dependency: rate limiting, lockout, TOTP replay) ──────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # appendonly persistence so lockout counters and TOTP-replay state survive a
+    # restart — without it, a Redis bounce silently resets every account-lockout
+    # counter to zero.
+    command:
+      - "redis-server"
+      - "--requirepass"
+      - "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}"
+      - "--appendonly"
+      - "yes"
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256m
+
+  # ─── API ────────────────────────────────────────────────────────────────────
   api:
     build:
       context: .
@@ -30,18 +81,37 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+    # All application config (APP_ENV, JWT_KEYS, OTP_HMAC_SECRET, TOTP_KEYS, …)
+    # comes from .env. The DSNs below are overridden to point at the compose
+    # service names regardless of what .env sets for local (non-Docker) runs.
+    env_file: .env
     environment:
-      APP_ENV: production
-      APP_PORT: 8080
-      DB_DSN: appuser:apppassword@tcp(db:3306)/auth_db?parseTime=true&charset=utf8mb4&loc=UTC
-      JWT_SECRET: change-me-in-production-use-a-long-random-secret
-      JWT_ISSUER: go-auth-boilerplate
-      JWT_AUDIENCE: go-auth-boilerplate-users
-      JWT_ACCESS_TTL: 15m
-      JWT_REFRESH_TTL: 720h
+      DB_DSN: "${DB_USER:-app_user}:${DB_PASSWORD}@tcp(db:3306)/${DB_NAME:-go_auth}?parseTime=true&loc=UTC&tls=false"
+      REDIS_DSN: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+      # The DB runs on a private Docker network; acknowledge the non-TLS hop so a
+      # production-mode run does not fail the DB-TLS guard.
+      DB_ALLOW_INSECURE: "true"
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Dependency-aware readiness probe via the binary's own subcommand
+      # (the scratch image has no shell/curl). /readyz checks DB + Redis.
+      test: ["CMD", "/api", "healthcheck", "/readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512m
+        reservations:
+          memory: 128m
 
 volumes:
   db_data:
+  redis_data:

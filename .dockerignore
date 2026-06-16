@@ -1,0 +1,33 @@
+# Keep the build context small and avoid copying secrets/artefacts into image
+# layers. NOTE: docs/ is a generated Go package imported by internal/router for
+# Swagger, so it is intentionally NOT ignored — excluding it breaks the build.
+
+# VCS & CI
+.git
+.gitignore
+.github
+
+# Secrets and local config (must never enter the build context / image cache)
+.env
+.env.*
+!.env.example
+config.yaml
+config.yml
+config.json
+config.toml
+/config/
+
+# Build / test artefacts
+bin/
+coverage.out
+coverage.html
+gosec.sarif
+
+# Docs, images, and meta files not needed to compile the binary
+*.md
+*.png
+tests/
+docker-compose.yml
+Dockerfile
+.dockerignore
+.golangci.yml

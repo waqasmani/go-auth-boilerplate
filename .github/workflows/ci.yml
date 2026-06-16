@@ -7,9 +7,14 @@ on:
   pull_request:
     branches: [main, develop]
 
-# Define Go version as environment variable for consistency
+# Keep GO_VERSION in sync with the Dockerfile's GO_VERSION build arg so the
+# image ships on the same toolchain the gate runs on.
 env:
   GO_VERSION: "1.25.8"
+  # Coverage floor over ./internal/... . This is a regression guard, not a
+  # target — ratchet it up as coverage improves. (Generated db/ and wiring code
+  # drag the headline number down; the security primitives are well covered.)
+  MIN_COVERAGE: "25"
 
 jobs:
   test:
@@ -39,7 +44,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}  # Consistent version
+          go-version: ${{ env.GO_VERSION }}
           cache: true
 
       - name: Install dependencies
@@ -48,21 +53,44 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Security scan
+      - name: Security scan (govulncheck)
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
 
-      - name: Apply migrations
-        env:
-          MYSQL_PWD: rootpassword 
+      # Apply migrations through golang-migrate (pinned to the version in go.mod)
+      # — the SAME library + mysql driver + schema_migrations versioning the app
+      # uses at startup. This replaces the previous raw `mysql < file` loop, which
+      # never exercised the real migration path and could pass on schemas that
+      # the embedded migrator would reject (multi-statement handling, dirty-state
+      # tracking, down migrations).
+      - name: Apply migrations (golang-migrate)
         run: |
-          for f in $(ls sql/migrations/*.up.sql | sort); do
-            mysql -h 127.0.0.1 -u root auth_db_test < "$f"
-          done
+          go install -tags 'mysql' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.1
+          migrate -path sql/migrations \
+            -database "mysql://root:rootpassword@tcp(127.0.0.1:3306)/auth_db_test?multiStatements=true" up
 
-      - name: Run unit tests
-        run: go test -v -race -count=1 ./internal/...
+      - name: Run unit tests (race + coverage)
+        run: |
+          go test -race -count=1 -covermode=atomic -coverprofile=coverage.out ./internal/...
+
+      # Real coverage gate: no `|| true` swallowing failures, and the total is
+      # compared against MIN_COVERAGE so an accidental large drop fails CI.
+      - name: Coverage gate
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          echo "Total coverage: ${total}% (floor: ${MIN_COVERAGE}%)"
+          awk -v t="$total" -v m="$MIN_COVERAGE" 'BEGIN { exit (t+0 >= m+0) ? 0 : 1 }' \
+            || { echo "::error::coverage ${total}% is below floor ${MIN_COVERAGE}%"; exit 1; }
+
+      # Run the integration suite against the real MariaDB service. Previously
+      # this never ran (the test step only covered ./internal/...), so the
+      # DB-backed FOR UPDATE rotation / reuse-revoke / attempt-counter tests were
+      # dead weight despite CI provisioning a database.
+      - name: Run integration tests
+        env:
+          DB_DSN: "root:rootpassword@tcp(127.0.0.1:3306)/auth_db_test?parseTime=true&loc=UTC&multiStatements=true"
+        run: go test -race -count=1 -tags=integration ./tests/integration/...
 
   lint:
     name: Lint
@@ -78,11 +106,68 @@ jobs:
         with:
           version: v2.11.3
 
-  # Add build verification job
+  security:
+    name: Static Security Scan (gosec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: gosec
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          # Gate on high-severity findings to keep false positives from blocking
+          # CI; run `make sec` locally for the full report. -exclude-generated
+          # skips sqlc/swagger-generated files.
+          gosec -exclude-generated -severity=high -confidence=medium ./...
+
+  docker:
+    name: Docker Build & Image Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Builds the actual production artifact — catches Dockerfile breakage
+      # (e.g. the nonroot USER, build args, trimpath/version stamping) that the
+      # `go build` jobs never exercise.
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg GO_VERSION="${GO_VERSION}" \
+            --build-arg VERSION="${GITHUB_REF_NAME}" \
+            --build-arg COMMIT="${GITHUB_SHA::7}" \
+            --build-arg BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t go-auth-boilerplate:ci .
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      # Fail only on fixable HIGH/CRITICAL vulnerabilities so unfixed upstream
+      # advisories don't permanently block CI.
+      - name: Scan image for vulnerabilities
+        run: |
+          trivy image --scanners vuln --severity HIGH,CRITICAL \
+            --ignore-unfixed --exit-code 1 --no-progress go-auth-boilerplate:ci
+
+      - name: Generate SBOM (CycloneDX)
+        run: |
+          trivy image --format cyclonedx --output sbom.cdx.json --no-progress go-auth-boilerplate:ci
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+          if-no-files-found: error
+
   build:
     name: Build Verification
     runs-on: ubuntu-latest
-    needs: [test, lint]
+    needs: [test, lint, security]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
