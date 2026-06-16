@@ -125,14 +125,15 @@ type OauthOneTimeCode struct {
 }
 
 type RefreshToken struct {
-	ID          string       `json:"id"`
-	UserID      string       `json:"user_id"`
-	TokenHash   string       `json:"token_hash"`
-	TokenFamily string       `json:"token_family"`
-	ExpiresAt   time.Time    `json:"expires_at"`
-	UsedAt      sql.NullTime `json:"used_at"`
-	RevokedAt   sql.NullTime `json:"revoked_at"`
-	CreatedAt   time.Time    `json:"created_at"`
+	ID              string       `json:"id"`
+	UserID          string       `json:"user_id"`
+	TokenHash       string       `json:"token_hash"`
+	TokenFamily     string       `json:"token_family"`
+	ExpiresAt       time.Time    `json:"expires_at"`
+	FamilyExpiresAt sql.NullTime `json:"family_expires_at"`
+	UsedAt          sql.NullTime `json:"used_at"`
+	RevokedAt       sql.NullTime `json:"revoked_at"`
+	CreatedAt       time.Time    `json:"created_at"`
 }
 
 type Role struct {
