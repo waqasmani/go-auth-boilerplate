@@ -65,7 +65,19 @@ step:
    Roll out to all replicas. Tokens signed by the old key still verify (the old
    key remains in the set) — no forced re-login.
 3. After `JWT_REFRESH_TTL` has elapsed (so no live token was signed by the old
-   key), remove the old key entirely. Roll out to all replicas.
+   key), remove the old key entirely. Roll out to all replicas. Automate this
+   last step with `cmd/gensecrets -prune` (or `make prune-keys`), which retires
+   inactive keys by age and never touches the active key:
+
+   ```bash
+   make prune-keys KEY=JWT_KEYS OLDER_THAN=720h   # ≈ JWT_REFRESH_TTL (30 d)
+   ```
+
+   Rotated keys carry a `created` timestamp so prune can compute their age;
+   inactive keys with no timestamp (minted before this feature) are kept and
+   reported rather than deleted. When a shared secrets store is the source of
+   truth, prune against it the same way (`-merge` the file the store renders, or
+   use the stdout form and push the result back), then roll the fleet.
 
 Never skip a step or remove the old key early — a replica still signing with a
 key another replica has already dropped will break sessions. The same ordered

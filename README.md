@@ -318,6 +318,26 @@ JWT_KEYS=[{"id":"v1","secret":"<old_key>","active":false},{"id":"v2","secret":"<
 JWT_KEYS=[{"id":"v2","secret":"<new_key>","active":true}]
 ```
 
+`make rotate-key` automates steps 1–2 (new active key appended, old keys demoted
+and stamped with a `created` timestamp). Step 3 is automated too — instead of
+hand-editing, retire keys past their TTL by age:
+
+```bash
+make prune-keys KEY=JWT_KEYS OLDER_THAN=720h   # drop inactive keys minted >30 d ago
+```
+
+`prune-keys` never removes the active key, and never removes inactive keys that
+lack a `created` timestamp (minted before timestamped rotation, age unknown) —
+those are reported so you can remove them by hand once you're sure no live token
+still uses them.
+
+> **Multi-instance deployments:** `rotate-key` / `prune-keys` edit a local
+> `.env`. With more than one replica, make a shared secrets store (Vault, AWS
+> Secrets Manager, SSM, Kubernetes Secret) the source of truth so every instance
+> reads the same key set. Drive rotation against it with the stdout form —
+> `go run ./cmd/gensecrets -rotate JWT_KEYS` (reads `$JWT_KEYS`, prints the new
+> value) — and push that value into the store, then roll all replicas.
+
 Rules enforced at startup:
 - Every key must have a non-empty `id` and a `secret` of **at least 32 bytes** (RFC 7518 §3.2)
 - No two keys may share the same `id`
@@ -379,6 +399,7 @@ HSTS is **disabled by default** and must be explicitly enabled in production whe
 make env-init         # Generate a complete .env from .env.example (app secrets; FORCE=1 to overwrite)
 make gen-secrets      # Print freshly-generated values for the app's secret env vars
 make rotate-key KEY=JWT_KEYS  # Rotate a key set in .env (new active key; old kept for validation)
+make prune-keys KEY=JWT_KEYS OLDER_THAN=720h  # Retire inactive keys older than the window (active key kept)
 make run              # Run API locally
 make build            # Compile binary to bin/
 make test             # Unit tests (go test -race ./...)

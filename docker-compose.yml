@@ -24,7 +24,10 @@ services:
       MARIADB_USER: ${DB_USER:-app_user}
       MARIADB_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
     ports:
-      - "3306:3306"
+      # Host-side port is configurable to avoid clashing with a local MySQL/
+      # MariaDB on 3306. The app connects over the internal network (db:3306),
+      # so this mapping only affects access from the host.
+      - "${DB_HOST_PORT:-3306}:3306"
     volumes:
       - db_data:/var/lib/mysql
       # NOTE: schema migrations are applied by the application via golang-migrate
@@ -59,7 +62,9 @@ services:
       - "--appendonly"
       - "yes"
     ports:
-      - "6379:6379"
+      # Configurable host port to avoid clashing with a local Redis on 6379.
+      # The app connects over the internal network (redis:6379).
+      - "${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -85,6 +90,12 @@ services:
     # comes from .env. The DSNs below are overridden to point at the compose
     # service names regardless of what .env sets for local (non-Docker) runs.
     env_file: .env
+    # Force ndots:1 so single-label service names (db, redis) resolve against
+    # Docker's embedded DNS. Some hosts (systemd-resolved) push ndots:0 and a
+    # root `search .` into containers, which makes the resolver treat `db` as an
+    # absolute name, miss the internal record, and return SERVFAIL.
+    dns_opt:
+      - "ndots:1"
     environment:
       DB_DSN: "${DB_USER:-app_user}:${DB_PASSWORD}@tcp(db:3306)/${DB_NAME:-go_auth}?parseTime=true&loc=UTC&tls=false"
       REDIS_DSN: "redis://:${REDIS_PASSWORD}@redis:6379/0"

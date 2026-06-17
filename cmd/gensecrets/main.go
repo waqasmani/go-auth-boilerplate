@@ -37,6 +37,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // secret is one generated KEY=VALUE pair.
@@ -71,12 +72,19 @@ var weakMarkers = []string{
 func main() {
 	merge := flag.String("merge", "", "path to an existing env file to merge generated secrets into (fills only placeholder/empty values)")
 	rotate := flag.String("rotate", "", "rotate this key set (JWT_KEYS|TOTP_KEYS|OAUTH_TOKEN_KEYS): append a new active key and demote existing keys to still-validating, so live sessions/secrets keep working")
+	prune := flag.String("prune", "", "prune retired keys from this key set (JWT_KEYS|TOTP_KEYS|OAUTH_TOKEN_KEYS): remove inactive keys older than -older-than. The active key is never removed; keys without a creation timestamp are kept and reported")
+	olderThan := flag.Duration("older-than", 0, "with -prune: remove inactive keys whose creation timestamp is older than this (e.g. 720h). Required for -prune")
 	out := flag.String("o", "", "output path (default: stdout)")
 	force := flag.Bool("force", false, "overwrite -o if it already exists")
 	flag.Parse()
 
 	if *rotate != "" {
 		runRotate(*rotate, *merge, *out, *force)
+		return
+	}
+
+	if *prune != "" {
+		runPrune(*prune, *olderThan, *merge, *out, *force)
 		return
 	}
 
@@ -133,6 +141,144 @@ func runRotate(name, merge, out string, force bool) {
 	rotateChecklist(name)
 }
 
+// runPrune retires inactive keys older than olderThan from a single key set.
+// With -merge it edits that key's line in place; without -merge it prunes the
+// value from the process environment and prints the new KEY=VALUE line. The
+// active key is never removed, and keys with no creation timestamp are kept
+// (their age is unknown) and reported so the operator can decide manually.
+func runPrune(name string, olderThan time.Duration, merge, out string, force bool) {
+	if keysetField(name) == "" {
+		fatalf("gensecrets: %s is not a prunable key set — prunable: JWT_KEYS, TOTP_KEYS, OAUTH_TOKEN_KEYS", name)
+	}
+	if olderThan <= 0 {
+		fatalf("gensecrets: -prune requires -older-than <duration> greater than 0 (e.g. -older-than 720h to retire keys older than 30 days)")
+	}
+	now := time.Now().UTC()
+
+	if merge == "" {
+		current := os.Getenv(name)
+		if current == "" {
+			fatalf("gensecrets: %s is not set in the environment — pass -merge <env-file> to prune the value stored in a file", name)
+		}
+		pruned, res, err := pruneKeyset(name, current, olderThan, now)
+		if err != nil {
+			fatalf("gensecrets: %v", err)
+		}
+		fmt.Printf("%s=%s\n", name, pruned)
+		pruneReport(name, res)
+		return
+	}
+
+	raw, err := os.ReadFile(merge)
+	if err != nil {
+		fatalf("gensecrets: read %s: %v", merge, err)
+	}
+	content, res, err := pruneInFile(string(raw), name, olderThan, now)
+	if err != nil {
+		fatalf("gensecrets: %v", err)
+	}
+	writeOut(content, out, force, merge)
+	pruneReport(name, res)
+}
+
+// pruneResult records what a prune pass did, for operator-facing reporting.
+type pruneResult struct {
+	removed     []string // ids of inactive keys retired by age
+	keptNoStamp []string // inactive ids skipped because they have no creation timestamp
+	remaining   int      // total keys left in the set
+}
+
+// pruneKeyset removes inactive keys whose Created timestamp is older than
+// olderThan relative to now. The active key is always retained. Inactive keys
+// without a parseable Created timestamp are RETAINED (age unknown) and recorded
+// in keptNoStamp — refusing to delete material of unknown age is the safe
+// default, since a still-validating key removed too early breaks live sessions.
+func pruneKeyset(name, currentJSON string, olderThan time.Duration, now time.Time) (string, pruneResult, error) {
+	var res pruneResult
+	field := keysetField(name)
+	if field == "" {
+		return "", res, fmt.Errorf("%s is not a prunable key set", name)
+	}
+	currentJSON = strings.TrimSpace(currentJSON)
+	if currentJSON == "" || isPlaceholder(currentJSON) {
+		return "", res, fmt.Errorf("%s has no keys to prune (value is empty or a placeholder)", name)
+	}
+	var keys []anyKey
+	if err := json.Unmarshal([]byte(currentJSON), &keys); err != nil {
+		return "", res, fmt.Errorf("%s: current value is not a valid key-set JSON array: %w", name, err)
+	}
+	if len(keys) == 0 {
+		return "", res, fmt.Errorf("%s: current key set is empty", name)
+	}
+
+	kept := make([]anyKey, 0, len(keys))
+	for _, k := range keys {
+		if k.Active {
+			kept = append(kept, k)
+			continue
+		}
+		if k.Created == "" {
+			res.keptNoStamp = append(res.keptNoStamp, k.ID)
+			kept = append(kept, k)
+			continue
+		}
+		created, err := time.Parse(time.RFC3339, k.Created)
+		if err != nil {
+			// Unparseable timestamp: treat as unknown age, keep and report.
+			res.keptNoStamp = append(res.keptNoStamp, k.ID)
+			kept = append(kept, k)
+			continue
+		}
+		if now.Sub(created.UTC()) > olderThan {
+			res.removed = append(res.removed, k.ID)
+			continue
+		}
+		kept = append(kept, k)
+	}
+
+	res.remaining = len(kept)
+	b, err := json.Marshal(kept)
+	if err != nil {
+		return "", res, err
+	}
+	return string(b), res, nil
+}
+
+// pruneInFile rewrites the single uncommented `name=...` line in raw with its
+// pruned value, preserving every other line. Errors if the key is absent.
+func pruneInFile(raw, name string, olderThan time.Duration, now time.Time) (string, pruneResult, error) {
+	var res pruneResult
+	lines := strings.Split(raw, "\n")
+	for i, line := range lines {
+		key, val, ok := splitEnvLine(line)
+		if !ok || key != name {
+			continue
+		}
+		pruned, r, err := pruneKeyset(name, val, olderThan, now)
+		if err != nil {
+			return "", res, err
+		}
+		lines[i] = key + "=" + pruned
+		return strings.Join(lines, "\n"), r, nil
+	}
+	return "", res, fmt.Errorf("%s not found (uncommented) in the env file", name)
+}
+
+func pruneReport(name string, res pruneResult) {
+	if len(res.removed) == 0 {
+		fmt.Fprintf(os.Stderr, "gensecrets: %s — no inactive keys old enough to prune (%d key(s) retained)\n", name, res.remaining)
+	} else {
+		fmt.Fprintf(os.Stderr, "gensecrets: %s — pruned %d retired key(s): %s (%d key(s) remain)\n",
+			name, len(res.removed), strings.Join(res.removed, ", "), res.remaining)
+	}
+	if len(res.keptNoStamp) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"gensecrets: %s — kept %d inactive key(s) with no creation timestamp (age unknown, not auto-pruned): %s\n"+
+				"  These predate timestamped rotation. Once you are certain no live token/secret still uses them, remove them by hand.\n",
+			name, len(res.keptNoStamp), strings.Join(res.keptNoStamp, ", "))
+	}
+}
+
 // writeOut sends content to stdout (out == "") or to a file. It refuses to
 // overwrite an existing file unless -force is set, EXCEPT for an in-place edit
 // (out == the -merge source), which is the intended target you just read from.
@@ -160,8 +306,11 @@ func rotateChecklist(name string) {
 %s rotated: the new key is active; the previous key(s) are retained (inactive) so existing tokens/secrets still VALIDATE.
   1. Deploy with the updated %s.
   2. New tokens are signed/encrypted with the new key; tokens issued under the old key keep validating until they expire.
-  3. After the old key's max TTL has elapsed (e.g. JWT_REFRESH_TTL for JWT_KEYS), remove the inactive key(s) and redeploy.
-`, name, name)
+  3. After the old key's max TTL has elapsed (e.g. JWT_REFRESH_TTL for JWT_KEYS),
+     retire the inactive key(s) and redeploy:
+       go run ./cmd/gensecrets -prune %s -older-than <TTL> -merge .env -o .env
+     (or: make prune-keys KEY=%s OLDER_THAN=<TTL>). The active key is never removed.
+`, name, name, name, name)
 }
 
 // generateAll produces the full ordered set of secrets.
@@ -228,6 +377,12 @@ type anyKey struct {
 	Secret string `json:"secret,omitempty"`
 	Key    string `json:"key,omitempty"`
 	Active bool   `json:"active"`
+	// Created is the RFC3339 UTC timestamp the key was minted. It is written
+	// on every rotation so `-prune` can retire inactive keys by age. The field
+	// is optional and ignored by the application config loaders (non-strict
+	// JSON), so adding it is backward compatible; keys minted before this field
+	// existed simply have no timestamp and are never auto-pruned.
+	Created string `json:"created,omitempty"`
 }
 
 // keysetField returns the value field name for a rotatable key set, or "" if
@@ -277,7 +432,7 @@ func rotateKeyset(name, currentJSON string) (string, error) {
 		}
 		return b64(32)
 	})
-	newKey := anyKey{ID: nextKeyID(ids), Active: true}
+	newKey := anyKey{ID: nextKeyID(ids), Active: true, Created: time.Now().UTC().Format(time.RFC3339)}
 	if field == "secret" {
 		newKey.Secret = value
 	} else {

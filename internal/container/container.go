@@ -96,7 +96,7 @@ func New(migrationsFS fs.FS) (*Container, error) {
 
 	// ─── Migrations ────────────────────────────────────────────────────────────
 	if !cfg.SkipMigrations {
-		if err = database.RunMigrations(sqlDB, migrationsFS, log); err != nil {
+		if err = database.RunMigrations(cfg.DBDSN, migrationsFS, log); err != nil {
 			return nil, fmt.Errorf("container: run migrations: %w", err)
 		}
 	}

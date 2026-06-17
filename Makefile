@@ -335,6 +335,13 @@ rotate-key: ## Rotate a key set in .env, keeping old keys for validation. Usage:
 	$(call log,rotate-key,Rotating $(KEY) in .env)
 	@go run ./cmd/gensecrets -rotate $(KEY) -merge .env -o .env
 
+.PHONY: prune-keys
+prune-keys: ## Retire inactive keys older than OLDER_THAN from .env. Usage: make prune-keys KEY=JWT_KEYS OLDER_THAN=720h
+	@[ -n "$(KEY)" ] || { printf "$(RED)Usage: make prune-keys KEY=JWT_KEYS|TOTP_KEYS|OAUTH_TOKEN_KEYS OLDER_THAN=720h$(RESET)\n"; exit 1; }
+	@[ -n "$(OLDER_THAN)" ] || { printf "$(RED)Usage: make prune-keys KEY=$(KEY) OLDER_THAN=720h  (retire inactive keys older than this; the active key is never removed)$(RESET)\n"; exit 1; }
+	$(call log,prune-keys,Pruning inactive $(KEY) older than $(OLDER_THAN) from .env)
+	@go run ./cmd/gensecrets -prune $(KEY) -older-than $(OLDER_THAN) -merge .env -o .env
+
 
 # =============================================================================
 #  CODE GENERATION

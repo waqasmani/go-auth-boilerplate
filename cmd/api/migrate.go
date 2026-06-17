@@ -35,14 +35,9 @@ func runMigrate() int {
 	}
 	defer func() { _ = log.Sync() }()
 
-	sqlDB, err := database.New(database.DefaultConfig(cfg.DBDSN))
-	if err != nil {
-		log.Error("migrate: connect database", zap.Error(err))
-		return 1
-	}
-	defer func() { _ = sqlDB.Close() }()
-
-	if err = database.RunMigrations(sqlDB, migrations.FS, log); err != nil {
+	// RunMigrations opens its own dedicated multiStatements connection and closes
+	// it when done, so there is no app pool to manage here.
+	if err = database.RunMigrations(cfg.DBDSN, migrations.FS, log); err != nil {
 		log.Error("migrate: apply migrations", zap.Error(err))
 		return 1
 	}

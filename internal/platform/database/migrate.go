@@ -28,24 +28,33 @@ import (
 // var so tests can shorten it.
 var migrationTimeout = 2 * time.Minute
 
-// RunMigrations applies every pending migration in migrationsFS to db and
-// returns nil when the schema is already at the latest version (ErrNoChange).
+// RunMigrations applies every pending migration in migrationsFS and returns nil
+// when the schema is already at the latest version (ErrNoChange).
+//
+// It opens its OWN short-lived connection from dsn with multiStatements=true
+// (see database.NewMigrationDB) rather than reusing the application pool, so
+// migration files may contain multiple statements while the app pool keeps
+// multiStatements disabled. The connection is closed before this returns.
 //
 // It is safe to call on every startup: golang-migrate tracks applied versions
 // in a schema_migrations table and is idempotent when the schema is current.
 //
-// Call this immediately after the connection pool passes its Ping check and
-// before any application query executes, so the schema and the code are always
-// in sync:
+// Call this before any application query executes, so the schema and the code
+// are always in sync:
 //
-//	sqlDB, _ := database.New(cfg)
-//	database.RunMigrations(sqlDB, migrations.FS, log)
+//	database.RunMigrations(cfg.DBDSN, migrations.FS, log)
 //	queries, _ := db.Prepare(ctx, sqlDB)
 //
 // The migrationsFS must contain sequentially-numbered *.up.sql / *.down.sql
 // pairs at its root (e.g. 000001_init.up.sql).  Use the embed.FS exported by
 // the sql/migrations package so the files are always bundled with the binary.
-func RunMigrations(sqlDB *sql.DB, migrationsFS fs.FS, log *zap.Logger) error {
+func RunMigrations(dsn string, migrationsFS fs.FS, log *zap.Logger) error {
+	sqlDB, err := NewMigrationDB(dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = sqlDB.Close() }()
+
 	m, err := newMigrator(sqlDB, migrationsFS)
 	if err != nil {
 		return err

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	platformauth "github.com/waqasmani/go-auth-boilerplate/internal/platform/auth"
 )
@@ -347,5 +348,127 @@ func TestSplitEnvLine(t *testing.T) {
 		if ok != c.wantOK || k != c.wantKey || v != c.wVal {
 			t.Errorf("splitEnvLine(%q) = (%q,%q,%v), want (%q,%q,%v)", c.line, k, v, ok, c.wantKey, c.wVal, c.wantOK)
 		}
+	}
+}
+
+// Rotation must stamp the new key with a creation timestamp so -prune can later
+// retire it by age; the demoted old key keeps whatever it had (none here).
+func TestRotateStampsCreatedOnNewKey(t *testing.T) {
+	const old = `[{"id":"v1","secret":"original-secret-value-at-least-32-bytes-long-xyz","active":true}]`
+	out, err := rotateKeyset("JWT_KEYS", old)
+	if err != nil {
+		t.Fatalf("rotateKeyset: %v", err)
+	}
+	var keys []anyKey
+	if err := json.Unmarshal([]byte(out), &keys); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	newKey := keys[len(keys)-1]
+	if newKey.Created == "" {
+		t.Fatal("new key should carry a created timestamp")
+	}
+	if _, err := time.Parse(time.RFC3339, newKey.Created); err != nil {
+		t.Errorf("created timestamp %q is not RFC3339: %v", newKey.Created, err)
+	}
+}
+
+func TestPruneKeysetRemovesOldInactiveKeepsActiveAndRecent(t *testing.T) {
+	now := time.Date(2026, 6, 17, 0, 0, 0, 0, time.UTC)
+	old := now.Add(-1000 * time.Hour).Format(time.RFC3339) // well past the window
+	recent := now.Add(-1 * time.Hour).Format(time.RFC3339) // inside the window
+	in := `[` +
+		`{"id":"v1","secret":"old-inactive-secret-at-least-32-bytes-long-aaa","active":false,"created":"` + old + `"},` +
+		`{"id":"v2","secret":"recent-inactive-secret-32-bytes-long-bbbbbb","active":false,"created":"` + recent + `"},` +
+		`{"id":"v3","secret":"current-active-secret-at-least-32-bytes-long-cc","active":true,"created":"` + recent + `"}` +
+		`]`
+	out, res, err := pruneKeyset("JWT_KEYS", in, 720*time.Hour, now)
+	if err != nil {
+		t.Fatalf("pruneKeyset: %v", err)
+	}
+	var keys []anyKey
+	if err := json.Unmarshal([]byte(out), &keys); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, k := range keys {
+		ids[k.ID] = true
+	}
+	if ids["v1"] {
+		t.Error("v1 was older than the window and inactive — should have been pruned")
+	}
+	if !ids["v2"] || !ids["v3"] {
+		t.Errorf("v2 (recent inactive) and v3 (active) must be retained, got %+v", ids)
+	}
+	if len(res.removed) != 1 || res.removed[0] != "v1" {
+		t.Errorf("want removed=[v1], got %v", res.removed)
+	}
+}
+
+// The active key must never be pruned even if its timestamp is ancient.
+func TestPruneNeverRemovesActiveKey(t *testing.T) {
+	now := time.Date(2026, 6, 17, 0, 0, 0, 0, time.UTC)
+	old := now.Add(-100000 * time.Hour).Format(time.RFC3339)
+	in := `[{"id":"v1","secret":"ancient-but-active-secret-at-least-32-bytes-xx","active":true,"created":"` + old + `"}]`
+	out, res, err := pruneKeyset("JWT_KEYS", in, time.Hour, now)
+	if err != nil {
+		t.Fatalf("pruneKeyset: %v", err)
+	}
+	if !strings.Contains(out, `"id":"v1"`) {
+		t.Errorf("active key must survive pruning, got %s", out)
+	}
+	if len(res.removed) != 0 {
+		t.Errorf("no key should be removed, got %v", res.removed)
+	}
+}
+
+// Inactive keys without a creation timestamp predate timestamped rotation;
+// their age is unknown, so they must be kept (and reported), never deleted.
+func TestPruneKeepsUnstampedInactiveKeys(t *testing.T) {
+	now := time.Date(2026, 6, 17, 0, 0, 0, 0, time.UTC)
+	in := `[` +
+		`{"id":"v1","secret":"legacy-inactive-no-timestamp-32-bytes-long-aa","active":false},` +
+		`{"id":"v2","secret":"current-active-secret-at-least-32-bytes-long-cc","active":true}` +
+		`]`
+	out, res, err := pruneKeyset("JWT_KEYS", in, time.Hour, now)
+	if err != nil {
+		t.Fatalf("pruneKeyset: %v", err)
+	}
+	if !strings.Contains(out, `"id":"v1"`) {
+		t.Error("unstamped inactive key must be kept (unknown age)")
+	}
+	if len(res.keptNoStamp) != 1 || res.keptNoStamp[0] != "v1" {
+		t.Errorf("want keptNoStamp=[v1], got %v", res.keptNoStamp)
+	}
+	if len(res.removed) != 0 {
+		t.Errorf("nothing should be removed, got %v", res.removed)
+	}
+}
+
+func TestPruneInFilePreservesOtherLines(t *testing.T) {
+	now := time.Date(2026, 6, 17, 0, 0, 0, 0, time.UTC)
+	old := now.Add(-1000 * time.Hour).Format(time.RFC3339)
+	in := strings.Join([]string{
+		"APP_ENV=production",
+		`JWT_KEYS=[{"id":"v1","secret":"old-inactive-secret-at-least-32-bytes-long-aaa","active":false,"created":"` + old + `"},{"id":"v2","secret":"current-active-secret-at-least-32-bytes-long-cc","active":true,"created":"` + old + `"}]`,
+		"KEEP=me",
+	}, "\n")
+	out, res, err := pruneInFile(in, "JWT_KEYS", 720*time.Hour, now)
+	if err != nil {
+		t.Fatalf("pruneInFile: %v", err)
+	}
+	if !strings.Contains(out, "APP_ENV=production") || !strings.Contains(out, "KEEP=me") {
+		t.Error("pruneInFile dropped unrelated lines")
+	}
+	if strings.Contains(out, `"id":"v1"`) {
+		t.Error("old inactive v1 should have been pruned from the file")
+	}
+	if !strings.Contains(out, `"id":"v2"`) {
+		t.Error("active v2 must remain")
+	}
+	if len(res.removed) != 1 {
+		t.Errorf("want 1 removed, got %v", res.removed)
+	}
+	if _, _, err := pruneInFile("APP_ENV=x\n", "JWT_KEYS", time.Hour, now); err == nil {
+		t.Error("pruneInFile should error when the key is absent")
 	}
 }
