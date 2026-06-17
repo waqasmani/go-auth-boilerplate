@@ -30,6 +30,7 @@ func RegisterRoutes(
 	rg *gin.RouterGroup,
 	h *Handler,
 	jwtHelper *platformauth.JWT,
+	revoker *platformauth.AccessRevoker,
 	log *zap.Logger,
 	limits RateLimits,
 	rdb *goredis.Client,
@@ -67,7 +68,7 @@ func RegisterRoutes(
 	rg.GET("/:provider/login", loginRL, h.Login)
 	rg.GET("/:provider/callback", callbackRL, h.Callback)
 	rg.POST("/:provider/link",
-		middleware.Auth(jwtHelper, log),
+		middleware.Auth(jwtHelper, revoker, log),
 		linkRL,
 		h.Link,
 	)

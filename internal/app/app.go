@@ -99,6 +99,7 @@ func New(migrationsFS fs.FS) (*App, error) {
 		AuditLog:                cont.AuditLog,
 		Cfg:                     cont.Config,
 		RDB:                     cont.RawRedis,
+		Revoker:                 cont.Revoker,
 		LoginEmailRateLimitRate: cont.Config.RateLimitLoginEmail,
 	})
 	if err != nil {
@@ -121,6 +122,7 @@ func New(migrationsFS fs.FS) (*App, error) {
 		TOTPPeriod:     cont.Config.TOTPPeriod,
 		TOTPDigits:     cont.Config.TOTPDigits,
 		RDB:            cont.RawRedis,
+		Revoker:        cont.Revoker,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("app: init email auth module: %w", err)
@@ -186,6 +188,7 @@ func New(migrationsFS fs.FS) (*App, error) {
 		MetricsToken:      cont.Config.MetricsToken,
 		RedisClient:       cont.Redis,
 		RDB:               cont.RawRedis,
+		Revoker:           cont.Revoker,
 		Log:               cont.Logger,
 	}
 

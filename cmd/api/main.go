@@ -50,6 +50,28 @@ func main() {
 		os.Exit(healthcheck(flag.Arg(1)))
 	}
 
+	// `api migrate` applies all pending schema migrations once and exits 0/1.
+	// Run it as a Kubernetes init-container / Job or a CI step so a single
+	// process owns DDL, and run the API replicas with SKIP_MIGRATIONS=true so
+	// they never contend for the migration advisory lock on boot.
+	if flag.Arg(0) == "migrate" {
+		os.Exit(runMigrate())
+	}
+
+	// `api outbox-worker` is the long-running process that drains the
+	// email_outbox table and sends mail over SMTP. Run it as its own Deployment
+	// (scalable) — not inside the API pods.
+	if flag.Arg(0) == "outbox-worker" {
+		os.Exit(runOutboxWorker())
+	}
+
+	// `api cleanup` purges expired token rows and old outbox rows once, then
+	// exits. Run it as a CronJob. The same logic also ships as cmd/cleanup for
+	// non-container schedulers.
+	if flag.Arg(0) == "cleanup" {
+		os.Exit(runCleanup())
+	}
+
 	// Hand the link-time build metadata to the app so it is emitted on the
 	// structured startup log line for incident triage.
 	app.Build = app.BuildInfo{Version: Version, Commit: Commit, BuildTime: BuildTime}

@@ -19,7 +19,12 @@ const (
 )
 
 // Auth validates the JWT Bearer token and populates gin context with claims.
-func Auth(jwtHelper *platformauth.JWT, log *zap.Logger) gin.HandlerFunc {
+//
+// revoker may be nil (revocation disabled). When set, it enforces the per-user
+// "valid-after" epoch so a token issued before a logout-all / credential change
+// is rejected fleet-wide even though it is still cryptographically valid and
+// unexpired. The check fails open on Redis errors (see AccessRevoker).
+func Auth(jwtHelper *platformauth.JWT, revoker *platformauth.AccessRevoker, log *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authorization := c.GetHeader("Authorization")
 		if authorization == "" {
@@ -42,6 +47,19 @@ func Auth(jwtHelper *platformauth.JWT, log *zap.Logger) gin.HandlerFunc {
 				zap.String("request_id", requestIDStr(c.MustGet(RequestIDKey))),
 			)
 			response.Error(c, err)
+			c.Abort()
+			return
+		}
+
+		// Reject tokens issued before the user's revocation epoch. IssuedAt is
+		// always set by GenerateTokenPair; the nil guard is purely defensive.
+		if claims.IssuedAt != nil &&
+			revoker.IsRevoked(c.Request.Context(), claims.UserID, claims.IssuedAt.Time) {
+			log.Debug("access token revoked",
+				zap.String("user_id", claims.UserID),
+				zap.String("request_id", requestIDStr(c.MustGet(RequestIDKey))),
+			)
+			response.Error(c, apperrors.ErrUnauthorized)
 			c.Abort()
 			return
 		}

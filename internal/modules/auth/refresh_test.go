@@ -92,6 +92,17 @@ func (f *fakeRepo) RevokeRefreshTokenFamily(ctx context.Context, family string) 
 	return nil
 }
 
+func (f *fakeRepo) RevokeUserRefreshTokens(ctx context.Context, userID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, t := range f.tokens {
+		if t.UserID == userID {
+			t.RevokedAt = sql.NullTime{Time: time.Now().UTC(), Valid: true}
+		}
+	}
+	return nil
+}
+
 func (f *fakeRepo) GetUserByIDWithRoles(ctx context.Context, id string) (*UserWithRoles, error) {
 	return f.user, nil
 }

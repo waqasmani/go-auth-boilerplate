@@ -9,9 +9,9 @@ import (
 )
 
 // RegisterRoutes attaches user endpoints to a RouterGroup.
-func RegisterRoutes(rg *gin.RouterGroup, h *Handler, jwt *platformauth.JWT, log *zap.Logger) {
+func RegisterRoutes(rg *gin.RouterGroup, h *Handler, jwt *platformauth.JWT, revoker *platformauth.AccessRevoker, log *zap.Logger) {
 	protected := rg.Group("")
-	protected.Use(middleware.Auth(jwt, log))
+	protected.Use(middleware.Auth(jwt, revoker, log))
 	{
 		protected.GET("/me", h.Me)
 	}

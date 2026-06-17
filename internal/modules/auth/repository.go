@@ -36,6 +36,9 @@ type Repository interface {
 	AssignUserRole(ctx context.Context, userID, roleName string) error
 	ConsumeRefreshToken(ctx context.Context, id string) (bool, error)
 	RevokeRefreshTokenFamily(ctx context.Context, family string) error
+	// RevokeUserRefreshTokens revokes every refresh-token family belonging to
+	// userID — the account-wide kill used by logout-all.
+	RevokeUserRefreshTokens(ctx context.Context, userID string) error
 	WithTx(ctx context.Context, fn func(tx Repository) error) error
 }
 
@@ -193,6 +196,13 @@ func (r *repository) ConsumeRefreshToken(ctx context.Context, id string) (bool, 
 
 func (r *repository) RevokeRefreshTokenFamily(ctx context.Context, family string) error {
 	if err := r.queries.RevokeRefreshTokenFamily(ctx, family); err != nil {
+		return apperrors.Wrap(apperrors.ErrInternalServer, err)
+	}
+	return nil
+}
+
+func (r *repository) RevokeUserRefreshTokens(ctx context.Context, userID string) error {
+	if err := r.queries.RevokeUserRefreshTokens(ctx, userID); err != nil {
 		return apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
 	return nil

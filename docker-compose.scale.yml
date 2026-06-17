@@ -1,0 +1,64 @@
+# Multi-instance overlay for local testing. Layer it on top of the base compose:
+#
+#     docker compose -f docker-compose.yml -f docker-compose.scale.yml \
+#       up --build --scale api=3
+#
+# It:
+#   • drops the api's fixed host-port publish (so the service can scale), and
+#     fronts the replicas with an nginx load balancer on :8080;
+#   • runs migrations once as a dedicated `migrate` one-shot (api replicas set
+#     SKIP_MIGRATIONS=true);
+#   • runs the email outbox worker as a separate process.
+#
+# Requires Compose v2.20+ for the `!reset` tag.
+
+services:
+  api:
+    # Remove the host-port publish from the base file so N replicas don't all
+    # try to bind host :8080. Traffic now arrives via the nginx service.
+    ports: !reset []
+    environment:
+      SKIP_MIGRATIONS: "true"
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["migrate"]
+    env_file: .env
+    environment:
+      DB_DSN: "${DB_USER:-app_user}:${DB_PASSWORD}@tcp(db:3306)/${DB_NAME:-go_auth}?parseTime=true&loc=UTC&tls=false"
+      REDIS_DSN: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+      DB_ALLOW_INSECURE: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  outbox-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["outbox-worker"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_DSN: "${DB_USER:-app_user}:${DB_PASSWORD}@tcp(db:3306)/${DB_NAME:-go_auth}?parseTime=true&loc=UTC&tls=false"
+      REDIS_DSN: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+      DB_ALLOW_INSECURE: "true"
+      SKIP_MIGRATIONS: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  lb:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api

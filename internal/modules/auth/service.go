@@ -33,6 +33,10 @@ type Service interface {
 	Login(ctx context.Context, req LoginRequest) (*LoginResult, error)
 	Refresh(ctx context.Context, req RefreshRequest) (*TokenResponse, error)
 	Logout(ctx context.Context, req LogoutRequest) error
+	// LogoutAll terminates every session for the user: it revokes all
+	// refresh-token families in the database and records the access-token
+	// revocation epoch so in-flight access tokens are rejected fleet-wide.
+	LogoutAll(ctx context.Context, userID string) error
 	SetMFAChallenger(c MFAChallenger)
 	SetVerificationSender(v VerificationSender)
 	// IssueTokensForUser fetches fresh user data and issues a full token pair
@@ -61,14 +65,19 @@ type service struct {
 	// nil when Redis is not configured or in tests that do not require lockout;
 	// all call sites guard with a nil check so the service degrades gracefully.
 	locker *platformauth.AccountLocker
+	// revoker records the per-user access-token "valid-after" epoch on
+	// account-wide session kills (logout-all). May be nil — the AccessRevoker
+	// methods nil-guard, so the service degrades gracefully without it.
+	revoker *platformauth.AccessRevoker
 }
 
 // NewService constructs the auth service.
 // locker may be nil — the service operates without account lockout when it is,
 // relying exclusively on rate limiting. Pass a non-nil AccountLocker in all
-// production deployments.
-func NewService(repo Repository, jwt *platformauth.JWT, log *zap.Logger, auditLog *audit.Logger, locker *platformauth.AccountLocker) Service {
-	return &service{repo: repo, jwt: jwt, log: log, auditLog: auditLog, locker: locker}
+// production deployments. revoker may likewise be nil (access-token revocation
+// disabled).
+func NewService(repo Repository, jwt *platformauth.JWT, log *zap.Logger, auditLog *audit.Logger, locker *platformauth.AccountLocker, revoker *platformauth.AccessRevoker) Service {
+	return &service{repo: repo, jwt: jwt, log: log, auditLog: auditLog, locker: locker, revoker: revoker}
 }
 
 func (s *service) SetMFAChallenger(c MFAChallenger)           { s.mfaChallenger = c }
@@ -466,6 +475,39 @@ func (s *service) Logout(ctx context.Context, req LogoutRequest) error {
 	logger.FromContext(ctx).Info("user logged out",
 		zap.String("user_id", token.UserID),
 		zap.String("family", token.TokenFamily),
+	)
+	return nil
+}
+
+// ── LogoutAll ─────────────────────────────────────────────────────────────────
+
+// LogoutAll terminates every session for userID: it revokes all of the user's
+// refresh-token families in the database and records the access-token revocation
+// epoch so in-flight access tokens are rejected on every replica immediately
+// (not just until their natural expiry). Used by the authenticated
+// POST /auth/logout-all endpoint and intended for "log out everywhere" / lost
+// device flows.
+func (s *service) LogoutAll(ctx context.Context, userID string) error {
+	if err := s.repo.RevokeUserRefreshTokens(ctx, userID); err != nil {
+		// Return the error so the client gets a 500 and retries rather than a
+		// success that falsely implies all sessions were terminated.
+		s.log.Error("logout-all: refresh-token revocation failed — sessions may still be active",
+			zap.String("user_id", userID),
+			zap.Error(err),
+		)
+		return err
+	}
+
+	// Refresh tokens are revoked durably; also invalidate in-flight access
+	// tokens fleet-wide. Done after the DB write so a failed revoke never kills
+	// live access tokens.
+	s.revoker.RevokeBefore(ctx, userID, time.Now().UTC())
+
+	s.auditLog.Log(ctx, audit.EventSessionsRevoked, userID,
+		zap.String("trigger", "logout_all"),
+	)
+	logger.FromContext(ctx).Info("user logged out of all sessions",
+		zap.String("user_id", userID),
 	)
 	return nil
 }

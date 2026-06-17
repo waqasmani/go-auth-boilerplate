@@ -53,6 +53,10 @@ type Options struct {
 	// RDB is the raw go-redis client passed to per-route rate-limit middleware.
 	RDB *goredis.Client
 
+	// Revoker is the Redis-backed access-token revocation checker shared by every
+	// JWT-protected route's Auth middleware. May be nil (revocation disabled).
+	Revoker *platformauth.AccessRevoker
+
 	// Log is forwarded to all middleware constructors that emit structured logs.
 	Log *zap.Logger
 }
@@ -189,18 +193,18 @@ func New(
 
 	// ── Auth ───────────────────────────────────────────────────────────────────
 	authGroup := v1.Group("/auth")
-	emailmodule.RegisterRoutes(authGroup, emailMod.Handler, jwtHelper, log, opts.EmailRateLimit, opts.RDB)
-	authmodule.RegisterRoutes(authGroup, authMod.Handler, opts.RateLimit, opts.RefreshRateLimit, opts.CookieCSRF, opts.RDB, log)
+	emailmodule.RegisterRoutes(authGroup, emailMod.Handler, jwtHelper, opts.Revoker, log, opts.EmailRateLimit, opts.RDB)
+	authmodule.RegisterRoutes(authGroup, authMod.Handler, jwtHelper, opts.Revoker, opts.RateLimit, opts.RefreshRateLimit, opts.CookieCSRF, opts.RDB, log)
 
 	// ── OAuth Social Login ─────────────────────────────────────────────────────
 	if oauthMod != nil {
 		oauthGroup := v1.Group("/oauth")
-		oauthmodule.RegisterRoutes(oauthGroup, oauthMod.Handler, jwtHelper, log, opts.OAuthRateLimits, opts.RDB)
+		oauthmodule.RegisterRoutes(oauthGroup, oauthMod.Handler, jwtHelper, opts.Revoker, log, opts.OAuthRateLimits, opts.RDB)
 	}
 
 	// ── Users ──────────────────────────────────────────────────────────────────
 	usersGroup := v1.Group("/users")
-	usersmodule.RegisterRoutes(usersGroup, usersMod.Handler, jwtHelper, log)
+	usersmodule.RegisterRoutes(usersGroup, usersMod.Handler, jwtHelper, opts.Revoker, log)
 
 	return r
 }

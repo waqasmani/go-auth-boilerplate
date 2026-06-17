@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/waqasmani/go-auth-boilerplate/internal/middleware"
+	platformauth "github.com/waqasmani/go-auth-boilerplate/internal/platform/auth"
 )
 
 // RegisterRoutes attaches auth endpoints to a RouterGroup.
@@ -18,6 +19,8 @@ import (
 func RegisterRoutes(
 	rg *gin.RouterGroup,
 	h *Handler,
+	jwt *platformauth.JWT,
+	revoker *platformauth.AccessRevoker,
 	rlCfg middleware.RateLimitConfig,
 	refreshRlCfg middleware.RateLimitConfig,
 	csrfCfg middleware.CookieCSRFConfig,
@@ -41,4 +44,9 @@ func RegisterRoutes(
 		h.Refresh,
 	)
 	rg.POST("/logout", csrfCheck, h.Logout)
+
+	// ── Authenticated session management ──────────────────────────────────────
+	// logout-all is bearer-authenticated (it acts on the caller's own account)
+	// and terminates every session fleet-wide.
+	rg.POST("/logout-all", middleware.Auth(jwt, revoker, log), h.LogoutAll)
 }

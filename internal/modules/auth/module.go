@@ -39,6 +39,9 @@ type ModuleConfig struct {
 	// Redis is a mandatory dependency; NewModule returns an error if RDB is nil.
 	RDB                     *goredis.Client
 	LoginEmailRateLimitRate float64
+	// Revoker records the access-token revocation epoch on logout-all. May be
+	// nil (revocation disabled); the service nil-guards every call.
+	Revoker *platformauth.AccessRevoker
 }
 
 // NewModule constructs the auth module. Returns an error on any
@@ -81,7 +84,7 @@ func NewModule(m ModuleConfig) (*Module, error) {
 		return nil, fmt.Errorf("auth: init account locker: %w", err)
 	}
 
-	svc := NewService(repo, m.Jwt, m.Log, m.AuditLog, locker)
+	svc := NewService(repo, m.Jwt, m.Log, m.AuditLog, locker, m.Revoker)
 	h := NewHandler(svc, m.Cfg, emailLimiter)
 
 	return &Module{Handler: h, Service: svc}, nil

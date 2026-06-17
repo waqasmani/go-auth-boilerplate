@@ -10,6 +10,8 @@
 //   - oauth_one_time_codes — rows whose expires_at is in the past AND whose
 //     used_at is NOT NULL (unused-but-expired codes are also purged since they
 //     can never be redeemed once the TTL has elapsed).
+//   - email_outbox        — terminal ('sent'/'failed') rows older than the
+//     retention window. Pending/sending rows are never touched.
 //
 // # Batching
 //
@@ -151,6 +153,7 @@ func (j *Job) Run(ctx context.Context) error {
 		{"refresh_tokens", j.purgeRefreshTokens},
 		{"oauth_linking_states", j.purgeLinkingStates},
 		{"oauth_one_time_codes", j.purgeOneTimeCodes},
+		{"email_outbox", j.purgeEmailOutbox},
 	}
 
 	var failures []*PassError
@@ -233,6 +236,21 @@ func (j *Job) purgeOneTimeCodes(ctx context.Context) (int64, error) {
 		  WHERE expires_at < UTC_TIMESTAMP()
 		  LIMIT ?`,
 		"oauth_one_time_codes",
+	)
+}
+
+// purgeEmailOutbox removes terminal email_outbox rows — those already delivered
+// ('sent') or permanently abandoned ('failed') — older than the retention
+// window. Pending/sending rows are never touched, so a backlog or in-flight
+// retry is never deleted. The window keeps a short audit/debug trail of recently
+// completed sends.
+func (j *Job) purgeEmailOutbox(ctx context.Context) (int64, error) {
+	return j.deleteBatched(ctx,
+		`DELETE FROM email_outbox
+		  WHERE status IN ('sent','failed')
+		    AND created_at < (UTC_TIMESTAMP() - INTERVAL 7 DAY)
+		  LIMIT ?`,
+		"email_outbox",
 	)
 }
 

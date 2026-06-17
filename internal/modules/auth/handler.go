@@ -184,6 +184,34 @@ func (h *Handler) Logout(c *gin.Context) {
 	response.NoContent(c)
 }
 
+// LogoutAll godoc
+// @Summary      Log out of all sessions
+// @Description  Revokes every refresh-token family for the authenticated user and
+// @Description  immediately invalidates all in-flight access tokens across the fleet.
+// @Tags         auth
+// @Produce      json
+// @Security     BearerAuth
+// @Success      204 "All sessions terminated"
+// @Failure      401 {object} response.Response "Unauthenticated"
+// @Router       /auth/logout-all [post]
+func (h *Handler) LogoutAll(c *gin.Context) {
+	claims, ok := middleware.GetClaims(c)
+	if !ok {
+		response.Error(c, apperrors.ErrUnauthorized)
+		return
+	}
+
+	// Clear this device's cookie too, so the current client is fully logged out.
+	h.clearCookie(c)
+
+	if err := h.svc.LogoutAll(c.Request.Context(), claims.UserID); err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	response.NoContent(c)
+}
+
 // maybeStripRefreshFromBody blanks the refresh token in the JSON response body
 // when the deployment delivers it solely via the HttpOnly cookie
 // (COOKIE_REFRESH_TOKEN_IN_BODY=false). The cookie is always set regardless;

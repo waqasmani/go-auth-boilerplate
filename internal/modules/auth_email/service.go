@@ -89,6 +89,13 @@ type service struct {
 	totpPeriod  uint
 	totpDigits  otp.Digits
 	replayCache *platformauth.TOTPReplayCache
+
+	// revoker records the per-user access-token "valid-after" epoch on
+	// account-wide session kills (password reset, TOTP disable) so in-flight
+	// access tokens are rejected fleet-wide, not just until their natural expiry.
+	// May be nil (revocation disabled); every call site nil-guards via the
+	// AccessRevoker methods.
+	revoker *platformauth.AccessRevoker
 }
 
 // NewService constructs the email-auth service. Returns an error when
@@ -111,6 +118,7 @@ func NewService(
 	totpDigits int,
 	replayCache *platformauth.TOTPReplayCache,
 	rdb *goredis.Client,
+	revoker *platformauth.AccessRevoker,
 ) (Service, error) {
 	if replayCache == nil {
 		return nil, fmt.Errorf(
@@ -142,6 +150,7 @@ func NewService(
 		totpDigits:     digits,
 		replayCache:    replayCache,
 		rdb:            rdb,
+		revoker:        revoker,
 	}, nil
 }
 
@@ -298,6 +307,11 @@ func (s *service) ResetPassword(ctx context.Context, req ResetPasswordRequest) (
 	}); err != nil {
 		return nil, err
 	}
+
+	// Refresh tokens are now revoked in the DB; also invalidate any in-flight
+	// access tokens fleet-wide. Done after the tx commits so a failed reset never
+	// revokes live sessions.
+	s.revoker.RevokeBefore(ctx, userID, time.Now().UTC())
 
 	s.auditLog.Log(ctx, audit.EventPasswordReset, userID)
 	log.Info("reset-password: password updated, all sessions and challenges revoked",
@@ -987,6 +1001,10 @@ func (s *service) DisableTOTP(ctx context.Context, userID, code, password string
 		return err
 	}
 
+	// Disabling TOTP is an account-wide credential change: kill in-flight access
+	// tokens fleet-wide too, after the tx commits.
+	s.revoker.RevokeBefore(ctx, userID, time.Now().UTC())
+
 	s.auditLog.Log(ctx, audit.EventTOTPDisabled, userID)
 	log.Info("totp-disable: reverted to email OTP", zap.String("user_id", userID))
 	return nil
@@ -1017,16 +1035,15 @@ func (s *service) sendEmail(ctx context.Context, to, subject string, renderFn fu
 		s.log.Error(op+": render email template", zap.Error(err), zap.String("user_id", userID))
 		return
 	}
-	// Detach from the request context before enqueuing. The router's timeout
-	// middleware cancels the request context via `defer cancel()` the instant
-	// the handler returns, which almost always happens before a background
-	// worker dequeues the message — causing the send to be silently dropped
-	// (the worker bails on item.ctx.Err()). context.WithoutCancel severs
-	// cancellation/deadline propagation while preserving request-scoped values
-	// (e.g. request_id) for logging; the mailer worker applies its own
-	// workerMsgTimeout to bound the actual send.
-	if err = s.mailer.Enqueue(context.WithoutCancel(ctx), mailer.Message{To: to, Subject: subject, HTML: html}); err != nil {
-		s.log.Warn(op+": enqueue email failed", zap.Error(err), zap.String("user_id", userID))
+	// Durably enqueue into the email_outbox table; the standalone outbox worker
+	// (internal/outbox) performs the SMTP send. Unlike the previous in-memory
+	// Mailer.Enqueue, this survives a process crash and is delivered exactly once
+	// across worker replicas. context.WithoutCancel detaches from the request
+	// context so the single INSERT is not aborted by the router's timeout
+	// middleware cancelling the context the instant the handler returns, while
+	// preserving request-scoped values (e.g. request_id) for logging.
+	if err = s.repo.EnqueueOutboxEmail(context.WithoutCancel(ctx), to, subject, html); err != nil {
+		s.log.Warn(op+": enqueue outbox email failed", zap.Error(err), zap.String("user_id", userID))
 	}
 }
 

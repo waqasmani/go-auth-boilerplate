@@ -83,9 +83,10 @@ func (f *breakerFakeRepo) UpdateUserPasswordHash(_ context.Context, _ db.UpdateU
 	return nil
 }
 
-func (f *breakerFakeRepo) MarkEmailVerified(_ context.Context, _ string) error       { return nil }
-func (f *breakerFakeRepo) ClearEmailVerified(_ context.Context, _ string) error      { return nil }
-func (f *breakerFakeRepo) RevokeUserRefreshTokens(_ context.Context, _ string) error { return nil }
+func (f *breakerFakeRepo) MarkEmailVerified(_ context.Context, _ string) error        { return nil }
+func (f *breakerFakeRepo) ClearEmailVerified(_ context.Context, _ string) error       { return nil }
+func (f *breakerFakeRepo) RevokeUserRefreshTokens(_ context.Context, _ string) error  { return nil }
+func (f *breakerFakeRepo) EnqueueOutboxEmail(_ context.Context, _, _, _ string) error { return nil }
 
 func (f *breakerFakeRepo) CreateRefreshToken(_ context.Context, _ db.CreateRefreshTokenParams) error {
 	return nil
@@ -123,7 +124,7 @@ func newBreakerService(t *testing.T, repo Repository, rdb *goredis.Client) Servi
 	svc, err := NewService(
 		repo, nil, zap.NewNop(), "http://localhost:3000",
 		breakerIssuer{}, standaloneTestOTPSecret, 3,
-		audit.New(zap.NewNop()), keySet, "test", 30, 6, replay, rdb,
+		audit.New(zap.NewNop()), keySet, "test", 30, 6, replay, rdb, nil,
 	)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)

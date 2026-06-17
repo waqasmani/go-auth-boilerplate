@@ -1,0 +1,37 @@
+# Periodically purges expired token rows and old email_outbox rows. One-shot per
+# run; never runs inside the API pods. Migrations are skipped.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: go-auth-cleanup
+spec:
+  schedule: "0 * * * *" # hourly
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+          containers:
+            - name: cleanup
+              image: IMAGE_PLACEHOLDER
+              args: ["cleanup"]
+              envFrom:
+                - secretRef:
+                    name: go-auth-secrets
+              env:
+                - name: SKIP_MIGRATIONS
+                  value: "true"
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "64Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "256Mi"
