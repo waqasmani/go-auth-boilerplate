@@ -1,0 +1,35 @@
+# Runs all pending schema migrations exactly once, then exits. Run (and wait for)
+# this before rolling out api-deployment.yaml. Idempotent: a re-run is a no-op.
+#
+# Alternative: copy this container spec into api-deployment as an initContainer
+# so each rollout migrates before the new pods serve traffic. The standalone Job
+# keeps migration a single, observable, fleet-wide event.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: go-auth-migrate
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      name: go-auth-migrate
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: migrate
+          image: IMAGE_PLACEHOLDER
+          args: ["migrate"]
+          envFrom:
+            - secretRef:
+                name: go-auth-secrets
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

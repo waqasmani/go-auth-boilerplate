@@ -48,6 +48,11 @@ type ModuleConfig struct {
 	// RDB is the raw go-redis client used for the TOTP replay cache.
 	// Redis is a mandatory dependency; NewModule returns an error if RDB is nil.
 	RDB *goredis.Client
+
+	// Revoker records the per-user access-token "valid-after" epoch when an
+	// account-wide session kill occurs (password reset, TOTP disable). May be nil
+	// (revocation disabled) — the service nil-guards every call.
+	Revoker *platformauth.AccessRevoker
 }
 
 // totpEncKeysFromConfig converts config key structs to platform types.
@@ -99,6 +104,7 @@ func NewModule(cfg ModuleConfig) (*Module, error) {
 		cfg.TOTPDigits,
 		replayCache,
 		cfg.RDB,
+		cfg.Revoker,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("authemail: init service: %w", err)
@@ -137,6 +143,7 @@ func RegisterRoutes(
 	rg *gin.RouterGroup,
 	h *Handler,
 	jwt *platformauth.JWT,
+	revoker *platformauth.AccessRevoker,
 	log *zap.Logger,
 	rl EmailRateLimits,
 	rdb *goredis.Client,
@@ -174,7 +181,7 @@ func RegisterRoutes(
 
 	// JWT-protected routes — authenticated users only.
 	protected := rg.Group("")
-	protected.Use(middleware.Auth(jwt, log))
+	protected.Use(middleware.Auth(jwt, revoker, log))
 	{
 		protected.POST("/send-verification", h.SendVerification)
 		protected.POST("/otp/send", h.SendOTP)

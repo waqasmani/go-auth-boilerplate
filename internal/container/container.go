@@ -34,6 +34,7 @@ type Container struct {
 	AuditLog   *audit.Logger
 	Mailer     *mailer.Mailer
 	JWT        *platformauth.JWT
+	Revoker    *platformauth.AccessRevoker
 	OAuthKeys  *platformauth.SymmetricKeySet
 	TOTPKeys   *platformauth.TOTPKeySet
 	ShutdownCh chan struct{}
@@ -83,6 +84,16 @@ func New(migrationsFS fs.FS) (*Container, error) {
 	c.DB = sqlDB
 	log.Info("connected to database")
 
+	// MULTI-INSTANCE connection budget. Total server-side connections scale with
+	// the replica count: replicas × DB_MAX_OPEN_CONNS, plus the migrate job,
+	// cleanup CronJob, and outbox worker. Surface the per-replica ceiling so the
+	// operator can confirm it fits within the server's max_connections. See
+	// docs/DEPLOYMENT.md for the full formula.
+	log.Info("database pool configured",
+		zap.Int("max_open_conns_per_replica", cfg.DBMaxOpenConns),
+		zap.Int("max_idle_conns_per_replica", cfg.DBMaxIdleConns),
+	)
+
 	// ─── Migrations ────────────────────────────────────────────────────────────
 	if !cfg.SkipMigrations {
 		if err = database.RunMigrations(sqlDB, migrationsFS, log); err != nil {
@@ -127,6 +138,13 @@ func New(migrationsFS fs.FS) (*Container, error) {
 		return nil, fmt.Errorf("container: init jwt: %w", err)
 	}
 	c.JWT = jwtHelper
+
+	// ─── Access-token revocation ────────────────────────────────────────────────
+	// Redis-backed per-user "valid-after" epoch so logout-all / credential changes
+	// invalidate in-flight access tokens immediately across every replica. Shared
+	// by the Auth middleware (enforcement) and the auth / email services (which
+	// record the epoch on account-wide session kills). Fail-open on Redis errors.
+	c.Revoker = platformauth.NewAccessRevoker(c.RawRedis, log, cfg.AccessTTL)
 
 	// ─── OAuth Keys ────────────────────────────────────────────────────────────
 	// NewSymmetricKeySet returns an error instead of panicking so a bad

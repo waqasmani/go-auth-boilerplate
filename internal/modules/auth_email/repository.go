@@ -9,6 +9,7 @@ import (
 	"net/http"
 
 	"github.com/go-sql-driver/mysql"
+	"github.com/google/uuid"
 	"github.com/waqasmani/go-auth-boilerplate/internal/db"
 	apperrors "github.com/waqasmani/go-auth-boilerplate/internal/errors"
 )
@@ -34,6 +35,12 @@ type Repository interface {
 	ClearEmailVerified(ctx context.Context, id string) error
 	RevokeUserRefreshTokens(ctx context.Context, userID string) error
 	CreateRefreshToken(ctx context.Context, params db.CreateRefreshTokenParams) error
+
+	// EnqueueOutboxEmail durably enqueues an outbound (HTML) email into the
+	// email_outbox table for the outbox worker to deliver. This replaces the old
+	// in-memory, at-most-once Mailer.Enqueue path: the row survives a process
+	// crash and is delivered exactly once across any number of worker replicas.
+	EnqueueOutboxEmail(ctx context.Context, to, subject, html string) error
 
 	// ── TOTP ──────────────────────────────────────────────────────────────────
 
@@ -140,6 +147,20 @@ func (r *repository) GetUserByID(ctx context.Context, id string) (*db.User, erro
 
 func (r *repository) CreateEmailToken(ctx context.Context, params db.CreateEmailTokenParams) error {
 	if err := r.queries.CreateEmailToken(ctx, params); err != nil {
+		return apperrors.Wrap(apperrors.ErrInternalServer, err)
+	}
+	return nil
+}
+
+// insertOutboxEmailSQL durably enqueues an outbound email. Hand-written
+// database/sql (not sqlc) so the email_outbox table needs no generated code —
+// the outbox worker reads the same table via internal/outbox.SQLStore.
+const insertOutboxEmailSQL = `
+INSERT INTO email_outbox (id, to_addr, subject, body_html, body_text, status, available_at, created_at)
+VALUES (?, ?, ?, ?, NULL, 'pending', NOW(), NOW())`
+
+func (r *repository) EnqueueOutboxEmail(ctx context.Context, to, subject, html string) error {
+	if _, err := r.sqlDB.ExecContext(ctx, insertOutboxEmailSQL, uuid.NewString(), to, subject, html); err != nil {
 		return apperrors.Wrap(apperrors.ErrInternalServer, err)
 	}
 	return nil

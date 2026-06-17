@@ -1,0 +1,42 @@
+# Drains the email_outbox table and sends mail via SMTP. Safe to run multiple
+# replicas: rows are claimed with FOR UPDATE SKIP LOCKED, so no email sends
+# twice. Does not serve HTTP. Migrations are owned by migrate-job.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-auth-outbox-worker
+  labels: { app: go-auth-outbox-worker }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: go-auth-outbox-worker }
+  template:
+    metadata:
+      labels: { app: go-auth-outbox-worker }
+    spec:
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: outbox-worker
+          image: IMAGE_PLACEHOLDER
+          args: ["outbox-worker"]
+          envFrom:
+            - secretRef:
+                name: go-auth-secrets
+          env:
+            - name: SKIP_MIGRATIONS
+              value: "true"
+            # Optional tuning (defaults shown):
+            # - name: OUTBOX_POLL_INTERVAL
+            #   value: "5s"
+            # - name: OUTBOX_BATCH_SIZE
+            #   value: "50"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"

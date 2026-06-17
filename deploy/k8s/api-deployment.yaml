@@ -1,0 +1,63 @@
+# Stateless API replicas. Scale `replicas` freely — all shared state is in MySQL
+# and Redis. Migrations are owned by migrate-job.yaml, so SKIP_MIGRATIONS=true.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: go-auth-api
+  labels: { app: go-auth-api }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: go-auth-api }
+  template:
+    metadata:
+      labels: { app: go-auth-api }
+    spec:
+      # ≥ serverShutdownTimeout (30s) + mailer drain headroom so a rolling deploy
+      # never SIGKILLs a pod mid-drain (see docs/DEPLOYMENT.md §7).
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: api
+          image: IMAGE_PLACEHOLDER
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: go-auth-secrets
+          env:
+            # Replicas must NOT migrate — the migrate Job owns DDL.
+            - name: SKIP_MIGRATIONS
+              value: "true"
+          livenessProbe:
+            httpGet: { path: /livez, port: 8080 }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8080 }
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Give the load balancer time to deregister this endpoint before
+              # the server begins draining.
+              exec: { command: ["/api", "healthcheck", "/livez"] }
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: go-auth-api
+spec:
+  selector: { app: go-auth-api }
+  ports:
+    - port: 80
+      targetPort: 8080

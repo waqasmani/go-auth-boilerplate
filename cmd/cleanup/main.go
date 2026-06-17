@@ -97,7 +97,7 @@ func run() error {
 		if errors.As(err, &runErr) {
 			log.Error("cleanup: finished with errors",
 				zap.Int("failed_passes", len(runErr.Failures)),
-				zap.Int("total_passes", 3),
+				zap.Int("total_passes", 4),
 			)
 		} else {
 			// Unexpected error shape (e.g. a future refactor broke the type

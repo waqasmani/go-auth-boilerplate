@@ -79,6 +79,9 @@ func (f *fakeOTPRepo) UpdateUserPasswordHash(ctx context.Context, p db.UpdateUse
 func (f *fakeOTPRepo) MarkEmailVerified(ctx context.Context, id string) error      { return nil }
 func (f *fakeOTPRepo) ClearEmailVerified(ctx context.Context, id string) error     { return nil }
 func (f *fakeOTPRepo) RevokeUserRefreshTokens(ctx context.Context, u string) error { return nil }
+func (f *fakeOTPRepo) EnqueueOutboxEmail(ctx context.Context, to, subject, html string) error {
+	return nil
+}
 func (f *fakeOTPRepo) CreateRefreshToken(ctx context.Context, p db.CreateRefreshTokenParams) error {
 	return nil
 }
@@ -132,7 +135,7 @@ func TestVerifyOTP_EmailBruteForceBurnsChallenge(t *testing.T) {
 	svc, err := NewService(
 		repo, nil, zap.NewNop(), "http://localhost:3000",
 		stubIssuer{}, bruteForceOTPSecret, maxAttempts,
-		audit.New(zap.NewNop()), keySet, "test", 30, 6, replay, rdb,
+		audit.New(zap.NewNop()), keySet, "test", 30, 6, replay, rdb, nil,
 	)
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
