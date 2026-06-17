@@ -98,7 +98,7 @@ func createUser(t *testing.T, repo authmod.Repository) string {
 func TestRefreshReuseRevokesFamily_DB(t *testing.T) {
 	db, q := setup(t)
 	repo := authmod.NewRepository(db, q)
-	svc := authmod.NewService(repo, newJWT(t), zap.NewNop(), audit.New(zap.NewNop()), nil)
+	svc := authmod.NewService(repo, newJWT(t), zap.NewNop(), audit.New(zap.NewNop()), nil, nil)
 	ctx := context.Background()
 
 	userID := createUser(t, repo)

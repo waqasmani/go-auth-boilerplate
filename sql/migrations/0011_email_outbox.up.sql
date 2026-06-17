@@ -22,7 +22,10 @@ CREATE TABLE IF NOT EXISTS email_outbox (
     to_addr      VARCHAR(320) NOT NULL,
     subject      VARCHAR(1024) NOT NULL,
     body_html    MEDIUMTEXT   NOT NULL,
-    body_text    MEDIUMTEXT   NULL DEFAULT NULL,
+    -- No DEFAULT on a TEXT column: nullable columns default to NULL implicitly,
+    -- and an explicit `TEXT DEFAULT NULL` is rejected by MySQL (< 8.0.13). This
+    -- matches the existing migrations' convention (see 0003 description TEXT).
+    body_text    MEDIUMTEXT   NULL,
     status       ENUM('pending','sending','sent','failed') NOT NULL DEFAULT 'pending',
     attempts     INT          NOT NULL DEFAULT 0,
     available_at TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
